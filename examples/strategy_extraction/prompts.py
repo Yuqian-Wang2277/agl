@@ -20,8 +20,7 @@ Requirements:
 4. Your strategy should be general enough to apply to similar problems
 5. Wrap your strategy within <strategy>...</strategy> tags
 6. **IMPORTANT**: Keep your response concise and under 500 tokens
-7. **CRITICAL**: Do NOT use any other XML-style tags like <think>, <reasoning>, etc.
-8. **CRITICAL**: Output ONLY the <strategy> tags with your answer inside - nothing before, nothing after
+7. **CRITICAL**: Output ONLY the <strategy> tags with your answer inside - nothing before, nothing after
 
 Output format (follow exactly):
 <strategy>

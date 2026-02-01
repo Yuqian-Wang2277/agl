@@ -60,15 +60,19 @@ python examples/strategy_extraction/train_strategy.py \
 
 ```
 
-### 3. With LoRA (Recommended for Limited GPU Memory)
+Todo:
 
-```bash
-python examples/strategy_extraction/train_strategy.py \
-    --model-path /home/test/test16/chenlu/model/Qwen3-8B \
-    --lora \
-    --lora-rank 32 \
-    --n-runners 5
-```
+1 日志：ai己经写了日志保存的逻辑，但没有实际保存，问一下为什么没保存下来（path to save）
+2 日志：看一下模型的raw output是否正常，据此修改一下prompt
+    a token长度
+    b 对策略的要求 是否给一个例子
+    c 细节的内容
+    d reward 只判断了策略标签是否存在，没判断是否有合理的内容，而不是作为思考内容，怎么跟精准地判断格式 粗暴的方法：判断长度，大于10token
+3 测试训练
+    a 检查agent逻辑 input output分别是什么 提取策略的具体细节是不是对的 fewshot是否来自同一个领域 解决的问题是否要是同领域的
+    b train val 的batchsize，rollout.n，agl的配置 按需要调整
+    c format 训练涨点
+4 二阶段的实现 需要仔细考虑（选择agl训练阶段的实现）论文idea 
 
 ---
 
