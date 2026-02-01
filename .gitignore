@@ -218,3 +218,4 @@ agentlightning/dashboard/**/*.svg
 
 # Docker data
 docker/data/
+wandb/
