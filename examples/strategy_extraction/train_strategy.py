@@ -85,6 +85,7 @@ def train(
     data_base_path: str,
     train_subdir: str,
     val_subdir: str,
+    val_subdirs: list[str] | None = None,
     model_path: str,
     fewshot_min: int,
     fewshot_max: int,
@@ -98,18 +99,22 @@ def train(
     wandb_project: str,
     wandb_experiment: str,
     checkpoint_dir: str,
+    save_full_output: bool,
+    resume_from_checkpoint: bool,
+    resume_from_path: str | None,
 ) -> None:
     """Train the strategy extraction model.
     
     Args:
         data_base_path: Base path for data directory.
         train_subdir: Training data subdirectory name.
-        val_subdir: Validation data subdirectory name.
+        val_subdir: Validation data subdirectory name (single validation set, for backward compatibility).
+        val_subdirs: List of validation data subdirectory names (multiple validation sets). If provided, overrides val_subdir.
         model_path: Path to the model.
         fewshot_min: Minimum number of few-shot examples.
         fewshot_max: Maximum number of few-shot examples.
         num_train_samples: Number of training samples to generate.
-        num_val_samples: Number of validation samples to generate.
+        num_val_samples: Number of validation samples to generate per validation set.
         n_runners: Number of parallel runners.
         lora: Whether to use LoRA training (default: False).
         lora_rank: LoRA rank when enabled.
@@ -118,7 +123,13 @@ def train(
         wandb_project: WandB project name.
         wandb_experiment: WandB experiment/run name.
         checkpoint_dir: Directory to save checkpoints.
+        save_full_output: Whether to save complete model output to log file.
+        resume_from_checkpoint: Whether to automatically resume from checkpoint if available.
+        resume_from_path: Specific checkpoint path to resume from. If provided, overrides resume_from_checkpoint.
     """
+    # Convert checkpoint_dir to absolute path to ensure correct saving regardless of working directory
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
+    
     # Set up logging
     log_level = "DEBUG" if debug else "INFO"
     
@@ -136,16 +147,17 @@ def train(
     )
     
     logger.info(f"Logging to file: {log_file}")
+    
     logger.info("=" * 80)
     logger.info("Strategy Extraction Training - Stage 1")
     logger.info("=" * 80)
     
     # Cleanup any existing Ray processes to avoid GPU conflicts
     try:
-        import ray
-        if ray.is_initialized():
+        import ray  # type: ignore
+        if ray.is_initialized():  # type: ignore
             logger.info("Ray is already initialized, shutting down...")
-            ray.shutdown()
+            ray.shutdown()  # type: ignore
         logger.info("Ensuring clean Ray environment...")
         os.system("ray stop > /dev/null 2>&1")
     except Exception as e:
@@ -159,10 +171,54 @@ def train(
     
     # Build data paths
     train_dir = os.path.join(data_base_path, train_subdir)
-    val_dir = os.path.join(data_base_path, val_subdir)
+    
+    # Determine validation sets to use (do this before saving config to save actual validation sets used)
+    if val_subdirs:
+        validation_subdirs = val_subdirs
+        logger.info(f"Using multiple validation sets: {validation_subdirs}")
+    else:
+        validation_subdirs = [val_subdir]
+        logger.info(f"Using single validation set: {val_subdir}")
+    
+    # Save training configuration for reproducibility (after determining actual validation sets)
+    if not resume_from_checkpoint and resume_from_path is None:
+        config_save_dir = os.path.join(checkpoint_dir, "training_configs")
+        os.makedirs(config_save_dir, exist_ok=True)
+        config_file = os.path.join(config_save_dir, f"config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        training_config = {
+            "timestamp": datetime.now().isoformat(),
+            "data_base_path": data_base_path,
+            "train_subdir": train_subdir,
+            "val_subdir": val_subdir,  # Keep for backward compatibility
+            "val_subdirs": validation_subdirs,  # Save actual validation sets used
+            "model_path": model_path,
+            "fewshot_min": fewshot_min,
+            "fewshot_max": fewshot_max,
+            "num_train_samples": num_train_samples,
+            "num_val_samples": num_val_samples,
+            "n_runners": n_runners,
+            "lora": lora,
+            "lora_rank": lora_rank,
+            "wandb_project": wandb_project,
+            "wandb_experiment": wandb_experiment,
+            "checkpoint_dir": checkpoint_dir,
+            "save_full_output": save_full_output,
+            "resume_from_checkpoint": resume_from_checkpoint,
+            "resume_from_path": resume_from_path,
+        }
+        try:
+            import json
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(training_config, f, ensure_ascii=False, indent=2)
+            logger.info(f"Training configuration saved to: {config_file}")
+            logger.info(f"  - Validation sets: {validation_subdirs}")
+        except Exception as e:
+            logger.warning(f"Failed to save training configuration: {e}")
     
     logger.info(f"Training data directory: {train_dir}")
-    logger.info(f"Validation data directory: {val_dir}")
+    for val_sub in validation_subdirs:
+        val_dir = os.path.join(data_base_path, val_sub)
+        logger.info(f"Validation data directory: {val_dir}")
     logger.info(f"Model path: {model_path}")
     logger.info(f"Few-shot range: [{fewshot_min}, {fewshot_max}]")
     logger.info(f"Number of runners: {n_runners}")
@@ -170,6 +226,10 @@ def train(
     logger.info(f"WandB Project: {wandb_project}")
     logger.info(f"WandB Experiment: {wandb_experiment}")
     logger.info(f"Checkpoint Directory: {checkpoint_dir}")
+    if resume_from_path:
+        logger.info(f"Resume from specific checkpoint: {resume_from_path}")
+    else:
+        logger.info(f"Resume from checkpoint: {'Enabled (auto-detect)' if resume_from_checkpoint else 'Disabled'}")
     
     # Load datasets
     logger.info("Loading training dataset...")
@@ -181,17 +241,28 @@ def train(
         seed=42,
     )
     
-    logger.info("Loading validation dataset...")
-    val_dataset = create_strategy_dataset(
-        val_dir,
-        fewshot_min,
-        fewshot_max,
-        num_val_samples,
-        seed=43,  # Different seed for validation
-    )
+    # Load validation datasets (merge multiple validation sets if provided)
+    logger.info("Loading validation datasets...")
+    val_datasets = []
+    for i, val_sub in enumerate(validation_subdirs):
+        val_dir = os.path.join(data_base_path, val_sub)
+        logger.info(f"Loading validation set {i+1}/{len(validation_subdirs)}: {val_sub}")
+        val_dataset = create_strategy_dataset(
+            val_dir,
+            fewshot_min,
+            fewshot_max,
+            num_val_samples,
+            seed=43 + i,  # Different seed for each validation set
+        )
+        val_datasets.append(val_dataset)
+        logger.info(f"  - {val_sub}: {len(val_dataset)} samples")
+    
+    # Merge all validation datasets into one
+    import itertools
+    val_dataset = list(itertools.chain.from_iterable(val_datasets))
     
     logger.info(f"Train dataset size: {len(train_dataset)}")
-    logger.info(f"Validation dataset size: {len(val_dataset)}")
+    logger.info(f"Combined validation dataset size: {len(val_dataset)} (from {len(validation_subdirs)} sets)")
     
     # Validate datasets: ensure all samples have examples
     logger.info("Validating datasets...")
@@ -227,12 +298,27 @@ def train(
     
     # Configure VERL algorithm
     logger.info("Configuring VERL algorithm...")
-    config = get_verl_config(model_path, lora=lora, lora_rank=lora_rank)
+    # Pass checkpoint_dir (already absolute path) to get_verl_config
+    config = get_verl_config(
+        model_path, 
+        lora=lora, 
+        lora_rank=lora_rank, 
+        resume_from_checkpoint=resume_from_checkpoint, 
+        resume_from_path=resume_from_path,
+        checkpoint_dir=checkpoint_dir
+    )
     
     # Update WandB configuration
     config["trainer"]["project_name"] = wandb_project
     config["trainer"]["experiment_name"] = wandb_experiment
+    # checkpoint_dir is already set in get_verl_config, but ensure it's correct
     config["trainer"]["default_local_dir"] = checkpoint_dir
+    
+    # Log resume configuration for debugging
+    logger.info(f"Resume configuration:")
+    logger.info(f"  - resume_mode: {config['trainer'].get('resume_mode', 'not set')}")
+    logger.info(f"  - resume_from_path: {config['trainer'].get('resume_from_path', 'not set')}")
+    logger.info(f"  - default_local_dir: {config['trainer'].get('default_local_dir', 'not set')}")
     
     # Validate critical config parameters
     logger.info("Validating configuration...")
@@ -265,6 +351,17 @@ def train(
         # 1. Use an external store: agl store --port 9999
         # 2. Set AGL_MANAGED_STORE=0 and use --external-store-address
     
+    # Create agent with rollout traces directory and validation output directory
+    rollout_traces_dir = os.path.join(checkpoint_dir, "rollout_traces")
+    validation_output_dir = os.path.join(checkpoint_dir, "validation_outputs")
+    agent = StrategyExtractionAgent(
+        save_full_output=save_full_output,
+        rollout_traces_dir=rollout_traces_dir,
+        validation_output_dir=validation_output_dir
+    )
+    logger.info(f"Rollout traces will be saved to: {rollout_traces_dir}")
+    logger.info(f"Validation outputs will be saved to: {validation_output_dir}")
+    
     # Create trainer
     logger.info("Creating trainer...")
     trainer = agl.Trainer(
@@ -273,14 +370,17 @@ def train(
         store=store,
     )
     
-    # Create agent
-    agent = StrategyExtractionAgent()
-    
     # Start training
     logger.info("Starting training...")
     logger.info("=" * 80)
     
     trainer.fit(agent, train_dataset=train_dataset, val_dataset=val_dataset)
+    
+    # Save any remaining validation outputs after training completes
+    if hasattr(agent, 'validation_outputs') and agent.validation_outputs:
+        saved_path = agent.save_validation_outputs(0)  # Use 0 as final step marker
+        if saved_path:
+            logger.info(f"Final validation outputs saved to: {saved_path}")
     
     logger.info("=" * 80)
     logger.info("Training completed!")
@@ -311,7 +411,14 @@ def main() -> None:
         "--val-subdir",
         type=str,
         default=StrategyConfig.val_subdir,
-        help="Validation data subdirectory name",
+        help="Validation data subdirectory name (single validation set, for backward compatibility)",
+    )
+    parser.add_argument(
+        "--val-subdirs",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of validation data subdirectory names (multiple validation sets). If provided, overrides --val-subdir. Example: --val-subdirs test-id-subtask test-ood-task test-bbh",
     )
     
     # Model configuration
@@ -390,6 +497,26 @@ def main() -> None:
         default=StrategyConfig.checkpoint_dir,
         help="Directory to save checkpoints (HuggingFace safetensor format)",
     )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        dest="resume_from_checkpoint",
+        action="store_true",
+        default=StrategyConfig.resume_from_checkpoint,
+        help="Automatically resume from checkpoint if available (default: disabled, start new training)",
+    )
+    parser.add_argument(
+        "--no-resume-from-checkpoint",
+        dest="resume_from_checkpoint",
+        action="store_false",
+        help="Disable automatic checkpoint resuming, start training from scratch (default behavior)",
+    )
+    parser.add_argument(
+        "--resume-from-path",
+        dest="resume_from_path",
+        type=str,
+        default=None,
+        help="Specific checkpoint path to resume from (e.g., ./checkpoints/global_step_64). Overrides --resume-from-checkpoint.",
+    )
     
     # Infrastructure
     parser.add_argument(
@@ -402,6 +529,18 @@ def main() -> None:
         "--debug",
         action="store_true",
         help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--save-full-output",
+        action="store_true",
+        default=StrategyConfig.save_full_output,
+        help="Save complete model output for each rollout to log file (default: from config)",
+    )
+    parser.add_argument(
+        "--no-save-full-output",
+        dest="save_full_output",
+        action="store_false",
+        help="Disable saving complete model output to log file",
     )
     
     args = parser.parse_args()
@@ -428,6 +567,7 @@ def main() -> None:
         data_base_path=args.data_base_path,
         train_subdir=args.train_subdir,
         val_subdir=args.val_subdir,
+        val_subdirs=args.val_subdirs if args.val_subdirs else (StrategyConfig.val_subdirs if hasattr(StrategyConfig, 'val_subdirs') else None),
         model_path=args.model_path,
         fewshot_min=args.fewshot_min,
         fewshot_max=args.fewshot_max,
@@ -441,6 +581,9 @@ def main() -> None:
         wandb_project=args.wandb_project,
         wandb_experiment=args.wandb_experiment,
         checkpoint_dir=args.checkpoint_dir,
+        save_full_output=args.save_full_output,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        resume_from_path=args.resume_from_path,
     )
 
 

@@ -2,8 +2,8 @@
 
 """Configuration module for strategy extraction training."""
 
-from dataclasses import dataclass
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 
 @dataclass
@@ -26,12 +26,14 @@ class StrategyConfig:
     
     data_base_path: str = "/home/test/test16/chenlu/projects/LLMReflection/data/"
     train_subdir: str = "train_20k"
-    val_subdir: str = "val_set"
+    val_subdir: str = "test-bbh"  # Options: "test-id-subtask", "test-ood-task", "test-bbh"
+    # Multiple validation sets configuration
+    val_subdirs: List[str] = field(default_factory=lambda: ["test-id-subtask", "test-ood-task", "test-bbh"])  # Multiple validation sets for comprehensive evaluation
     model_path: str = "/home/test/test16/chenlu/model/Qwen3-4B"
     fewshot_min: int = 2
     fewshot_max: int = 3  # Reduced from 8 to avoid long prompts
-    num_train_samples: int = 1000
-    num_val_samples: int = 200
+    num_train_samples: int = 20000
+    num_val_samples: int = 500
     n_runners: int = 10
     lora: bool = False  # Not using LoRA by default
     lora_rank: int = 32
@@ -42,17 +44,24 @@ class StrategyConfig:
     
     # Checkpoint configuration
     checkpoint_dir: str = "./checkpoints"
-    save_freq: int = 64  # Save checkpoint every N steps
-    test_freq: int = -1  # Run validation every N steps
+    save_freq: int = 50  # Save checkpoint every N steps
+    test_freq: int = 50  # Run validation every N steps
+    resume_from_checkpoint: bool = False  # Automatically resume from checkpoint if available (default: start new training)
+    
+    # Logging configuration
+    save_full_output: bool = True  # Save complete model output for each rollout to log file
 
 
-def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32) -> Dict[str, Any]:
+def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, resume_from_checkpoint: bool = False, resume_from_path: str | None = None, checkpoint_dir: str = "./checkpoints") -> Dict[str, Any]:
     """Get VERL algorithm configuration.
     
     Args:
         model_path: Path to the model.
         lora: Whether to use LoRA training.
         lora_rank: LoRA rank when LoRA is enabled.
+        resume_from_checkpoint: Whether to automatically resume from checkpoint if available.
+        resume_from_path: Specific checkpoint path to resume from. If provided, overrides resume_from_checkpoint.
+        checkpoint_dir: Directory to save checkpoints (will be converted to absolute path in train function).
         
     Returns:
         VERL configuration dictionary.
@@ -112,19 +121,26 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32) ->
         },
         "trainer": {
             "n_gpus_per_node": 8,  # Use all 8 GPUs for parallel training
-            "val_before_train": False,
+            "val_before_train": False,  # Enable validation before training starts
             "critic_warmup": 0,
             # Enable WandB logging for tracking training metrics
+            # Use ["console"] to disable WandB if connection issues occur
             "logger": ["console", "wandb"],
             "project_name": "StrategyExtraction",
             "experiment_name": "stage1",
             "nnodes": 1,
-            "save_freq": 64,
-            "test_freq": 32,
-            "total_epochs": 2,
+            "save_freq": 50,
+            "test_freq": 50,  # Run validation every 50 steps
+            "total_epochs": 3,
             # Ensure checkpoints are saved in HuggingFace format with safetensors
             "default_hdfs_dir": None,  # Use local filesystem
-            "default_local_dir": "./checkpoints",
+            "default_local_dir": checkpoint_dir,  # Use provided checkpoint_dir (will be absolute path)
+            # If resume_from_path is specified, use it; otherwise use resume_from_checkpoint flag
+            # When resume_mode is "never", VERL should skip checkpoint loading
+            # Note: VERL's _load_checkpoint may still be called, but with resume_mode="never" it should handle it gracefully
+            "resume_mode": "auto" if (resume_from_path is not None or resume_from_checkpoint) else "never",
+            # Set resume_from_path: if specified use it, if auto-resume enabled leave None (auto-detect), if disabled set to empty string to prevent auto-detection
+            "resume_from_path": resume_from_path if resume_from_path is not None else (None if resume_from_checkpoint else ""),
         },
     }
     

@@ -63,16 +63,26 @@ python examples/strategy_extraction/train_strategy.py \
 Todo:
 
 1 日志：ai己经写了日志保存的逻辑，但没有实际保存，问一下为什么没保存下来（path to save）
+    a 报错很有可能来源于wandb 但wandb代码可能没有修改，确定是不是日志的逻辑导致的
+    b checkpoint 为什么只保存了63 64 ，是save all全save了 还是别的什么原因 
+    c checkpoint能不能保存hugging face格式 就是保存safestensor
 2 日志：看一下模型的raw output是否正常，据此修改一下prompt
     a token长度
     b 对策略的要求 是否给一个例子
     c 细节的内容
     d reward 只判断了策略标签是否存在，没判断是否有合理的内容，而不是作为思考内容，怎么跟精准地判断格式 粗暴的方法：判断长度，大于10token
+    e 设计reward去判断策略的通用性、有效性（看看好策略的长度应该是多少）
 3 测试训练
     a 检查agent逻辑 input output分别是什么 提取策略的具体细节是不是对的 fewshot是否来自同一个领域 解决的问题是否要是同领域的
     b train val 的batchsize，rollout.n，agl的配置 按需要调整
     c format 训练涨点
 4 二阶段的实现 需要仔细考虑（选择agl训练阶段的实现）论文idea 
+    a 已经提取好策略了（满足通用性、元学习能力）
+    b 先用策略去解决同一领域的任务（从同领域例子提取策略应用去解决同领域的问题，评估效果）
+    c 跨领域解决任务
+5 用judger去评估证明具有自主学习能力的agent效果好！
+    a 阅读gemini上关于rubric的四篇文章
+    b qwen团队小模型CKD作judger文章
 
 ---
 

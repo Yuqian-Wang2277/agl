@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from contextlib import contextmanager
 from copy import deepcopy
@@ -39,6 +40,8 @@ from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
 
 from .daemon import AgentModeDaemon
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "AgentLightningTrainer",
@@ -186,6 +189,33 @@ class AgentLightningTrainer(RayPPOTrainer):
         self.llm_proxy = llm_proxy
         self.adapter = adapter
         self.daemon_cls = daemon_cls
+
+    def _load_checkpoint(self):
+        """Override _load_checkpoint to handle resume_mode='never' correctly.
+        
+        When resume_mode is 'never', skip checkpoint loading to avoid errors
+        when no checkpoint exists.
+        """
+        resume_mode = getattr(self.config.trainer, "resume_mode", "auto")
+        if resume_mode == "never":
+            # Skip checkpoint loading when resume_mode is 'never'
+            logger.info("resume_mode is 'never', skipping checkpoint loading")
+            return
+        # Otherwise, call parent's _load_checkpoint
+        try:
+            super()._load_checkpoint()
+        except AttributeError as e:
+            # Handle case where VERL's _load_checkpoint fails due to None checkpoint
+            if "'NoneType' object has no attribute 'split'" in str(e):
+                logger.warning(
+                    "Checkpoint loading failed (no checkpoint found). "
+                    "Starting training from scratch."
+                )
+                # Ensure global_steps is initialized
+                if not hasattr(self, "global_steps"):
+                    self.global_steps = 0
+            else:
+                raise
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."

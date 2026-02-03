@@ -4,7 +4,7 @@
 
 import logging
 import re
-from typing import Dict
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,10 @@ def compute_format_reward(output: str) -> float:
         output: Model output string to check.
         
     Returns:
-        1.0 if format is correct, 0.0 otherwise.
+        1.0 if format is correct (strategy successfully extracted), 0.0 otherwise.
     """
     if not output:
+        logger.debug("Empty output, reward: 0.0")
         return 0.0
     
     # Check for opening tag
@@ -39,7 +40,7 @@ def compute_format_reward(output: str) -> float:
     # If missing either tag, return 0.0
     if not has_opening or not has_closing:
         logger.debug(
-            f"Missing tags - opening: {has_opening}, closing: {has_closing}"
+            f"Missing tags - opening: {has_opening}, closing: {has_closing}, reward: 0.0"
         )
         return 0.0
     
@@ -49,13 +50,13 @@ def compute_format_reward(output: str) -> float:
     
     # Must have exactly one match
     if len(matches) != 1:
-        logger.debug(f"Found {len(matches)} strategy blocks, expected exactly 1")
+        logger.debug(f"Found {len(matches)} strategy blocks, expected exactly 1, reward: 0.0")
         return 0.0
     
     # Check that the content is non-empty (not just whitespace)
     content = matches[0].strip()
     if not content:
-        logger.debug("Strategy block is empty")
+        logger.debug("Strategy block is empty, reward: 0.0")
         return 0.0
     
     # All checks passed
@@ -117,4 +118,36 @@ def compute_detailed_format_metrics(output: str) -> Dict[str, float]:
     return metrics
 
 
+def extract_strategy(output: str) -> Optional[str]:
+    """Extract strategy content from <strategy>...</strategy> tags.
+    
+    This function extracts the content between <strategy> and </strategy> tags
+    from the model output. If multiple strategy blocks are found, returns the
+    first one. If no valid strategy block is found, returns None.
+    
+    Args:
+        output: Model output string containing strategy tags.
+        
+    Returns:
+        Extracted strategy content (stripped) if found, None otherwise.
+    """
+    if not output:
+        return None
+    
+    # Use regex to match strategy blocks (DOTALL for multiline)
+    pattern = r'<strategy>(.*?)</strategy>'
+    matches = re.findall(pattern, output, re.DOTALL)
+    
+    if not matches:
+        return None
+    
+    # Return the first match, stripped of whitespace
+    # If multiple blocks exist, we take the first one (same logic as reward check)
+    content = matches[0].strip()
+    
+    # Return None if content is empty (only whitespace)
+    if not content:
+        return None
+    
+    return content
 
