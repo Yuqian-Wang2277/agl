@@ -39,22 +39,29 @@ class StrategyExtractionAgent(agl.LitAgent[StrategyTask]):
     in <strategy>...</strategy> tags.
     """
     
-    def __init__(self, save_full_output: bool = True, rollout_traces_dir: Optional[str] = None, validation_output_dir: Optional[str] = None) -> None:
+    def __init__(self, save_full_output: bool = True, rollout_traces_dir: Optional[str] = None, validation_output_dir: Optional[str] = None, experiment_id: Optional[str] = None, test_freq: int = 50) -> None:
         """Initialize the strategy extraction agent.
         
         Args:
             save_full_output: Whether to save complete model output to log file.
             rollout_traces_dir: Directory to save rollout traces (input/output pairs). If None, traces are not saved.
             validation_output_dir: Base directory to save validation outputs. If None, validation outputs are not saved separately.
+            experiment_id: Unique experiment identifier (format: YYYYMMDD_HHMMSS). Used to organize outputs by experiment.
+            test_freq: Frequency of validation (every N steps). Used to calculate actual step numbers for validation outputs.
         """
         super().__init__()
         self.save_full_output = save_full_output
+        self.experiment_id = experiment_id
         self.rollout_traces_dir = rollout_traces_dir
         self.validation_output_dir = validation_output_dir
+        self.test_freq = test_freq
         
         if rollout_traces_dir:
+            # Create experiment-specific subdirectory if experiment_id is provided
+            if experiment_id:
+                rollout_traces_dir = os.path.join(rollout_traces_dir, experiment_id)
             os.makedirs(rollout_traces_dir, exist_ok=True)
-            self.traces_file = os.path.join(rollout_traces_dir, f"rollout_traces_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
+            self.traces_file = os.path.join(rollout_traces_dir, f"rollout_traces.jsonl")
             logger.info(f"Rollout traces will be saved to: {self.traces_file}")
         else:
             self.traces_file = None
@@ -63,18 +70,23 @@ class StrategyExtractionAgent(agl.LitAgent[StrategyTask]):
         self.validation_outputs: List[Dict[str, Any]] = []
         self.current_validation_step: Optional[int] = None
         self.last_rollout_mode: Optional[str] = None  # Track mode transitions
+        self.validation_step_counter: int = 0  # Counter for validation steps (0 = before_train, 1+ = step numbers)
         
         if validation_output_dir:
+            # Create experiment-specific subdirectory if experiment_id is provided
+            if experiment_id:
+                validation_output_dir = os.path.join(validation_output_dir, experiment_id)
             os.makedirs(validation_output_dir, exist_ok=True)
+            self.validation_output_dir = validation_output_dir  # Update to experiment-specific path
             logger.info(f"Validation outputs will be saved to: {validation_output_dir}")
         
-        logger.info(f"StrategyExtractionAgent initialized (save_full_output={save_full_output}, rollout_traces_dir={rollout_traces_dir}, validation_output_dir={validation_output_dir})")
+        logger.info(f"StrategyExtractionAgent initialized (save_full_output={save_full_output}, rollout_traces_dir={rollout_traces_dir}, validation_output_dir={validation_output_dir}, experiment_id={experiment_id})")
     
     def save_validation_outputs(self, step: int) -> Optional[str]:
         """Save collected validation outputs to JSON file.
         
         Args:
-            step: Current training step number (0 for final save).
+            step: Current training step number (0 for before_train validation, >0 for actual training step).
             
         Returns:
             Path to saved file if successful, None otherwise.
@@ -82,17 +94,13 @@ class StrategyExtractionAgent(agl.LitAgent[StrategyTask]):
         if not self.validation_output_dir or not self.validation_outputs:
             return None
         
-        # Create date-based directory
-        date_str = datetime.now().strftime("%Y%m%d")
-        date_dir = os.path.join(self.validation_output_dir, date_str)
-        os.makedirs(date_dir, exist_ok=True)
-        
-        # Save validation outputs
+        # Save validation outputs with actual step number in filename
         if step == 0:
-            # Final save
-            output_file = os.path.join(date_dir, f"validation_outputs_final_{datetime.now().strftime('%H%M%S')}.json")
+            # Validation before training starts
+            output_file = os.path.join(self.validation_output_dir, f"validation_global_step0.json")
         else:
-            output_file = os.path.join(date_dir, f"validation_outputs_step_{step}_{datetime.now().strftime('%H%M%S')}.json")
+            # Validation at specific training step (format: validation_global_step{step}.json)
+            output_file = os.path.join(self.validation_output_dir, f"validation_global_step{step}.json")
         
         try:
             with open(output_file, "w", encoding="utf-8") as f:
@@ -183,9 +191,21 @@ class StrategyExtractionAgent(agl.LitAgent[StrategyTask]):
             if self.last_rollout_mode is not None and self.last_rollout_mode != "train" and current_mode == "train":
                 # Validation just ended, save collected outputs
                 if self.validation_outputs and self.validation_output_dir:
-                    saved_path = self.save_validation_outputs(0)  # Use 0 as step marker for validation-before-train
+                    # Calculate actual step number:
+                    # - counter = 0: before_train validation (step = 0)
+                    # - counter = 1: first validation (step = test_freq * 1 = 50)
+                    # - counter = 2: second validation (step = test_freq * 2 = 100)
+                    # - etc.
+                    if self.validation_step_counter == 0:
+                        actual_step = 0  # Before training
+                    else:
+                        actual_step = self.test_freq * self.validation_step_counter
+                    
+                    saved_path = self.save_validation_outputs(actual_step)
                     if saved_path:
-                        logger.info(f"Validation outputs saved after validation completed: {saved_path}")
+                        logger.info(f"Validation outputs saved after validation completed (global_step={actual_step}): {saved_path}")
+                    # Increment counter for next validation
+                    self.validation_step_counter += 1
             
             if is_validation and self.validation_output_dir:
                 validation_output = {

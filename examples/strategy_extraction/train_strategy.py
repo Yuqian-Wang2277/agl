@@ -127,26 +127,12 @@ def train(
         resume_from_checkpoint: Whether to automatically resume from checkpoint if available.
         resume_from_path: Specific checkpoint path to resume from. If provided, overrides resume_from_checkpoint.
     """
-    # Convert checkpoint_dir to absolute path to ensure correct saving regardless of working directory
-    checkpoint_dir = os.path.abspath(checkpoint_dir)
+    # Store original checkpoint_dir before modification
+    original_checkpoint_dir = os.path.abspath(checkpoint_dir)
     
-    # Set up logging
+    # Set up basic logging first (before experiment ID is determined)
     log_level = "DEBUG" if debug else "INFO"
-    
-    # Configure logging with file output
-    log_dir = os.path.join(checkpoint_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    
-    agl.setup_logging(
-        log_level,
-        files={
-            "agentlightning": log_file,
-            "examples.strategy_extraction": log_file,
-        }
-    )
-    
-    logger.info(f"Logging to file: {log_file}")
+    agl.setup_logging(log_level)
     
     logger.info("=" * 80)
     logger.info("Strategy Extraction Training - Stage 1")
@@ -180,12 +166,65 @@ def train(
         validation_subdirs = [val_subdir]
         logger.info(f"Using single validation set: {val_subdir}")
     
-    # Save training configuration for reproducibility (after determining actual validation sets)
+    # Generate experiment ID and create experiment-specific directories
+    experiment_id = None
+    if not resume_from_checkpoint and resume_from_path is None:
+        # New training run: generate experiment ID from timestamp
+        experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Create experiment-specific checkpoint directory
+        checkpoint_dir = os.path.join(original_checkpoint_dir, experiment_id)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger.info(f"New experiment started: {experiment_id}")
+        logger.info(f"Experiment checkpoint directory: {checkpoint_dir}")
+    else:
+        # Resuming from checkpoint: try to extract experiment ID from checkpoint path
+        if resume_from_path:
+            # Try to extract experiment ID from checkpoint path (e.g., /path/to/checkpoints/20240202_120000/global_step_64)
+            path_parts = os.path.normpath(os.path.abspath(resume_from_path)).split(os.sep)
+            # Look for timestamp-like pattern (YYYYMMDD_HHMMSS) in path
+            for part in path_parts:
+                if len(part) == 15 and part[8] == '_' and part[:8].isdigit() and part[9:].isdigit():
+                    experiment_id = part
+                    checkpoint_dir = os.path.join(original_checkpoint_dir, experiment_id)
+                    break
+        if experiment_id is None:
+            # Fallback: check if checkpoint_dir already contains an experiment ID
+            checkpoint_dir_parts = os.path.normpath(original_checkpoint_dir).split(os.sep)
+            for part in checkpoint_dir_parts:
+                if len(part) == 15 and part[8] == '_' and part[:8].isdigit() and part[9:].isdigit():
+                    experiment_id = part
+                    checkpoint_dir = original_checkpoint_dir
+                    break
+        if experiment_id is None:
+            # Last resort: use current timestamp (new experiment for resume)
+            experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            checkpoint_dir = os.path.join(original_checkpoint_dir, experiment_id)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger.info(f"Resuming experiment: {experiment_id}")
+        logger.info(f"Experiment checkpoint directory: {checkpoint_dir}")
+    
+    # Set up file logging now that checkpoint_dir is determined
+    log_dir = os.path.join(checkpoint_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"train_{experiment_id}.log")
+    
+    agl.setup_logging(
+        log_level,
+        files={
+            "agentlightning": log_file,
+            "examples.strategy_extraction": log_file,
+        }
+    )
+    
+    logger.info(f"Logging to file: {log_file}")
+    
+    # Save training configuration for reproducibility (after determining actual validation sets and experiment ID)
     if not resume_from_checkpoint and resume_from_path is None:
         config_save_dir = os.path.join(checkpoint_dir, "training_configs")
         os.makedirs(config_save_dir, exist_ok=True)
-        config_file = os.path.join(config_save_dir, f"config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        config_file = os.path.join(config_save_dir, f"config_{experiment_id}.json")
         training_config = {
+            "experiment_id": experiment_id,
             "timestamp": datetime.now().isoformat(),
             "data_base_path": data_base_path,
             "train_subdir": train_subdir,
@@ -352,15 +391,21 @@ def train(
         # 2. Set AGL_MANAGED_STORE=0 and use --external-store-address
     
     # Create agent with rollout traces directory and validation output directory
+    # Note: experiment_id subdirectories will be created inside agent.__init__
     rollout_traces_dir = os.path.join(checkpoint_dir, "rollout_traces")
     validation_output_dir = os.path.join(checkpoint_dir, "validation_outputs")
+    # Get test_freq from config (validation frequency)
+    test_freq = config.get("trainer", {}).get("test_freq", 50)
     agent = StrategyExtractionAgent(
         save_full_output=save_full_output,
         rollout_traces_dir=rollout_traces_dir,
-        validation_output_dir=validation_output_dir
+        validation_output_dir=validation_output_dir,
+        experiment_id=experiment_id,
+        test_freq=test_freq
     )
     logger.info(f"Rollout traces will be saved to: {rollout_traces_dir}")
     logger.info(f"Validation outputs will be saved to: {validation_output_dir}")
+    logger.info(f"Validation frequency: every {test_freq} steps")
     
     # Create trainer
     logger.info("Creating trainer...")
