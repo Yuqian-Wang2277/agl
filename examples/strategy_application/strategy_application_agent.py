@@ -2,6 +2,7 @@
 
 """Strategy application agent implementation."""
 
+import glob
 import json
 import logging
 import os
@@ -111,6 +112,7 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
         self.validation_outputs: List[Dict[str, Any]] = []
         self.last_rollout_mode: Optional[str] = None
         self.validation_step_counter: int = 0
+        self.worker_id = os.getpid()  # Use process ID to distinguish workers
         
         # Batch statistics tracking for monitoring
         self.batch_rewards: List[float] = []
@@ -130,33 +132,89 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
         )
     
     def save_validation_outputs(self, step: int) -> Optional[str]:
-        """Save collected validation outputs to JSON file.
+        """Save collected validation outputs to a worker-specific temp file, then merge all workers.
+        
+        Each worker saves to a temp file with its process ID. After saving, this method
+        attempts to merge all worker temp files into a single final output file.
         
         Args:
             step: Current training step number.
             
         Returns:
-            Path to saved file if successful, None otherwise.
+            Path to merged file if successful, None otherwise.
         """
         if not self.validation_output_dir or not self.validation_outputs:
             return None
         
-        if step == 0:
-            output_file = os.path.join(self.validation_output_dir, "validation_global_step0.json")
-        else:
-            output_file = os.path.join(
-                self.validation_output_dir, f"validation_global_step{step}.json"
-            )
+        # Save to worker-specific temp file first
+        temp_file = os.path.join(
+            self.validation_output_dir, f"validation_step{step}_worker{self.worker_id}.json"
+        )
         
         try:
-            with open(output_file, "w", encoding="utf-8") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self.validation_outputs, f, ensure_ascii=False, indent=2)
             saved_count = len(self.validation_outputs)
-            logger.info(f"Saved {saved_count} validation outputs to: {output_file}")
+            logger.info(f"[Worker {self.worker_id}] Saved {saved_count} validation outputs to: {temp_file}")
             self.validation_outputs = []
-            return output_file
         except Exception as e:
-            logger.error(f"Failed to save validation outputs: {e}")
+            logger.error(f"[Worker {self.worker_id}] Failed to save validation outputs: {e}")
+            return None
+        
+        # Merge all worker files into final output
+        return self._merge_worker_validation_files(step)
+    
+    def _merge_worker_validation_files(self, step: int) -> Optional[str]:
+        """Merge all worker validation files for a given step into one file.
+        
+        Args:
+            step: Current training step number.
+            
+        Returns:
+            Path to merged file if successful, None otherwise.
+        """
+        if not self.validation_output_dir:
+            return None
+        
+        # Find all worker files for this step
+        pattern = os.path.join(self.validation_output_dir, f"validation_step{step}_worker*.json")
+        worker_files = glob.glob(pattern)
+        
+        if not worker_files:
+            logger.warning(f"No worker validation files found for step {step}")
+            return None
+        
+        # Merge all outputs
+        all_outputs: List[Dict[str, Any]] = []
+        for worker_file in sorted(worker_files):
+            try:
+                with open(worker_file, "r", encoding="utf-8") as f:
+                    outputs = json.load(f)
+                    if isinstance(outputs, list):
+                        all_outputs.extend(outputs)
+                    logger.debug(f"Loaded {len(outputs)} outputs from {worker_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load worker file {worker_file}: {e}")
+        
+        if not all_outputs:
+            return None
+        
+        # Save merged file
+        if step == 0:
+            merged_file = os.path.join(self.validation_output_dir, "validation_global_step0.json")
+        else:
+            merged_file = os.path.join(self.validation_output_dir, f"validation_global_step{step}.json")
+        
+        try:
+            with open(merged_file, "w", encoding="utf-8") as f:
+                json.dump(all_outputs, f, ensure_ascii=False, indent=2)
+            logger.info(
+                f"[Worker {self.worker_id}] Merged {len(all_outputs)} validation outputs "
+                f"from {len(worker_files)} workers to: {merged_file}"
+            )
+            return merged_file
+        except Exception as e:
+            logger.error(f"Failed to save merged validation file: {e}")
             return None
     
     async def rollout_async(
