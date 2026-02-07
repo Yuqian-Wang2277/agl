@@ -147,10 +147,7 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
             return None
         
         # Save to worker-specific temp file first
-        temp_file = os.path.join(
-            self.validation_output_dir, f"validation_step{step}_worker{self.worker_id}.json"
-        )
-        
+        temp_file = os.path.join(self.validation_output_dir, f"validation_step{step}_worker{self.worker_id}.json")        
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self.validation_outputs, f, ensure_ascii=False, indent=2)

@@ -135,6 +135,8 @@ echo "Data base path: $DATA_BASE_PATH"
 echo "Model path: $MODEL_PATH"
 echo ""
 
+EMBEDDING_MODEL_PATH="${EMBEDDING_MODEL_PATH:-/home/test/test16/chenlu/projects/agent-lightning/model/paraphrase-multilingual-MiniLM-L12-v2}"
+
 python -m examples.strategy_application.train_strategy_application \
     --stage2-mode "$STAGE2_MODE" \
     --stage1-model-path "$STAGE1_MODEL_PATH" \

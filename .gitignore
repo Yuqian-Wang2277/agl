@@ -221,3 +221,4 @@ docker/data/
 wandb/
 checkpoints/
 checkpoints_stage2
+model/

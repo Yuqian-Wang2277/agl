@@ -139,7 +139,7 @@ def get_verl_config(
         },
         "data": {
             "train_batch_size": 32,
-            "max_prompt_length": 8192,
+            "max_prompt_length": 16384,
             "max_response_length": 16384,
             "filter_overlong_prompts": True,
         },
