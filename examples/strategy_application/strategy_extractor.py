@@ -68,6 +68,9 @@ class StrategyExtractor:
         system_prompt = get_system_prompt()
         user_prompt = format_user_prompt(examples)
         
+        logger.info(f"Extracting strategy with model: {self.stage1_model_path}, base_url: {effective_base_url}")
+        logger.debug(f"System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
+        
         # Create OpenAI client
         client = AsyncOpenAI(
             base_url=effective_base_url,
@@ -76,6 +79,7 @@ class StrategyExtractor:
         
         try:
             # Call LLM using the stage 1 model path
+            logger.info(f"Calling LLM for strategy extraction...")
             response = await client.chat.completions.create(
                 model=self.stage1_model_path,  # Use stage 1 model path as model identifier
                 messages=[
@@ -87,13 +91,21 @@ class StrategyExtractor:
             )
             
             output = response.choices[0].message.content or ""
+            logger.info(f"Strategy extraction LLM response: length={len(output)} chars, empty={not output}")
+            if output:
+                logger.debug(f"Raw output (first 300 chars): {output[:300]}...")
+            else:
+                logger.error("ERROR: Strategy extraction LLM returned empty output!")
             
             # Extract strategy from <strategy>...</strategy> tags
             from examples.strategy_extraction.reward import extract_strategy
             extracted = extract_strategy(output)
             
             if extracted is None:
-                logger.warning(f"Failed to extract strategy from output: {output[:200]}...")
+                logger.warning(f"Failed to extract strategy from output (no <strategy> tags found)")
+                logger.warning(f"Raw output sample: {output[:200]}...")
+            else:
+                logger.info(f"Strategy extracted successfully: length={len(extracted)} chars")
             
             return extracted
             

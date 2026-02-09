@@ -302,6 +302,16 @@ class AgentLightningTrainer(RayPPOTrainer):
                 self.agent_mode_daemon.clear_data_and_server()
                 self.async_rollout_manager.sleep()
 
+            # Guard against empty batches (e.g. all rollouts failed or produced no triplets)
+            if len(batch) == 0:
+                logger.warning(
+                    "Empty training batch at step %d: all rollouts failed or produced no triplets. "
+                    "Skipping this training step.",
+                    self.global_steps,
+                )
+                metrics["training/empty_batch"] = 1
+                return metrics
+
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)

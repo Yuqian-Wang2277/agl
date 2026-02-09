@@ -30,8 +30,8 @@ class StrategyConfig:
     # Multiple validation sets configuration
     val_subdirs: List[str] = field(default_factory=lambda: ["test-id-subtask", "test-ood-task", "test-bbh"])  # Multiple validation sets for comprehensive evaluation
     model_path: str = "/home/test/test16/chenlu/model/Qwen3-4B"
-    fewshot_min: int = 2
-    fewshot_max: int = 3  # Reduced from 8 to avoid long prompts
+    fewshot_min: int = 3
+    fewshot_max: int = 5  # Reduced from 8 to avoid long prompts
     num_train_samples: int = 20000
     num_val_samples: int = 500
     n_runners: int = 10

@@ -113,6 +113,7 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
         self.last_rollout_mode: Optional[str] = None
         self.validation_step_counter: int = 0
         self.worker_id = os.getpid()  # Use process ID to distinguish workers
+        self._pending_merge_step: Optional[int] = None  # Deferred merge: step awaiting merge
         
         # Batch statistics tracking for monitoring
         self.batch_rewards: List[float] = []
@@ -132,21 +133,31 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
         )
     
     def save_validation_outputs(self, step: int) -> Optional[str]:
-        """Save collected validation outputs to a worker-specific temp file, then merge all workers.
+        """Save collected validation outputs to a worker-specific file.
         
-        Each worker saves to a temp file with its process ID. After saving, this method
-        attempts to merge all worker temp files into a single final output file.
+        Uses deferred merging to avoid race conditions: instead of merging
+        immediately (when other workers may not have saved yet), this method
+        merges the *previous* step's worker files first. By the time the next
+        validation round triggers a save, all workers have finished the
+        previous round, so the merge is guaranteed to be complete.
         
         Args:
             step: Current training step number.
             
         Returns:
-            Path to merged file if successful, None otherwise.
+            Path to the per-worker file if successful, None otherwise.
         """
         if not self.validation_output_dir or not self.validation_outputs:
             return None
         
-        # Save to worker-specific temp file first
+        # Deferred merge: merge the previous step's worker files.
+        # By now all workers have finished the previous validation round
+        # (at least one full training cycle has elapsed), so all per-worker
+        # files are guaranteed to exist.
+        if self._pending_merge_step is not None:
+            self._merge_worker_validation_files(self._pending_merge_step)
+        
+        # Save this worker's file for the current step
         temp_file = os.path.join(self.validation_output_dir, f"validation_step{step}_worker{self.worker_id}.json")        
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
@@ -158,8 +169,9 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
             logger.error(f"[Worker {self.worker_id}] Failed to save validation outputs: {e}")
             return None
         
-        # Merge all worker files into final output
-        return self._merge_worker_validation_files(step)
+        # Record current step as pending merge (will be merged at next save)
+        self._pending_merge_step = step
+        return temp_file
     
     def _merge_worker_validation_files(self, step: int) -> Optional[str]:
         """Merge all worker validation files for a given step into one file.
@@ -250,6 +262,7 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
             extraction_temperature = llm.sampling_parameters.get("temperature", 0.7)
             extraction_max_tokens = llm.sampling_parameters.get("max_tokens", 4000)
 
+            logger.info(f"[Rollout {attempted_rollout.rollout_id}] Calling strategy extractor...")
             strategy = await self.strategy_extractor.extract_strategy(
                 task["fewshot_examples"],
                 temperature=extraction_temperature,
@@ -257,6 +270,15 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
                 base_url=base_url,
                 api_key=llm.api_key or "dummy-key",
             )
+            
+            # DEBUG: Print strategy extraction output
+            logger.info(
+                f"[Rollout {attempted_rollout.rollout_id}] Strategy extraction result: "
+                f"{'SUCCESS' if strategy else 'FAILED'}, "
+                f"length={len(strategy) if strategy else 0} chars"
+            )
+            if strategy:
+                logger.debug(f"[Rollout {attempted_rollout.rollout_id}] Strategy content (first 200 chars): {strategy[:200]}...")
 
             if not strategy:
                 logger.warning(
@@ -287,6 +309,9 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
                     f"{len(user_prompt)} chars"
                 )
 
+                logger.info(f"[Rollout {attempted_rollout.rollout_id}] Calling LLM for strategy application...")
+                logger.info(f"[Rollout {attempted_rollout.rollout_id}] Using base_url: {base_url}")
+                
                 client = AsyncOpenAI(
                     base_url=base_url,
                     api_key=llm.api_key or "dummy-key",
@@ -304,8 +329,19 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
 
                 # Extract response text
                 output = response.choices[0].message.content or ""
-            
-            # Compute reward
+                
+                # DEBUG: Print LLM output
+                logger.info(
+                    f"[Rollout {attempted_rollout.rollout_id}] LLM response received: "
+                    f"length={len(output)} chars, "
+                    f"empty={not output}"
+                )
+                if output:
+                    logger.debug(f"[Rollout {attempted_rollout.rollout_id}] Output (first 200 chars): {output[:200]}...")
+                else:
+                    logger.error(f"[Rollout {attempted_rollout.rollout_id}] ERROR: LLM returned empty output!")
+                
+                # Compute reward
                 final_reward, reward_details = compute_stage2_reward(
                     strategy=strategy,
                     problem=task["problem"],
@@ -322,7 +358,7 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
                     binding_weight=self.binding_weight,
                     intermediate_weight=self.intermediate_weight,
                 )
-            
+                
                 # Extract answer
                 extracted_answer = extract_answer(output)
             
@@ -493,6 +529,9 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
                     f"Reward: {final_reward}"
                 )
             
+            # Record reward to spans for AgentLightning tracking
+            agl.emit_reward(final_reward)
+            
             return float(final_reward)
             
         except Exception as e:
@@ -502,6 +541,12 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
                 exc_info=True,
             )
             logger.info(f"[Rollout {attempted_rollout.rollout_id}] RETURNING reward=0.0 (error)")
+            
+            # Record reward to spans for AgentLightning tracking
+            try:
+                agl.emit_reward(0.0)
+            except Exception as reward_err:
+                logger.warning(f"[Rollout {attempted_rollout.rollout_id}] Failed to emit reward: {reward_err}")
             
             # Track error in batch statistics
             batch_id = attempted_rollout.rollout_id.split('_')[0] if '_' in attempted_rollout.rollout_id else "unknown"

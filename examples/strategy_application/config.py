@@ -48,8 +48,8 @@ class StrategyApplicationConfig:
     val_subdir: str = "test-bbh"
     val_subdirs: List[str] = field(default_factory=lambda: ["test-id-subtask", "test-ood-task", "test-bbh"])
     model_path: str = "/home/test/test16/chenlu/model/Qwen3-4B"
-    fewshot_min: int = 2
-    fewshot_max: int = 3
+    fewshot_min: int = 3
+    fewshot_max: int = 5
     num_train_samples: int = 20000
     num_val_samples: int = 500
     n_runners: int = 10
@@ -179,7 +179,7 @@ def get_verl_config(
         },
         "trainer": {
             "n_gpus_per_node": 8,
-            "val_before_train": False,
+            "val_before_train": True,
             "critic_warmup": 0,
             "logger": ["console", "wandb"],
             "project_name": wandb_project,

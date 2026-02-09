@@ -26,6 +26,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, cast
 
+import glob
+import json
+import re
+
 import agentlightning as agl
 
 # Handle both direct execution and module import
@@ -48,6 +52,66 @@ except ImportError:
     from examples.strategy_application.strategy_extractor import StrategyExtractor
 
 logger = logging.getLogger(__name__)
+
+
+def merge_remaining_validation_files(validation_output_dir: str) -> None:
+    """Merge any per-worker validation files that have not yet been merged.
+
+    Workers save per-worker files as ``validation_step{N}_worker{pid}.json``.
+    The deferred merge strategy inside the agent merges the *previous* step
+    when saving the *current* step, so the very last validation step is
+    left un-merged.  This function scans the directory and merges any step
+    whose worker files exist but whose ``validation_global_step{N}.json``
+    is missing.
+
+    Args:
+        validation_output_dir: Directory containing worker validation files.
+    """
+    if not os.path.isdir(validation_output_dir):
+        return
+
+    # Discover all steps that have per-worker files
+    worker_files = glob.glob(os.path.join(validation_output_dir, "validation_step*_worker*.json"))
+    step_pattern = re.compile(r"validation_step(\d+)_worker")
+    steps_with_workers: set[int] = set()
+    for wf in worker_files:
+        m = step_pattern.search(os.path.basename(wf))
+        if m:
+            steps_with_workers.add(int(m.group(1)))
+
+    for step in sorted(steps_with_workers):
+        if step == 0:
+            merged_path = os.path.join(validation_output_dir, "validation_global_step0.json")
+        else:
+            merged_path = os.path.join(validation_output_dir, f"validation_global_step{step}.json")
+
+        # Skip steps that already have a merged file
+        if os.path.exists(merged_path):
+            continue
+
+        # Merge all worker files for this step
+        pattern = os.path.join(validation_output_dir, f"validation_step{step}_worker*.json")
+        step_worker_files = sorted(glob.glob(pattern))
+        all_outputs: list[dict[str, object]] = []
+        for swf in step_worker_files:
+            try:
+                with open(swf, "r", encoding="utf-8") as f:
+                    outputs = json.load(f)
+                    if isinstance(outputs, list):
+                        all_outputs.extend(outputs)
+            except Exception as e:
+                logger.warning(f"Failed to load worker file {swf}: {e}")
+
+        if all_outputs:
+            try:
+                with open(merged_path, "w", encoding="utf-8") as f:
+                    json.dump(all_outputs, f, ensure_ascii=False, indent=2)
+                logger.info(
+                    f"Final merge: {len(all_outputs)} validation outputs from "
+                    f"{len(step_worker_files)} workers -> {merged_path}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to write merged validation file {merged_path}: {e}")
 
 
 def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
@@ -408,11 +472,9 @@ def train(
         print(f"ERROR: Training failed: {e}")
         raise
     
-    # Save any remaining validation outputs
-    if hasattr(agent, 'validation_outputs') and agent.validation_outputs:
-        saved_path = agent.save_validation_outputs(0)
-        if saved_path:
-            logger.info(f"Final validation outputs saved to: {saved_path}")
+    # Merge any remaining per-worker validation files that were not yet merged
+    # (the deferred merge strategy leaves the last step un-merged).
+    merge_remaining_validation_files(validation_output_dir)
     
     logger.info("=" * 80)
     logger.info("Training completed!")
