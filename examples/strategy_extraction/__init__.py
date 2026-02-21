@@ -11,6 +11,7 @@ from .data_loader import create_strategy_dataset, load_problem_types, sample_few
 from .prompts import format_user_prompt, get_system_prompt
 from .reward import compute_format_reward
 from .strategy_agent import StrategyExtractionAgent, StrategyTask
+from .strategy_generation_agent import StrategyGenerationAgent, StrategyGenerationTask
 
 __all__ = [
     "StrategyConfig",
@@ -22,6 +23,8 @@ __all__ = [
     "compute_format_reward",
     "StrategyExtractionAgent",
     "StrategyTask",
+    "StrategyGenerationAgent",
+    "StrategyGenerationTask",
 ]
 
 

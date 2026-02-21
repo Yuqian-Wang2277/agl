@@ -51,6 +51,11 @@ class StrategyConfig:
     # Logging configuration
     save_full_output: bool = True  # Save complete model output for each rollout to log file
 
+    # Prompt / reward versions (see prompt/ and reward/ packages)
+    strategy_prompt_version: str = "v1"
+    answer_prompt_version: str = "v1"
+    reward_version: str = "v1"
+
 
 def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, resume_from_checkpoint: bool = False, resume_from_path: str | None = None, checkpoint_dir: str = "./checkpoints") -> Dict[str, Any]:
     """Get VERL algorithm configuration.
@@ -121,7 +126,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
         },
         "trainer": {
             "n_gpus_per_node": 8,  # Use all 8 GPUs for parallel training
-            "val_before_train": False,  # Enable validation before training starts
+            "val_before_train": True,  # Enable validation before training starts
             "critic_warmup": 0,
             # Enable WandB logging for tracking training metrics
             # Use ["console"] to disable WandB if connection issues occur

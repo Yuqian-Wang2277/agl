@@ -222,3 +222,4 @@ wandb/
 checkpoints/
 checkpoints_stage2
 model/
+checkpoints_strategy_gen/

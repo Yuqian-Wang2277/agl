@@ -112,7 +112,7 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
         self.validation_outputs: List[Dict[str, Any]] = []
         self.last_rollout_mode: Optional[str] = None
         self.validation_step_counter: int = 0
-        self.worker_id = os.getpid()  # Use process ID to distinguish workers
+        self._worker_id: Optional[int] = None  # Lazily resolved in worker process
         self._pending_merge_step: Optional[int] = None  # Deferred merge: step awaiting merge
         
         # Batch statistics tracking for monitoring
@@ -129,9 +129,22 @@ class StrategyApplicationAgent(agl.LitAgent[StrategyApplicationTask]):
         
         logger.info(
             f"StrategyApplicationAgent initialized "
-            f"(save_full_output={save_full_output}, experiment_id={experiment_id})"
+            f"(save_full_output={save_full_output}, experiment_id={experiment_id}, "
+            f"init_pid={os.getpid()})"
         )
     
+    @property
+    def worker_id(self) -> int:
+        """Return the actual PID of the current (worker) process.
+
+        The value is resolved lazily so that it reflects the worker process
+        rather than the main process that originally created the agent.
+        """
+        if self._worker_id is None:
+            self._worker_id = os.getpid()
+            logger.info(f"Resolved worker_id = {self._worker_id} (pid)")
+        return self._worker_id
+
     def save_validation_outputs(self, step: int) -> Optional[str]:
         """Save collected validation outputs to a worker-specific file.
         

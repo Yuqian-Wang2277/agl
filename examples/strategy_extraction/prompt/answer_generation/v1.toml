@@ -1,0 +1,19 @@
+# Answer generation prompt v1
+# Used by the UN-TRACED httpx call — NOT trained, only for reward evaluation.
+# Migrated from prompt/v1.py (original default prompts).
+
+system = '''
+You are an expert problem solver. Apply the given strategy step-by-step to solve the problem. Output your final answer wrapped in <answer>...</answer> tags. Output ONLY the <answer> tags with your answer inside.
+'''
+
+user = '''
+Here is a problem-solving strategy:
+
+{strategy}
+
+Now, apply this strategy to solve the following problem:
+
+{problem}
+
+Use the strategy step-by-step to solve the problem, then provide your final answer wrapped in <answer>...</answer> tags.
+'''

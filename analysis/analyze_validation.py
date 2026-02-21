@@ -145,8 +145,67 @@ def classify_problem(problem_type: str) -> str:
     return "UNKNOWN"
 
 
+def merge_worker_shards(validation_dir: str) -> None:
+    """Find worker shard files without a merged global file and merge them.
+
+    Shard naming: validation_step{N}_worker{PID}.json
+    Merged naming: validation_global_step{N}.json
+
+    If merging a step fails (e.g. corrupt JSON), that step is skipped with a warning.
+    """
+    shard_pattern = re.compile(r"validation_step(\d+)_worker\d+\.json$")
+    merged_pattern = re.compile(r"validation_global_step(\d+)\.json$")
+
+    # Collect existing merged steps
+    merged_steps: set[int] = set()
+    # Collect shard files grouped by step
+    shard_map: Dict[int, List[str]] = defaultdict(list)
+
+    for fname in os.listdir(validation_dir):
+        m = merged_pattern.match(fname)
+        if m:
+            merged_steps.add(int(m.group(1)))
+            continue
+        m = shard_pattern.match(fname)
+        if m:
+            step = int(m.group(1))
+            shard_map[step].append(os.path.join(validation_dir, fname))
+
+    # Merge steps that have shards but no merged file
+    for step in sorted(shard_map):
+        if step in merged_steps:
+            continue
+        shards = sorted(shard_map[step])
+        merged_data: List[Dict[str, Any]] = []
+        ok = True
+        for shard_path in shards:
+            try:
+                items = load_json_robust(shard_path)
+                if items:
+                    merged_data.extend(items)
+            except Exception as e:
+                logger.warning("合并 step %d 时读取 %s 失败: %s", step, shard_path, e)
+                ok = False
+                break
+        if not ok or not merged_data:
+            print(f"⚠️  Step {step}: 分片合并失败或为空，跳过")
+            continue
+        out_path = os.path.join(validation_dir, f"validation_global_step{step}.json")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(merged_data, f, ensure_ascii=False)
+            print(f"🔀 Step {step}: 合并 {len(shards)} 个分片 → {len(merged_data)} 条 ({os.path.basename(out_path)})")
+        except Exception as e:
+            print(f"⚠️  Step {step}: 写入合并文件失败 ({e})，跳过")
+
+
 def discover_steps(validation_dir: str) -> List[Tuple[int, str]]:
-    """Return sorted list of (step, filepath) found in the directory."""
+    """Return sorted list of (step, filepath) found in the directory.
+
+    Automatically merges any unmerged worker shard files before discovery.
+    """
+    merge_worker_shards(validation_dir)
+
     pattern = re.compile(r"validation_global_step(\d+)\.json$")
     results = []
     for fname in os.listdir(validation_dir):
@@ -344,6 +403,7 @@ def generate_excel(
     all_stats: Dict[int, Dict[str, Optional[Dict[str, float]]]],
     steps: List[int],
     output_path: str,
+    all_data: Optional[Dict[int, List[Dict[str, Any]]]] = None,
 ) -> None:
     """Generate Excel workbook with all analysis tables."""
     wb = Workbook()
@@ -488,6 +548,85 @@ def generate_excel(
     for j in range(len(steps)):
         ws4.column_dimensions[get_column_letter(2 + j)].width = 10
 
+    # ---- Sheet 5: 题型细分 ----
+    if all_data:
+        LEFT_ALIGN = Alignment(horizontal="left", vertical="center")
+        last_step = steps[-1]
+        data = all_data.get(last_step, [])
+        if data:
+            ws5 = wb.create_sheet("题型细分")
+            ws5.cell(row=1, column=1, value=f"Step {last_step} 各题型细分")
+            ws5.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
+            _style_header(ws5, 1, 1, 7)
+
+            headers = ["Cat", "Problem Type", "N", "Acc (%)", "Avg Final", "Avg Fmt", "Avg Corr"]
+            for j, h in enumerate(headers):
+                ws5.cell(row=2, column=1 + j, value=h)
+            _style_header(ws5, 2, 1, 7)
+
+            # Group by category then problem_type
+            cat_type_items: Dict[str, Dict[str, List[Dict[str, Any]]]] = {c: defaultdict(list) for c in CATEGORIES}
+            for item in data:
+                cat = classify_problem(item.get("problem_type", ""))
+                if cat in cat_type_items:
+                    cat_type_items[cat][item.get("problem_type", "unknown")].append(item)
+
+            r = 3
+            for cat in CATEGORIES:
+                type_groups = cat_type_items[cat]
+                if not type_groups:
+                    _style_cat(ws5, r, 1)
+                    ws5.cell(row=r, column=1, value=cat)
+                    ws5.cell(row=r, column=2, value="(no data)")
+                    r += 1
+                    continue
+                cat_n = 0
+                cat_correct = 0
+                cat_final = 0.0
+                cat_fmt = 0.0
+                cat_corr = 0.0
+                for ptype in sorted(type_groups):
+                    items = type_groups[ptype]
+                    tn = len(items)
+                    tc = sum(1 for it in items if it.get("reward", {}).get("correctness_reward", 0) == 1.0)
+                    t_final = sum(it.get("reward", {}).get("final_reward", 0) for it in items) / tn
+                    t_fmt = sum(it.get("reward", {}).get("format_reward", 0) for it in items) / tn
+                    t_corr = sum(it.get("reward", {}).get("correctness_reward", 0) for it in items) / tn
+
+                    _style_cat(ws5, r, 1)
+                    ws5.cell(row=r, column=1, value=cat)
+                    c2 = ws5.cell(row=r, column=2, value=ptype)
+                    c2.alignment = LEFT_ALIGN
+                    c2.border = THIN_BORDER
+                    for ci, val in [(3, tn), (4, round(tc / tn * 100, 1)), (5, round(t_final, 4)),
+                                    (6, round(t_fmt, 4)), (7, round(t_corr, 4))]:
+                        c = ws5.cell(row=r, column=ci, value=val)
+                        c.alignment = CENTER
+                        c.border = THIN_BORDER
+
+                    cat_n += tn
+                    cat_correct += tc
+                    cat_final += t_final * tn
+                    cat_fmt += t_fmt * tn
+                    cat_corr += t_corr * tn
+                    r += 1
+
+                # Category subtotal
+                _style_header(ws5, r, 1, 7)
+                ws5.cell(row=r, column=1, value=cat)
+                ws5.cell(row=r, column=2, value="小计")
+                ws5.cell(row=r, column=3, value=cat_n)
+                ws5.cell(row=r, column=4, value=round(cat_correct / cat_n * 100, 1) if cat_n else 0)
+                ws5.cell(row=r, column=5, value=round(cat_final / cat_n, 4) if cat_n else 0)
+                ws5.cell(row=r, column=6, value=round(cat_fmt / cat_n, 4) if cat_n else 0)
+                ws5.cell(row=r, column=7, value=round(cat_corr / cat_n, 4) if cat_n else 0)
+                r += 1
+
+            ws5.column_dimensions["A"].width = 8
+            ws5.column_dimensions["B"].width = 48
+            for ci in range(3, 8):
+                ws5.column_dimensions[get_column_letter(ci)].width = 14
+
     # Save
     wb.save(output_path)
     print(f"\n✅ Excel文件已保存: {output_path}")
@@ -517,18 +656,34 @@ def main() -> None:
         print(f"❌ 未找到 validation_global_step*.json 文件: {validation_dir}", file=sys.stderr)
         sys.exit(1)
 
+    # Auto-select up to 6 equidistant points if too many steps
+    MAX_POINTS = 6
+    if len(step_files) > MAX_POINTS:
+        n = len(step_files)
+        indices = [round(i * (n - 1) / (MAX_POINTS - 1)) for i in range(MAX_POINTS)]
+        seen: set[int] = set()
+        unique_indices: list[int] = []
+        for idx in indices:
+            if idx not in seen:
+                seen.add(idx)
+                unique_indices.append(idx)
+        step_files = [step_files[i] for i in unique_indices]
+
     steps = [s for s, _ in step_files]
     print(f"📂 验证目录: {validation_dir}")
-    print(f"📊 发现 {len(steps)} 个step文件: {steps}")
+    print(f"📊 分析 {len(steps)} 个step点位: {steps}")
 
     # Load & analyze
     all_stats: Dict[int, Dict[str, Optional[Dict[str, float]]]] = {}
+    all_data: Dict[int, List[Dict[str, Any]]] = {}
     for step, filepath in step_files:
         data = load_json_robust(filepath)
         if not data:
             print(f"⚠️  Step {step}: 加载失败或为空")
             all_stats[step] = {c: None for c in CATEGORIES}
+            all_data[step] = []
             continue
+        all_data[step] = data
         all_stats[step] = analyze_step(data)
         total = sum(all_stats[step][c]["n"] for c in CATEGORIES if all_stats[step][c])
         print(f"   Step {step}: {total} 样本 (ID={all_stats[step]['ID']['n'] if all_stats[step]['ID'] else 0}, "
@@ -543,7 +698,7 @@ def main() -> None:
         output_path = os.path.abspath(args.output)
     else:
         output_path = os.path.join(validation_dir, "analysis_report.xlsx")
-    generate_excel(all_stats, steps, output_path)
+    generate_excel(all_stats, steps, output_path, all_data)
 
 
 if __name__ == "__main__":
