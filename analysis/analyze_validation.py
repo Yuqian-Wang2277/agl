@@ -231,21 +231,41 @@ METRIC_KEYS = [
     "intermediate_reward",
 ]
 
+# Map canonical metric key → list of fallback keys to try in the data
+_REWARD_ALIASES: Dict[str, List[str]] = {
+    "final_reward": ["final_reward", "final"],
+    "format_reward": ["format_reward", "format"],
+    "correctness_reward": ["correctness_reward", "correctness"],
+    "consistency_reward": ["consistency_reward", "consistency"],
+    "coverage_reward": ["coverage_reward", "coverage"],
+    "order_reward": ["order_reward", "order"],
+    "binding_reward": ["binding_reward", "binding"],
+    "intermediate_reward": ["intermediate_reward", "intermediate"],
+}
+
+
+def _get_reward(reward_dict: Dict[str, Any], canonical_key: str, default: float = 0) -> float:
+    """Get reward value trying canonical key then alias fallbacks."""
+    for alias in _REWARD_ALIASES.get(canonical_key, [canonical_key]):
+        if alias in reward_dict:
+            return reward_dict[alias]
+    return default
+
 
 def compute_stats(items: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
     """Compute accuracy / reward metrics for a group of samples."""
     if not items:
         return None
     n = len(items)
-    correct = sum(1 for it in items if it["reward"].get("correctness_reward", 0) == 1.0)
-    fmt_ok = sum(1 for it in items if it["reward"].get("format_reward", 0) == 1.0)
+    correct = sum(1 for it in items if _get_reward(it["reward"], "correctness_reward") == 1.0)
+    fmt_ok = sum(1 for it in items if _get_reward(it["reward"], "format_reward") == 1.0)
     stats: Dict[str, float] = {
         "n": n,
         "acc": correct / n * 100,
         "fmt_acc": fmt_ok / n * 100,
     }
     for key in METRIC_KEYS:
-        stats[key] = sum(it["reward"].get(key, 0) for it in items) / n
+        stats[key] = sum(_get_reward(it["reward"], key) for it in items) / n
     return stats
 
 
@@ -588,10 +608,10 @@ def generate_excel(
                 for ptype in sorted(type_groups):
                     items = type_groups[ptype]
                     tn = len(items)
-                    tc = sum(1 for it in items if it.get("reward", {}).get("correctness_reward", 0) == 1.0)
-                    t_final = sum(it.get("reward", {}).get("final_reward", 0) for it in items) / tn
-                    t_fmt = sum(it.get("reward", {}).get("format_reward", 0) for it in items) / tn
-                    t_corr = sum(it.get("reward", {}).get("correctness_reward", 0) for it in items) / tn
+                    tc = sum(1 for it in items if _get_reward(it.get("reward", {}), "correctness_reward") == 1.0)
+                    t_final = sum(_get_reward(it.get("reward", {}), "final_reward") for it in items) / tn
+                    t_fmt = sum(_get_reward(it.get("reward", {}), "format_reward") for it in items) / tn
+                    t_corr = sum(_get_reward(it.get("reward", {}), "correctness_reward") for it in items) / tn
 
                     _style_cat(ws5, r, 1)
                     ws5.cell(row=r, column=1, value=cat)
