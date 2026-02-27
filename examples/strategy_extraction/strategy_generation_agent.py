@@ -1,13 +1,16 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Strategy generation agent — trains ONLY strategy generation using answer quality as reward.
+"""Strategy generation agent — trains ONLY strategy generation tokens.
 
-This agent inherits from StrategyExtractionAgent and overrides rollout_async to:
-1. Generate a strategy via the traced LLM call (this is what VERL trains)
-2. Apply the strategy to solve a problem via an UN-traced HTTP call (not trained)
-3. Use answer correctness as the reward signal to improve strategy generation
+Reward modes:
+    **v2 (scorer, default)** — a separately trained strategy-scorer LLM
+    directly evaluates strategy quality.  Answer generation (via a *fixed*
+    base model) is optional and only used when ``correctness_weight > 0``.
 
-The answer-generation LLM call is made with raw httpx (bypassing OpenAI SDK tracing)
+    **v1 (legacy)** — answer correctness from the training model is the
+    primary reward signal.
+
+All non-strategy LLM calls use raw httpx (bypassing OpenAI SDK tracing)
 so that only strategy-generation tokens receive gradient updates.
 """
 
@@ -56,12 +59,16 @@ class StrategyGenerationTask(TypedDict):
 
 
 class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
-    """Agent that trains strategy generation using answer quality as reward.
+    """Agent that trains strategy generation using strategy quality as reward.
 
-    Rollout flow:
+    Rollout flow (v2 / scorer mode):
         1. **Traced LLM call** — generate strategy from few-shot examples (trained by VERL).
-        2. **Un-traced HTTP call** — apply strategy to problem via raw httpx (NOT trained).
-        3. Compute reward from answer correctness and strategy format.
+        2. **Un-traced scorer call** — evaluate strategy quality with a trained scorer LLM.
+        3. *(optional)* **Un-traced answer call** — apply strategy via a *fixed* model.
+        4. Compute reward: ``fw * format + sw * scorer + cw * correctness``.
+
+    Fallback (v1 / legacy mode):
+        Same as before — answer correctness from the training model.
     """
 
     def __init__(
@@ -72,14 +79,22 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         experiment_id: Optional[str] = None,
         test_freq: int = 50,
         # Reward weights
-        format_weight: float = 0.2,
-        correctness_weight: float = 0.8,
+        format_weight: float = 0.1,
+        correctness_weight: float = 0.0,
+        scorer_weight: float = 0.9,
         numeric_tolerance: float = 0.02,
         f1_threshold: float = 0.5,
+        # Strategy scorer (trained LLM that evaluates strategy quality)
+        strategy_scorer_base_url: str = "",
+        strategy_scorer_model: str = "",
+        strategy_scoring_prompt_version: str = "v1",
+        # Fixed answer-generation model (frozen weights, not trained)
+        answer_model_base_url: str = "",
+        answer_model_name: str = "",
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
-        reward_version: str = "v1",
+        reward_version: str = "v2",
     ) -> None:
         super().__init__()
         self.save_full_output = save_full_output
@@ -91,8 +106,17 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # Reward weights
         self.format_weight = format_weight
         self.correctness_weight = correctness_weight
+        self.scorer_weight = scorer_weight
         self.numeric_tolerance = numeric_tolerance
         self.f1_threshold = f1_threshold
+
+        # Strategy scorer
+        self.strategy_scorer_base_url = strategy_scorer_base_url
+        self.strategy_scorer_model = strategy_scorer_model
+
+        # Fixed answer model
+        self.answer_model_base_url = answer_model_base_url
+        self.answer_model_name = answer_model_name
 
         # Load TOML prompts and reward config
         self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
@@ -101,6 +125,11 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
         self._strategy_prompt_version = strategy_prompt_version
         self._answer_prompt_version = answer_prompt_version
+
+        # Load scorer prompt (only when a scorer is configured)
+        self.scoring_prompt: Optional[Dict[str, str]] = None
+        if self.strategy_scorer_base_url:
+            self.scoring_prompt = load_prompt("strategy_scoring", strategy_scoring_prompt_version)
 
         if rollout_traces_dir:
             if experiment_id:
@@ -127,7 +156,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
         logger.info(
             f"StrategyGenerationAgent initialized "
-            f"(format_w={format_weight}, correctness_w={correctness_weight}, "
+            f"(format_w={format_weight}, scorer_w={scorer_weight}, "
+            f"correctness_w={correctness_weight}, "
+            f"scorer_url={'SET' if strategy_scorer_base_url else 'NONE'}, "
+            f"answer_url={'SET' if answer_model_base_url else 'training-model'}, "
             f"strategy_prompt={strategy_prompt_version}, "
             f"answer_prompt={answer_prompt_version}, "
             f"reward={self.reward_config.name}, pid={os.getpid()})"
@@ -255,6 +287,71 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         return choices[0].get("message", {}).get("content", "") or ""
 
     # ------------------------------------------------------------------ #
+    #  Un-traced strategy scoring (raw httpx, bypasses OpenTelemetry)
+    # ------------------------------------------------------------------ #
+
+    class _SafeFormatDict(dict):
+        """Dict that returns empty string for missing ``str.format`` keys."""
+        def __missing__(self, key: str) -> str:
+            return ""
+
+    async def _score_strategy_untraced(
+        self,
+        strategy: str,
+        examples_text: str,
+        problem_type: str = "",
+        temperature: float = 0.3,
+        max_tokens: int = 512,
+    ) -> float:
+        """Score strategy quality using the trained scorer LLM via raw httpx.
+
+        Returns a float in [0, 1].  Falls back to 0.0 on any error.
+        """
+        if not self.strategy_scorer_base_url or not self.scoring_prompt:
+            return 0.0
+
+        format_values = self._SafeFormatDict(
+            strategy=strategy,
+            examples_text=examples_text,
+            task=problem_type,
+        )
+
+        url = f"{self.strategy_scorer_base_url}/chat/completions"
+        payload = {
+            "model": self.strategy_scorer_model,
+            "messages": [
+                {"role": "system", "content": self.scoring_prompt["system"]},
+                {
+                    "role": "user",
+                    "content": self.scoring_prompt["user"].format_map(format_values),
+                },
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            choices = data.get("choices", [])
+            if not choices:
+                logger.warning("Strategy scorer returned empty choices")
+                return 0.0
+
+            raw_output = choices[0].get("message", {}).get("content", "") or ""
+            assert self.reward_config.extract_score is not None
+            score = self.reward_config.extract_score(raw_output)
+            logger.debug("Strategy scorer raw=%r  parsed=%.3f", raw_output.strip(), score)
+            return score
+        except Exception as e:
+            logger.warning("Strategy scoring failed (non-fatal): %s", e)
+            return 0.0
+
+    # ------------------------------------------------------------------ #
     #  Main rollout
     # ------------------------------------------------------------------ #
 
@@ -264,12 +361,18 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         resources: agl.NamedResources,
         rollout: agl.Rollout,
     ) -> float:
-        """Execute a rollout: generate strategy (trained) → verify via answer (not trained).
+        """Execute a rollout: generate strategy (trained) → score / verify (not trained).
 
-        Args:
-            task: Task containing few-shot examples, problem, and ground truth.
-            resources: Named resources including the LLM.
-            rollout: Rollout metadata.
+        v2 flow (scorer mode):
+            1. Generate strategy  (traced)
+            2. Score strategy via trained scorer LLM  (un-traced)
+            3. Optionally generate + check answer via fixed model  (un-traced)
+            4. reward = fw*format + sw*scorer + cw*correctness
+
+        v1 flow (legacy):
+            1. Generate strategy  (traced)
+            2. Generate answer via training model  (un-traced)
+            3. reward = fw*format + cw*correctness
 
         Returns:
             Reward in [0, 1].
@@ -287,10 +390,12 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 f"Type: {task['problem_type']}, Mode: {rollout.mode}"
             )
 
+            examples_text = format_examples(task["examples"])
+
             # ---- Step 1: Generate strategy (TRACED — will be trained) ---- #
             system_prompt = self.strategy_prompt["system"]
             user_prompt = self.strategy_prompt["user"].format(
-                examples_text=format_examples(task["examples"]),
+                examples_text=examples_text,
             )
 
             client = AsyncOpenAI(
@@ -317,17 +422,45 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 f"format={format_reward}, length={len(strategy) if strategy else 0}"
             )
 
-            # ---- Step 2: Apply strategy to problem (UN-TRACED — not trained) ---- #
+            use_scorer = self.reward_config.extract_score is not None and self.strategy_scorer_base_url
+
+            # ---- Step 2: Score strategy via trained scorer LLM (UN-TRACED) ---- #
+            scorer_reward = 0.0
+            if use_scorer and strategy:
+                scorer_reward = await self._score_strategy_untraced(
+                    strategy=strategy,
+                    examples_text=examples_text,
+                    problem_type=task["problem_type"],
+                )
+                logger.info(
+                    f"[Rollout {attempted_rollout.rollout_id}] Scorer: {scorer_reward:.3f}"
+                )
+
+            # ---- Step 3: Answer generation (UN-TRACED, optional) ---- #
             correctness = 0.0
             answer_output = ""
             extracted_answer: Optional[str] = None
 
-            if strategy:
+            run_answer = bool(
+                strategy
+                and (
+                    self.correctness_weight > 0
+                    or not use_scorer
+                    or self.answer_model_base_url
+                )
+            )
+            if run_answer:
                 try:
+                    # Use a fixed answer model if configured; otherwise fall
+                    # back to the training model (v1 behaviour).
+                    ans_base_url = self.answer_model_base_url or base_url
+                    ans_api_key = llm.api_key or "dummy-key"
+                    ans_model = self.answer_model_name or llm.model
+
                     answer_output = await self._generate_answer_untraced(
-                        base_url=base_url,
-                        api_key=llm.api_key or "dummy-key",
-                        model=llm.model,
+                        base_url=ans_base_url,
+                        api_key=ans_api_key,
+                        model=ans_model,
                         strategy=strategy,
                         problem=task["problem"],
                         temperature=llm.sampling_parameters.get("temperature", 0.7),
@@ -343,27 +476,35 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         )
                     logger.info(
                         f"[Rollout {attempted_rollout.rollout_id}] Answer: "
-                        f"correctness={correctness}, extracted={extracted_answer[:50] if extracted_answer else 'None'}"
+                        f"correctness={correctness}, "
+                        f"extracted={extracted_answer[:50] if extracted_answer else 'None'}"
                     )
                 except Exception as e:
                     logger.warning(
                         f"[Rollout {attempted_rollout.rollout_id}] "
                         f"Answer generation failed (non-fatal): {e}"
                     )
-            else:
+            elif not strategy:
                 logger.warning(
                     f"[Rollout {attempted_rollout.rollout_id}] No strategy extracted, "
-                    "skipping answer generation"
+                    "skipping downstream steps"
                 )
 
-            # ---- Step 3: Compute reward ---- #
-            final_reward = self.reward_config.compute_final_reward(
-                format_reward, correctness,
-                self.format_weight, self.correctness_weight,
-            )
+            # ---- Step 4: Compute reward ---- #
+            if use_scorer:
+                final_reward = self.reward_config.compute_final_reward(
+                    format_reward, scorer_reward, correctness,
+                    self.format_weight, self.scorer_weight, self.correctness_weight,
+                )
+            else:
+                final_reward = self.reward_config.compute_final_reward(
+                    format_reward, correctness,
+                    self.format_weight, self.correctness_weight,
+                )
 
             reward_details: Dict[str, float] = {
                 "format": format_reward,
+                "scorer": scorer_reward,
                 "correctness": correctness,
                 "final": final_reward,
             }
@@ -465,7 +606,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             if final_reward == 0.0:
                 logger.warning(
                     f"[Rollout {attempted_rollout.rollout_id}] ZERO REWARD - "
-                    f"format={format_reward}, correctness={correctness}"
+                    f"format={format_reward}, scorer={scorer_reward}, "
+                    f"correctness={correctness}"
                 )
             else:
                 logger.info(

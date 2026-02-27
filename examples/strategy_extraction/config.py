@@ -56,8 +56,22 @@ class StrategyConfig:
     answer_prompt_version: str = "v1"
     reward_version: str = "v1"
 
+    # Strategy scorer LLM — a separately trained model that directly evaluates
+    # strategy quality (used by reward v2+).  Served via a standalone vLLM
+    # instance; the user must start the server before training.
+    strategy_scorer_model_path: str = ""
+    strategy_scorer_base_url: str = ""
+    strategy_scoring_prompt_version: str = "v1"
+    scorer_weight: float = 1.0
 
-def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, resume_from_checkpoint: bool = False, resume_from_path: str | None = None, checkpoint_dir: str = "./checkpoints") -> Dict[str, Any]:
+    # Fixed answer-generation model — a frozen copy of the base model so that
+    # the reward signal is not destabilised by the changing training weights.
+    # Leave empty to fall back to the training model (v1 behaviour).
+    answer_model_path: str = ""
+    answer_model_base_url: str = ""
+
+
+def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, resume_from_checkpoint: bool = False, resume_from_path: str | None = None, checkpoint_dir: str = "./checkpoints", n_gpus: int = 8) -> Dict[str, Any]:
     """Get VERL algorithm configuration.
     
     Args:
@@ -77,7 +91,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             "use_kl_in_reward": False,
         },
         "data": {
-            "train_batch_size": 32,
+            "train_batch_size": 24,
             # Context overflow handling:
             # - Prompts > max_prompt_length: truncated and DROPPED from training (no gradient update)
             # - Responses > max_response_length: truncated but KEPT in training
@@ -94,7 +108,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             },
             "rollout": {
                 "tensor_model_parallel_size": 1,
-                "n": 4,
+                "n": 8,
                 "log_prob_micro_batch_size_per_gpu": 4,
                 "name": "vllm",
                 "gpu_memory_utilization": 0.5,  # Further reduced to accommodate larger context window
@@ -106,7 +120,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },
             "actor": {
-                "ppo_mini_batch_size": 32,
+                "ppo_mini_batch_size": 24,
                 "ppo_micro_batch_size_per_gpu": 4,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": False,
@@ -125,7 +139,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             },
         },
         "trainer": {
-            "n_gpus_per_node": 8,  # Use all 8 GPUs for parallel training
+            "n_gpus_per_node": n_gpus,
             "val_before_train": True,  # Enable validation before training starts
             "critic_warmup": 0,
             # Enable WandB logging for tracking training metrics

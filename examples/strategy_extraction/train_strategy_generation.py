@@ -237,6 +237,7 @@ def train(
     num_train_samples: int,
     num_val_samples: int,
     n_runners: int,
+    n_gpus: int,
     lora: bool,
     lora_rank: int,
     external_store_address: str,
@@ -248,12 +249,22 @@ def train(
     resume_from_checkpoint: bool,
     resume_from_path: str | None,
     format_weight: float,
+    scorer_weight: float,
     correctness_weight: float,
     numeric_tolerance: float,
     f1_threshold: float,
     strategy_prompt_version: str,
     answer_prompt_version: str,
     reward_version: str,
+    # Strategy scorer
+    strategy_scorer_model_path: str,
+    strategy_scorer_model_name: str,
+    strategy_scorer_base_url: str,
+    strategy_scoring_prompt_version: str,
+    # Fixed answer model
+    answer_model_path: str,
+    answer_model_base_url: str,
+    answer_model_name: str,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -356,6 +367,14 @@ def train(
                         "strategy_prompt_version": strategy_prompt_version,
                         "answer_prompt_version": answer_prompt_version,
                         "reward_version": reward_version,
+                        "scorer_weight": scorer_weight,
+                        "strategy_scorer_model_path": strategy_scorer_model_path,
+                        "strategy_scorer_model_name": strategy_scorer_model_name,
+                        "strategy_scorer_base_url": strategy_scorer_base_url,
+                        "strategy_scoring_prompt_version": strategy_scoring_prompt_version,
+                        "answer_model_path": answer_model_path,
+                        "answer_model_base_url": answer_model_base_url,
+                        "answer_model_name": answer_model_name,
                         "wandb_project": wandb_project,
                         "wandb_experiment": wandb_experiment,
                         "checkpoint_dir": checkpoint_dir,
@@ -413,6 +432,7 @@ def train(
         resume_from_checkpoint=resume_from_checkpoint,
         resume_from_path=resume_from_path,
         checkpoint_dir=checkpoint_dir,
+        n_gpus=n_gpus,
     )
     config["trainer"]["project_name"] = wandb_project
     config["trainer"]["experiment_name"] = wandb_experiment
@@ -439,9 +459,15 @@ def train(
         experiment_id=experiment_id,
         test_freq=test_freq,
         format_weight=format_weight,
+        scorer_weight=scorer_weight,
         correctness_weight=correctness_weight,
         numeric_tolerance=numeric_tolerance,
         f1_threshold=f1_threshold,
+        strategy_scorer_base_url=strategy_scorer_base_url,
+        strategy_scorer_model=strategy_scorer_model_name or strategy_scorer_model_path,
+        strategy_scoring_prompt_version=strategy_scoring_prompt_version,
+        answer_model_base_url=answer_model_base_url,
+        answer_model_name=answer_model_name or answer_model_path,
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
@@ -497,6 +523,7 @@ def main() -> None:
 
     # Training
     parser.add_argument("--n-runners", type=int, default=StrategyConfig.n_runners)
+    parser.add_argument("--n-gpus", type=int, default=8, help="Number of GPUs for VERL training")
     parser.add_argument("--lora", action="store_true")
     parser.add_argument("--lora-rank", type=int, default=StrategyConfig.lora_rank)
 
@@ -510,10 +537,29 @@ def main() -> None:
     parser.add_argument("--resume-from-path", type=str, default=None)
 
     # Reward weights
-    parser.add_argument("--format-weight", type=float, default=0.2, help="Weight for strategy format reward")
-    parser.add_argument("--correctness-weight", type=float, default=0.8, help="Weight for answer correctness reward")
+    parser.add_argument("--format-weight", type=float, default=0.1, help="Weight for strategy format reward")
+    parser.add_argument("--scorer-weight", type=float, default=0.9, help="Weight for strategy scorer reward (v2)")
+    parser.add_argument("--correctness-weight", type=float, default=0.0, help="Weight for answer correctness reward (0 = disabled)")
     parser.add_argument("--numeric-tolerance", type=float, default=0.02, help="Numeric tolerance for answer matching")
     parser.add_argument("--f1-threshold", type=float, default=0.5, help="F1 threshold for partial answer match")
+
+    # Strategy scorer LLM (separately trained model that scores strategy quality)
+    parser.add_argument("--strategy-scorer-model-path", type=str, default="",
+                        help="Path to the trained strategy-scorer model")
+    parser.add_argument("--strategy-scorer-model-name", type=str, default="",
+                        help="Model name in the scorer vLLM API (must match --served-model-name)")
+    parser.add_argument("--strategy-scorer-base-url", type=str, default="",
+                        help="Base URL of the vLLM server for the strategy scorer (e.g. http://localhost:8100/v1)")
+    parser.add_argument("--strategy-scoring-prompt-version", type=str, default="v1",
+                        help="Prompt version for strategy scoring (see prompt/strategy_scoring/)")
+
+    # Fixed answer-generation model (frozen copy, not trained)
+    parser.add_argument("--answer-model-path", type=str, default="",
+                        help="Path to the fixed answer-generation model")
+    parser.add_argument("--answer-model-base-url", type=str, default="",
+                        help="Base URL of the vLLM server for the fixed answer model (e.g. http://localhost:8200/v1)")
+    parser.add_argument("--answer-model-name", type=str, default="",
+                        help="Model name for the answer API (defaults to answer-model-path if empty)")
 
     # Prompt / reward versions (see prompt/ and reward/ packages)
     parser.add_argument(
@@ -558,6 +604,7 @@ def main() -> None:
         num_train_samples=args.num_train_samples,
         num_val_samples=args.num_val_samples,
         n_runners=args.n_runners,
+        n_gpus=args.n_gpus,
         lora=args.lora,
         lora_rank=args.lora_rank,
         external_store_address=args.external_store_address,
@@ -569,12 +616,20 @@ def main() -> None:
         resume_from_checkpoint=args.resume_from_checkpoint,
         resume_from_path=args.resume_from_path,
         format_weight=args.format_weight,
+        scorer_weight=args.scorer_weight,
         correctness_weight=args.correctness_weight,
         numeric_tolerance=args.numeric_tolerance,
         f1_threshold=args.f1_threshold,
         strategy_prompt_version=args.strategy_prompt_version,
         answer_prompt_version=args.answer_prompt_version,
         reward_version=args.reward_version,
+        strategy_scorer_model_path=args.strategy_scorer_model_path,
+        strategy_scorer_model_name=args.strategy_scorer_model_name,
+        strategy_scorer_base_url=args.strategy_scorer_base_url,
+        strategy_scoring_prompt_version=args.strategy_scoring_prompt_version,
+        answer_model_path=args.answer_model_path,
+        answer_model_base_url=args.answer_model_base_url,
+        answer_model_name=args.answer_model_name,
     )
 
 

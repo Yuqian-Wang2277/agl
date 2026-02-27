@@ -1,0 +1,32 @@
+# Strategy scoring prompt v1
+# Used by the UN-TRACED strategy-scorer LLM — NOT trained, only for reward.
+#
+# The scorer model evaluates the quality of a generated problem-solving
+# strategy given the few-shot examples it was derived from.
+#
+# Customise this file (or create v2.toml) to match your scorer model's
+# expected input format.
+
+system = '''
+You are a strategy quality evaluator. Given a set of example problems and a generated problem-solving strategy, evaluate how well the strategy captures the underlying problem-solving approach.
+
+Rate the strategy on a scale from 0.0 to 1.0 based on:
+- Coverage: Does the strategy capture all key patterns from the examples?
+- Clarity: Is it clear, step-by-step, and executable?
+- Generalizability: Can it be applied to similar unseen problems?
+- Specificity: Is it concrete enough to actually guide problem-solving?
+
+Output ONLY a single number between 0.0 and 1.0.
+'''
+
+user = '''
+Example problems and solutions:
+
+{examples_text}
+Generated strategy:
+<strategy>
+{strategy}
+</strategy>
+
+Quality score (0.0-1.0):
+'''

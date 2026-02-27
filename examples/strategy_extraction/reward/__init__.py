@@ -173,13 +173,17 @@ class RewardConfig:
         compute_answer_correctness:
             ``(answer, ground_truth, numeric_tolerance, f1_threshold) -> float``.
         compute_final_reward:
-            ``(format_reward, correctness, format_weight, correctness_weight) -> float``.
+            Flexible signature — v1 uses ``(fmt, corr, fw, cw)``;
+            v2 uses ``(fmt, scorer, corr, fw, sw, cw)``.
+        extract_score: ``(scorer_output) -> float`` — parse a quality score
+            from the strategy-scorer LLM output.  ``None`` for v1 (unused).
     """
 
     name: str
     extract_answer: Callable[[str], Optional[str]]
     compute_answer_correctness: Callable[[str, str, float, float], float]
-    compute_final_reward: Callable[[float, float, float, float], float]
+    compute_final_reward: Callable[..., float]
+    extract_score: Optional[Callable[[str], float]] = None
 
 
 REWARD_REGISTRY: Dict[str, RewardConfig] = {}
