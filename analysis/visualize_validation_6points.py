@@ -15,6 +15,7 @@ import csv
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -28,6 +29,67 @@ try:
     sns.set_theme(style="whitegrid")
 except Exception:  # pragma: no cover
     sns = None
+
+
+ID_TYPES = {
+    "contextual_parametric_knowledge_conflicts",
+    "cryptonite",
+    "disfl_qa",
+    "elementary_math_qa",
+    "fact_checker",
+    "language_identification",
+    "matrixshapes",
+    "mnist_ascii",
+    "movie_dialog_same_or_different",
+    "vitaminc_fact_verification",
+    "word_unscrambling",
+}
+
+OOD_TYPES = {
+    "arithmetic",
+    "ascii_word_recognition",
+    "chess_state_tracking",
+    "discourse_marker_prediction",
+    "goal_step_wikihow",
+    "hyperbaton",
+    "implicatures",
+    "intersect_geometry",
+    "linguistic_mappings",
+    "modified_arithmetic",
+    "nonsense_words_grammar",
+    "real_or_fake_text",
+    "simp_turing_concept",
+    "snarks",
+    "unnatural_in_context_learning",
+}
+
+HARD_TYPES = {
+    "boolean_expressions",
+    "causal_judgement",
+    "date_understanding",
+    "disambiguation_qa",
+    "dyck_languages",
+    "formal_fallacies",
+    "geometric_shapes",
+    "hyperbaton",
+    "logical_deduction",
+    "movie_recommendation",
+    "multistep_arithmetic_two",
+    "navigate",
+    "object_counting",
+    "penguins_in_a_table",
+    "reasoning_about_colored_objects",
+    "ruin_names",
+    "salient_translation_error_detection",
+    "snarks",
+    "sports_understanding",
+    "temporal_sequences",
+    "tracking_shuffled_objects",
+    "web_of_lies",
+    "word_sorting",
+}
+
+SPLIT_ORDER = ["ID", "OOD", "HARD", "UNKNOWN"]
 
 
 def load_json_robust(filepath: Path) -> List[Dict[str, Any]]:
@@ -98,6 +160,43 @@ def is_number(x: Any) -> bool:
     return isinstance(x, (int, float)) and not math.isnan(float(x))
 
 
+def classify_problem(problem_type: str) -> str:
+    if problem_type in ID_TYPES:
+        return "ID"
+    if problem_type in OOD_TYPES:
+        return "OOD"
+    if problem_type in HARD_TYPES:
+        return "HARD"
+    return "UNKNOWN"
+
+def to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def normalize_text(value: Any) -> str:
+    text = to_text(value).strip().lower()
+    # Lenient normalization: keep only alphanumeric characters.
+    return re.sub(r"[^0-9a-z]+", "", text)
+
+
+def mean_ci(values: List[float]) -> Tuple[float, float, int]:
+    arr = np.array(values, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    n = len(arr)
+    if n == 0:
+        return float("nan"), float("nan"), 0
+    mean = float(arr.mean())
+    if n == 1:
+        return mean, 0.0, 1
+    std = float(arr.std(ddof=1))
+    ci = 1.96 * std / math.sqrt(n)
+    return mean, ci, n
+
+
 def compute_step_metrics(data: List[Dict[str, Any]]) -> Dict[str, Any]:
     sums = defaultdict(float)
     counts = defaultdict(int)
@@ -106,13 +205,37 @@ def compute_step_metrics(data: List[Dict[str, Any]]) -> Dict[str, Any]:
     missing_strategy = 0
     missing_answer = 0
 
-    per_pt_sum = defaultdict(float)
-    per_pt_cnt = defaultdict(int)
-    per_pt_corr_sum = defaultdict(float)
+    metric_names = ["final", "format", "scorer", "correctness"]
+    metric_values: Dict[str, List[float]] = {m: [] for m in metric_names}
+
+    per_pt_metric_sum: Dict[str, Dict[str, float]] = {
+        m: defaultdict(float) for m in metric_names
+    }
+    per_pt_metric_cnt: Dict[str, Dict[str, int]] = {
+        m: defaultdict(int) for m in metric_names
+    }
+    per_pt_total_cnt: Dict[str, int] = defaultdict(int)
+    per_pt_correct_cnt: Dict[str, int] = defaultdict(int)
+    split_metric_sum: Dict[str, Dict[str, float]] = {
+        s: defaultdict(float) for s in SPLIT_ORDER
+    }
+    split_metric_cnt: Dict[str, Dict[str, int]] = {
+        s: defaultdict(int) for s in SPLIT_ORDER
+    }
 
     scatter_points: List[Tuple[float, float, float]] = []  # scorer, correctness, format
+    scorer_correctness_pt: List[Tuple[float, float, str]] = []  # scorer, correctness, problem_type
     strat_len_points: List[Tuple[int, float]] = []  # len(strategy), final
     ans_len_points: List[Tuple[int, float]] = []  # len(answer), correctness
+    strat_len_scorer_points: List[Tuple[int, float]] = []  # len(strategy), scorer
+    calibration_points: List[Tuple[float, float, float]] = []  # scorer, correctness, format
+    quadrant_counts = defaultdict(int)
+    scorer_format_sum = 0.0
+    scorer_format_cnt = 0
+
+    exact_correct = 0
+    norm_correct = 0
+    total_count = 0
 
     for item in data:
         reward = item.get("reward") or {}
@@ -121,18 +244,17 @@ def compute_step_metrics(data: List[Dict[str, Any]]) -> Dict[str, Any]:
         correctness = reward.get("correctness")
         final = reward.get("final")
 
-        if is_number(fmt):
-            sums["format"] += float(fmt)
-            counts["format"] += 1
-        if is_number(scorer):
-            sums["scorer"] += float(scorer)
-            counts["scorer"] += 1
-        if is_number(correctness):
-            sums["correctness"] += float(correctness)
-            counts["correctness"] += 1
-        if is_number(final):
-            sums["final"] += float(final)
-            counts["final"] += 1
+        for name, value in (
+            ("format", fmt),
+            ("scorer", scorer),
+            ("correctness", correctness),
+            ("final", final),
+        ):
+            if is_number(value):
+                value_f = float(value)
+                sums[name] += value_f
+                counts[name] += 1
+                metric_values[name].append(value_f)
 
         output = item.get("output") or {}
         strategy_extracted = output.get("strategy_extracted")
@@ -158,20 +280,69 @@ def compute_step_metrics(data: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             failure_counts["unknown"] += 1
 
+        problem_type = item.get("problem_type")
+
         if is_number(scorer) and is_number(correctness) and is_number(fmt):
             scatter_points.append((float(scorer), float(correctness), float(fmt)))
+            calibration_points.append((float(scorer), float(correctness), float(fmt)))
+            if problem_type:
+                scorer_correctness_pt.append((float(scorer), float(correctness), problem_type))
 
         if isinstance(strategy_extracted, str) and is_number(final):
             strat_len_points.append((len(strategy_extracted), float(final)))
         if isinstance(answer_extracted, str) and is_number(correctness):
             ans_len_points.append((len(answer_extracted), float(correctness)))
+        if isinstance(strategy_extracted, str) and is_number(scorer):
+            strat_len_scorer_points.append((len(strategy_extracted), float(scorer)))
 
-        problem_type = item.get("problem_type")
-        if problem_type and is_number(final):
-            per_pt_sum[problem_type] += float(final)
-            per_pt_cnt[problem_type] += 1
-        if problem_type and is_number(correctness):
-            per_pt_corr_sum[problem_type] += float(correctness)
+        if problem_type:
+            per_pt_total_cnt[problem_type] += 1
+            if is_number(correctness) and float(correctness) == 1:
+                per_pt_correct_cnt[problem_type] += 1
+            for name, value in (
+                ("final", final),
+                ("format", fmt),
+                ("scorer", scorer),
+                ("correctness", correctness),
+            ):
+                if is_number(value):
+                    per_pt_metric_sum[name][problem_type] += float(value)
+                    per_pt_metric_cnt[name][problem_type] += 1
+            split = classify_problem(problem_type)
+            for name, value in (
+                ("final", final),
+                ("format", fmt),
+                ("scorer", scorer),
+                ("correctness", correctness),
+            ):
+                if is_number(value):
+                    split_metric_sum[split][name] += float(value)
+                    split_metric_cnt[split][name] += 1
+
+        # Exact vs normalized accuracy (based on extracted answer vs ground truth)
+        total_count += 1
+        gt_text = to_text((item.get("input") or {}).get("ground_truth"))
+        ans_text = to_text(answer_extracted)
+        if ans_text.strip() and gt_text.strip() and ans_text.strip() == gt_text.strip():
+            exact_correct += 1
+        if normalize_text(ans_text) and normalize_text(gt_text) and normalize_text(ans_text) == normalize_text(gt_text):
+            norm_correct += 1
+
+        if is_number(scorer) and is_number(fmt):
+            scorer_format_sum += float(scorer) * float(fmt)
+            scorer_format_cnt += 1
+
+        if is_number(scorer) and is_number(correctness):
+            is_correct = float(correctness) == 1.0
+            high_score = float(scorer) >= 0.7
+            if high_score and is_correct:
+                quadrant_counts["high_score_correct"] += 1
+            elif high_score and not is_correct:
+                quadrant_counts["high_score_wrong"] += 1
+            elif (not high_score) and is_correct:
+                quadrant_counts["low_score_correct"] += 1
+            else:
+                quadrant_counts["low_score_wrong"] += 1
 
     means = {
         k: (sums[k] / counts[k] if counts[k] else float("nan"))
@@ -186,23 +357,44 @@ def compute_step_metrics(data: List[Dict[str, Any]]) -> Dict[str, Any]:
         "missing_answer_rate": missing_answer / n if n else float("nan"),
     }
 
-    per_pt_mean = {
-        p: per_pt_sum[p] / per_pt_cnt[p] for p in per_pt_cnt if per_pt_cnt[p]
-    }
-    per_pt_corr_mean = {
-        p: per_pt_corr_sum[p] / per_pt_cnt[p] for p in per_pt_cnt if per_pt_cnt[p]
-    }
+    per_pt_metric_mean: Dict[str, Dict[str, float]] = {}
+    for name in metric_names:
+        per_pt_metric_mean[name] = {
+            p: per_pt_metric_sum[name][p] / per_pt_metric_cnt[name][p]
+            for p in per_pt_metric_cnt[name]
+            if per_pt_metric_cnt[name][p]
+        }
+    split_metric_mean: Dict[str, Dict[str, float]] = {}
+    for split in SPLIT_ORDER:
+        split_metric_mean[split] = {}
+        for name in metric_names:
+            if split_metric_cnt[split].get(name):
+                split_metric_mean[split][name] = (
+                    split_metric_sum[split][name] / split_metric_cnt[split][name]
+                )
 
     return {
         "n": n,
         "means": means,
         "failure_counts": dict(failure_counts),
         "missing": missing,
-        "per_pt_mean": per_pt_mean,
-        "per_pt_corr_mean": per_pt_corr_mean,
+        "per_pt_metric_mean": per_pt_metric_mean,
+        "split_metric_mean": split_metric_mean,
+        "per_pt_total_cnt": dict(per_pt_total_cnt),
+        "per_pt_correct_cnt": dict(per_pt_correct_cnt),
+        "metric_values": metric_values,
         "scatter_points": scatter_points,
+        "scorer_correctness_pt": scorer_correctness_pt,
         "strat_len_points": strat_len_points,
         "ans_len_points": ans_len_points,
+        "strat_len_scorer_points": strat_len_scorer_points,
+        "calibration_points": calibration_points,
+        "quadrant_counts": dict(quadrant_counts),
+        "scorer_format_mean": (
+            scorer_format_sum / scorer_format_cnt if scorer_format_cnt else float("nan")
+        ),
+        "exact_acc": exact_correct / total_count if total_count else float("nan"),
+        "norm_acc": norm_correct / total_count if total_count else float("nan"),
     }
 
 
@@ -216,7 +408,11 @@ def save_fig(path: Path) -> None:
     plt.close()
 
 
-def plot_metric_trends(steps: List[int], metrics: Dict[int, Dict[str, float]], out: Path) -> None:
+def plot_metric_trends_simple(
+    steps: List[int],
+    metrics: Dict[int, Dict[str, float]],
+    out: Path,
+) -> None:
     labels = ["final", "format", "scorer", "correctness"]
     plt.figure(figsize=(9, 5))
     for label in labels:
@@ -228,6 +424,73 @@ def plot_metric_trends(steps: List[int], metrics: Dict[int, Dict[str, float]], o
     plt.title("Metric Trends (6 evenly spaced steps)")
     plt.legend(loc="lower right")
     save_fig(out / "metric_trends.png")
+
+
+def plot_metric_trends_by_split(
+    steps: List[int],
+    split_metric_mean_by_step: Dict[int, Dict[str, Dict[str, float]]],
+    out: Path,
+) -> None:
+    metrics = ["final", "correctness", "format", "scorer"]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    axes = axes.flatten()
+
+    for idx, metric in enumerate(metrics):
+        ax = axes[idx]
+        for split in SPLIT_ORDER:
+            ys = []
+            for step in steps:
+                ys.append(split_metric_mean_by_step[step].get(split, {}).get(metric, float("nan")))
+            if all(math.isnan(v) for v in ys):
+                continue
+            ax.plot(steps, ys, marker="o", linewidth=2, label=split)
+        ax.set_ylim(0, 1.05)
+        ax.set_title(metric)
+        ax.grid(True, alpha=0.3)
+        if idx in (2, 3):
+            ax.set_xlabel("Step")
+        if idx in (0, 2):
+            ax.set_ylabel("Mean")
+        if idx == 0:
+            ax.legend(loc="lower right")
+
+    plt.suptitle("Metric Trends by Validation Split", y=1.02)
+    save_fig(out / "metric_trends_by_split.png")
+
+
+def plot_scorer_correctness_by_problem_type(
+    points: List[Tuple[float, float, str]],
+    out: Path,
+) -> None:
+    if not points:
+        return
+    problem_types = sorted({p for _, _, p in points})
+    colors = plt.cm.hsv(np.linspace(0, 1, len(problem_types), endpoint=False))
+    color_map = {p: colors[i] for i, p in enumerate(problem_types)}
+
+    plt.figure(figsize=(9, 6))
+    for scorer, correctness, ptype in points:
+        plt.scatter(scorer, correctness, s=10, alpha=0.5, color=color_map[ptype])
+
+    plt.xlabel("Scorer")
+    plt.ylabel("Correctness")
+    plt.yticks([0, 1], ["0", "1"])
+    plt.ylim(-0.1, 1.1)
+    plt.title("Scorer vs Correctness by Problem Type")
+    handles = [
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color_map[p], markersize=6)
+        for p in problem_types
+    ]
+    plt.legend(
+        handles,
+        problem_types,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        frameon=False,
+        fontsize=6,
+        ncol=1,
+    )
+    save_fig(out / "scatter_scorer_correctness_by_problem_type.png")
 
 
 def plot_failure_buckets(steps: List[int], failures: Dict[int, Dict[str, int]], out: Path) -> None:
@@ -351,26 +614,285 @@ def plot_dumbbell(
     save_fig(out / f"dumbbell_delta_{step_a}_{step_b}.png")
 
 
-def plot_scorer_correctness(scatter_points: List[Tuple[float, float, float]], out: Path) -> None:
-    if not scatter_points:
-        return
-    scorer = np.array([p[0] for p in scatter_points])
-    correctness = np.array([p[1] for p in scatter_points])
-    fmt = np.array([p[2] for p in scatter_points])
-    jitter = (np.random.rand(len(correctness)) - 0.5) * 0.05
-    y = correctness + jitter
+def plot_step_scatter(
+    step_a: int,
+    step_b: int,
+    pt_means: Dict[int, Dict[str, float]],
+    pt_counts: Dict[int, Dict[str, int]],
+    out: Path,
+) -> None:
+    pts = sorted(
+        set(pt_means.get(step_a, {}).keys()) | set(pt_means.get(step_b, {}).keys())
+    )
+    xs = []
+    ys = []
+    sizes = []
+    deltas = []
+    for p in pts:
+        x = pt_means.get(step_a, {}).get(p, float("nan"))
+        y = pt_means.get(step_b, {}).get(p, float("nan"))
+        if math.isnan(x) or math.isnan(y):
+            continue
+        xs.append(x)
+        ys.append(y)
+        deltas.append(y - x)
+        sizes.append(pt_counts.get(step_b, {}).get(p, 1))
+
+    sizes = np.array(sizes, dtype=float)
+    sizes = 40 * (sizes / sizes.max() if sizes.max() else 1.0) + 20
+
+    plt.figure(figsize=(7, 7))
+    sc = plt.scatter(xs, ys, c=deltas, s=sizes, cmap="RdBu", vmin=-0.5, vmax=0.5, alpha=0.7)
+    plt.plot([0, 1], [0, 1], linestyle="--", color="#777777", linewidth=1)
+    plt.xlabel(f"Mean final @ step {step_a}")
+    plt.ylabel(f"Mean final @ step {step_b}")
+    plt.title(f"Problem Type Transfer: Step {step_a} vs Step {step_b}")
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    cbar = plt.colorbar(sc)
+    cbar.set_label("Δ (step_b - step_a)")
+    save_fig(out / "scatter_step0_step750.png")
+
+
+def plot_accuracy_heatmap(
+    steps: List[int],
+    pt_correctness: Dict[int, Dict[str, float]],
+    out: Path,
+) -> None:
+    problem_types = sorted({p for s in pt_correctness for p in pt_correctness[s]})
+    last = steps[-1]
+    problem_types.sort(key=lambda p: pt_correctness[last].get(p, float("nan")), reverse=True)
+
+    matrix = np.full((len(problem_types), len(steps)), np.nan, dtype=float)
+    for i, p in enumerate(problem_types):
+        for j, s in enumerate(steps):
+            matrix[i, j] = pt_correctness[s].get(p, float("nan"))
+
+    plt.figure(figsize=(10, max(6, len(problem_types) * 0.25)))
+    if sns:
+        sns.heatmap(
+            matrix,
+            cmap="viridis",
+            cbar=True,
+            yticklabels=problem_types,
+            xticklabels=steps,
+            vmin=0,
+            vmax=1,
+        )
+    else:
+        plt.imshow(matrix, aspect="auto", cmap="viridis", vmin=0, vmax=1)
+        plt.colorbar()
+        plt.yticks(np.arange(len(problem_types)), problem_types)
+        plt.xticks(np.arange(len(steps)), steps)
+    plt.xlabel("Step")
+    plt.ylabel("Problem type")
+    plt.title("Problem Type Accuracy Heatmap (correctness)")
+    save_fig(out / "heatmap_problem_type_accuracy.png")
+
+
+def plot_easy_hard_curves(
+    steps: List[int],
+    pt_correctness: Dict[int, Dict[str, float]],
+    out: Path,
+) -> None:
+    base = steps[0]
+    easy = []
+    hard = []
+    for p, acc in pt_correctness.get(base, {}).items():
+        if acc > 0.5:
+            easy.append(p)
+        elif acc < 0.2:
+            hard.append(p)
+
+    def mean_for_group(step: int, group: List[str]) -> float:
+        vals = [pt_correctness[step].get(p, float("nan")) for p in group]
+        vals = [v for v in vals if not math.isnan(v)]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    easy_curve = [mean_for_group(s, easy) for s in steps]
+    hard_curve = [mean_for_group(s, hard) for s in steps]
 
     plt.figure(figsize=(9, 5))
-    mask_fmt1 = fmt == 1
-    plt.scatter(scorer[mask_fmt1], y[mask_fmt1], s=12, alpha=0.25, label="format=1")
-    plt.scatter(scorer[~mask_fmt1], y[~mask_fmt1], s=12, alpha=0.5, label="format=0", color="#d62728")
-    plt.yticks([0, 0.5, 1.0], ["0", "0.5", "1"])
-    plt.ylim(-0.1, 1.1)
-    plt.xlabel("Scorer")
-    plt.ylabel("Correctness (jittered)")
-    plt.title("Scorer vs Correctness (all selected steps)")
+    plt.plot(steps, easy_curve, marker="o", linewidth=2, label=f"easy (>50%), n={len(easy)}")
+    plt.plot(steps, hard_curve, marker="s", linewidth=2, label=f"hard (<20%), n={len(hard)}")
+    plt.ylim(0, 1.05)
+    plt.xlabel("Step")
+    plt.ylabel("Accuracy (correctness)")
+    plt.title("Easy vs Hard Tasks (defined at step 0)")
     plt.legend(loc="lower right")
-    save_fig(out / "scatter_scorer_correctness.png")
+    save_fig(out / "accuracy_easy_hard.png")
+
+
+def plot_scorer_hist_steps(
+    scorer_values_by_step: Dict[int, List[float]],
+    out: Path,
+) -> None:
+    steps = list(scorer_values_by_step.keys())
+    bins = np.linspace(0, 1, 21)
+    plt.figure(figsize=(9, 5))
+    for step in steps:
+        vals = scorer_values_by_step[step]
+        if not vals:
+            continue
+        plt.hist(vals, bins=bins, density=True, alpha=0.35, label=f"step {step}")
+    plt.xlabel("Scorer")
+    plt.ylabel("Density")
+    plt.title("Scorer Distribution (selected steps)")
+    plt.legend(loc="upper left")
+    save_fig(out / "scorer_hist_steps.png")
+
+
+def plot_final_reward_decomposition(
+    steps: List[int],
+    metrics: Dict[int, Dict[str, float]],
+    scorer_format_mean: Dict[int, float],
+    out: Path,
+) -> None:
+    format_base = [metrics[s]["format"] * 0.1 for s in steps]
+    scorer_comp = [scorer_format_mean.get(s, float("nan")) * 0.9 for s in steps]
+    correctness_comp = [0.0 for _ in steps]
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(steps, format_base, label="format base (0.1 * format)")
+    plt.bar(steps, scorer_comp, bottom=format_base, label="scorer component (0.9 * scorer * format)")
+    plt.bar(
+        steps,
+        correctness_comp,
+        bottom=np.array(format_base) + np.array(scorer_comp),
+        label="correctness (0 weight)",
+    )
+    plt.xlabel("Step")
+    plt.ylabel("Mean contribution")
+    plt.title("Final Reward Decomposition")
+    plt.legend(loc="upper left")
+    save_fig(out / "final_reward_decomposition.png")
+
+
+def plot_strategy_len_vs_scorer(points: List[Tuple[int, float]], out: Path) -> None:
+    if not points:
+        return
+    x = np.array([p[0] for p in points])
+    y = np.array([p[1] for p in points])
+    plt.figure(figsize=(8, 5))
+    plt.hexbin(x, y, gridsize=40, cmap="Purples", mincnt=1)
+    plt.colorbar(label="count")
+    plt.xlabel("len(strategy_extracted)")
+    plt.ylabel("scorer")
+    plt.ylim(0, 1.05)
+    plt.title("Strategy Length vs Scorer")
+    save_fig(out / "hexbin_strategylen_scorer.png")
+
+
+def plot_quadrant_counts(
+    steps: List[int],
+    quadrant_counts: Dict[int, Dict[str, int]],
+    out: Path,
+) -> None:
+    order = ["high_score_correct", "high_score_wrong", "low_score_correct", "low_score_wrong"]
+    colors = {
+        "high_score_correct": "#2ca02c",
+        "high_score_wrong": "#d62728",
+        "low_score_correct": "#1f77b4",
+        "low_score_wrong": "#ff7f0e",
+    }
+    plt.figure(figsize=(10, 5))
+    bottoms = np.zeros(len(steps))
+    for key in order:
+        vals = [quadrant_counts.get(s, {}).get(key, 0) for s in steps]
+        plt.bar(steps, vals, bottom=bottoms, label=key, color=colors[key])
+        bottoms += np.array(vals)
+    plt.xlabel("Step")
+    plt.ylabel("Count")
+    plt.title("Scorer/Correctness Quadrants (threshold=0.7)")
+    plt.legend(loc="upper right")
+    save_fig(out / "quadrant_counts.png")
+
+
+def plot_scorer_calibration(
+    calibration_by_step: Dict[int, List[Tuple[float, float, float]]],
+    step_a: int,
+    step_b: int,
+    out: Path,
+    bins: int = 10,
+) -> None:
+    def bucket_curve(points: List[Tuple[float, float, float]]) -> Tuple[List[float], List[float]]:
+        if not points:
+            return [], []
+        edges = np.linspace(0, 1, bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2
+        bucket_vals = [[] for _ in range(bins)]
+        for s, c, f in points:
+            if f != 1:
+                continue
+            idx = min(int(s * bins), bins - 1)
+            bucket_vals[idx].append(c)
+        means = [float(np.mean(v)) if v else float("nan") for v in bucket_vals]
+        return centers.tolist(), means
+
+    plt.figure(figsize=(8, 5))
+    for step in (step_a, step_b):
+        centers, means = bucket_curve(calibration_by_step.get(step, []))
+        plt.plot(centers, means, marker="o", linewidth=2, label=f"step {step}")
+    plt.xlabel("Scorer (binned)")
+    plt.ylabel("Mean correctness")
+    plt.title("Scorer Calibration (format=1)")
+    plt.ylim(0, 1.05)
+    plt.legend(loc="lower right")
+    save_fig(out / "scorer_calibration.png")
+
+
+def plot_exact_normalized_gap(
+    steps: List[int],
+    exact_acc: Dict[int, float],
+    norm_acc: Dict[int, float],
+    out: Path,
+) -> None:
+    exact = [exact_acc[s] for s in steps]
+    norm = [norm_acc[s] for s in steps]
+    plt.figure(figsize=(9, 5))
+    plt.plot(steps, exact, marker="o", linewidth=2, label="exact accuracy")
+    plt.plot(steps, norm, marker="s", linewidth=2, label="normalized accuracy")
+    plt.fill_between(steps, exact, norm, alpha=0.2)
+    plt.ylim(0, 1.05)
+    plt.xlabel("Step")
+    plt.ylabel("Accuracy")
+    plt.title("Exact vs Normalized Accuracy (gap shaded)")
+    plt.legend(loc="lower right")
+    save_fig(out / "exact_vs_normalized_accuracy.png")
+
+
+def plot_topk_error_contrib(
+    step: int,
+    pt_counts: Dict[int, Dict[str, int]],
+    pt_correct: Dict[int, Dict[str, int]],
+    out: Path,
+    top_k: int = 15,
+) -> None:
+    total = pt_counts.get(step, {})
+    correct = pt_correct.get(step, {})
+    errors = {p: total.get(p, 0) - correct.get(p, 0) for p in total}
+    errors = {p: v for p, v in errors.items() if v > 0}
+    top = sorted(errors.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    if not top:
+        return
+    labels = [p for p, _ in top][::-1]
+    vals = [v for _, v in top][::-1]
+    total_errors = sum(errors.values()) or 1
+    perc = [v / total_errors * 100 for v in vals]
+
+    plt.figure(figsize=(9, max(5, len(labels) * 0.4)))
+    bars = plt.barh(labels, vals, color="#ff7f0e")
+    plt.xlabel("Error count")
+    plt.title(f"Top-{top_k} Error-Contributing Tasks (step {step})")
+    for b, p in zip(bars, perc):
+        plt.text(
+            b.get_width() + 1,
+            b.get_y() + b.get_height() / 2,
+            f"{p:.1f}%",
+            va="center",
+            fontsize=9,
+        )
+    save_fig(out / "topk_error_contrib.png")
 
 
 def plot_strategy_len_vs_final(points: List[Tuple[int, float]], out: Path) -> None:
@@ -417,8 +939,11 @@ def write_csvs(
     metrics: Dict[int, Dict[str, float]],
     failures: Dict[int, Dict[str, int]],
     missing: Dict[int, Dict[str, float]],
-    pt_means: Dict[int, Dict[str, float]],
-    pt_corr_means: Dict[int, Dict[str, float]],
+    per_pt_metric_mean: Dict[int, Dict[str, Dict[str, float]]],
+    metric_values: Dict[int, Dict[str, List[float]]],
+    split_metric_mean_by_step: Dict[int, Dict[str, Dict[str, float]]],
+    exact_acc: Dict[int, float],
+    norm_acc: Dict[int, float],
     out: Path,
 ) -> None:
     with open(out / "overall_metrics.csv", "w", newline="", encoding="utf-8") as f:
@@ -442,11 +967,48 @@ def write_csvs(
 
     with open(out / "problem_type_metrics.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["problem_type", "step", "mean_final", "mean_correctness"])
-        all_pts = sorted({p for s in pt_means for p in pt_means[s]})
+        w.writerow(["problem_type", "step", "mean_final", "mean_correctness", "mean_format", "mean_scorer"])
+        all_pts = sorted({p for s in per_pt_metric_mean for p in per_pt_metric_mean[s].get("final", {})})
         for p in all_pts:
             for s in steps:
-                w.writerow([p, s, pt_means[s].get(p, ""), pt_corr_means[s].get(p, "")])
+                w.writerow([
+                    p,
+                    s,
+                    per_pt_metric_mean[s].get("final", {}).get(p, ""),
+                    per_pt_metric_mean[s].get("correctness", {}).get(p, ""),
+                    per_pt_metric_mean[s].get("format", {}).get(p, ""),
+                    per_pt_metric_mean[s].get("scorer", {}).get(p, ""),
+                ])
+
+    with open(out / "split_metric_trends.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "split", "final", "correctness", "format", "scorer"])
+        for s in steps:
+            for split in SPLIT_ORDER:
+                w.writerow([
+                    s,
+                    split,
+                    split_metric_mean_by_step[s].get(split, {}).get("final", ""),
+                    split_metric_mean_by_step[s].get(split, {}).get("correctness", ""),
+                    split_metric_mean_by_step[s].get(split, {}).get("format", ""),
+                    split_metric_mean_by_step[s].get(split, {}).get("scorer", ""),
+                ])
+
+    with open(out / "metric_trends_micro_macro.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "metric", "micro_mean", "micro_ci", "macro_mean", "macro_ci", "micro_n", "macro_n"])
+        for s in steps:
+            for metric in ("final", "correctness", "format", "scorer"):
+                micro_mean, micro_ci, micro_n = mean_ci(metric_values[s].get(metric, []))
+                macro_vals = list(per_pt_metric_mean[s].get(metric, {}).values())
+                macro_mean, macro_ci, macro_n = mean_ci(macro_vals)
+                w.writerow([s, metric, micro_mean, micro_ci, macro_mean, macro_ci, micro_n, macro_n])
+
+    with open(out / "exact_vs_normalized_accuracy.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "exact_accuracy", "normalized_accuracy"])
+        for s in steps:
+            w.writerow([s, exact_acc[s], norm_acc[s]])
 
 
 def main() -> None:
@@ -491,9 +1053,18 @@ def main() -> None:
     metrics: Dict[int, Dict[str, float]] = {}
     failures: Dict[int, Dict[str, int]] = {}
     missing: Dict[int, Dict[str, float]] = {}
-    pt_means: Dict[int, Dict[str, float]] = {}
-    pt_corr_means: Dict[int, Dict[str, float]] = {}
-    scatter_points: List[Tuple[float, float, float]] = []
+    per_pt_metric_mean: Dict[int, Dict[str, Dict[str, float]]] = {}
+    per_pt_counts: Dict[int, Dict[str, int]] = {}
+    per_pt_correct: Dict[int, Dict[str, int]] = {}
+    split_metric_mean_by_step: Dict[int, Dict[str, Dict[str, float]]] = {}
+    metric_values: Dict[int, Dict[str, List[float]]] = {}
+    calibration_by_step: Dict[int, List[Tuple[float, float, float]]] = {}
+    scorer_correctness_pt_all: List[Tuple[float, float, str]] = []
+    strat_len_scorer_points: List[Tuple[int, float]] = []
+    quadrant_counts_by_step: Dict[int, Dict[str, int]] = {}
+    scorer_format_mean_by_step: Dict[int, float] = {}
+    exact_acc: Dict[int, float] = {}
+    norm_acc: Dict[int, float] = {}
     strat_len_points: List[Tuple[int, float]] = []
     ans_len_points: List[Tuple[int, float]] = []
 
@@ -503,22 +1074,63 @@ def main() -> None:
         metrics[step] = {"n": summary["n"], **summary["means"]}
         failures[step] = summary["failure_counts"]
         missing[step] = summary["missing"]
-        pt_means[step] = summary["per_pt_mean"]
-        pt_corr_means[step] = summary["per_pt_corr_mean"]
-        scatter_points.extend(summary["scatter_points"])
+        per_pt_metric_mean[step] = summary["per_pt_metric_mean"]
+        per_pt_counts[step] = summary["per_pt_total_cnt"]
+        per_pt_correct[step] = summary["per_pt_correct_cnt"]
+        split_metric_mean_by_step[step] = summary["split_metric_mean"]
+        metric_values[step] = summary["metric_values"]
+        calibration_by_step[step] = summary["calibration_points"]
+        scorer_correctness_pt_all.extend(summary["scorer_correctness_pt"])
+        strat_len_scorer_points.extend(summary["strat_len_scorer_points"])
+        quadrant_counts_by_step[step] = summary["quadrant_counts"]
+        scorer_format_mean_by_step[step] = summary["scorer_format_mean"]
+        exact_acc[step] = summary["exact_acc"]
+        norm_acc[step] = summary["norm_acc"]
         strat_len_points.extend(summary["strat_len_points"])
         ans_len_points.extend(summary["ans_len_points"])
 
-    plot_metric_trends(steps, metrics, output_dir)
-    plot_failure_buckets(steps, failures, output_dir)
-    plot_missing_rates(steps, missing, output_dir)
-    plot_heatmap(steps, pt_means, output_dir, metric_name="final")
-    plot_dumbbell(steps[0], steps[-1], pt_means, output_dir, top_n=args.dumbbell_top)
-    plot_scorer_correctness(scatter_points, output_dir)
-    plot_strategy_len_vs_final(strat_len_points, output_dir)
-    plot_answer_len_vs_correctness(ans_len_points, output_dir)
+    scorer_hist_steps = [0, 200, 500, 750]
+    scorer_values_by_step: Dict[int, List[float]] = {}
+    for step in scorer_hist_steps:
+        if step in metric_values:
+            scorer_values_by_step[step] = metric_values[step].get("scorer", [])
+            continue
+        try:
+            data = load_step_data(validation_dir, step)
+        except FileNotFoundError:
+            continue
+        summary = compute_step_metrics(data)
+        scorer_values_by_step[step] = summary["metric_values"].get("scorer", [])
 
-    write_csvs(steps, metrics, failures, missing, pt_means, pt_corr_means, output_dir)
+    pt_final_means = {s: per_pt_metric_mean[s].get("final", {}) for s in steps}
+    pt_correctness = {s: per_pt_metric_mean[s].get("correctness", {}) for s in steps}
+
+    plot_metric_trends_simple(steps, metrics, output_dir)
+    plot_metric_trends_by_split(steps, split_metric_mean_by_step, output_dir)
+    plot_scorer_correctness_by_problem_type(scorer_correctness_pt_all, output_dir)
+    plot_step_scatter(steps[0], steps[-1], pt_final_means, per_pt_counts, output_dir)
+    plot_accuracy_heatmap(steps, pt_correctness, output_dir)
+    plot_easy_hard_curves(steps, pt_correctness, output_dir)
+    plot_scorer_calibration(calibration_by_step, steps[0], steps[-1], output_dir)
+    plot_scorer_hist_steps(scorer_values_by_step, output_dir)
+    plot_final_reward_decomposition(steps, metrics, scorer_format_mean_by_step, output_dir)
+    plot_exact_normalized_gap(steps, exact_acc, norm_acc, output_dir)
+    plot_topk_error_contrib(steps[-1], per_pt_counts, per_pt_correct, output_dir)
+    plot_strategy_len_vs_scorer(strat_len_scorer_points, output_dir)
+    plot_quadrant_counts(steps, quadrant_counts_by_step, output_dir)
+
+    write_csvs(
+        steps,
+        metrics,
+        failures,
+        missing,
+        per_pt_metric_mean,
+        metric_values,
+        split_metric_mean_by_step,
+        exact_acc,
+        norm_acc,
+        output_dir,
+    )
 
     print(f"Saved charts and CSVs to: {output_dir}")
 
