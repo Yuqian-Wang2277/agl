@@ -1,0 +1,131 @@
+{
+  "val_dir": "/home/test/test16/chenlu/projects/agent-lightning/checkpoints_strategy_gen/20260221_190204/validation_outputs/20260221_190204",
+  "n_records": 24000,
+  "parse_rate": 0.993,
+  "spearman_scorer_correctness": -0.0667,
+  "spearman_final_reward_correctness": -0.0668,
+  "mean_scorer": 0.6282,
+  "mean_correctness": 0.2899,
+  "mean_final_reward": 0.6647,
+  "top_scorer_bin_threshold": 0.8,
+  "top_scorer_bin_size": 7410,
+  "top_scorer_bin_correctness": 0.2671,
+  "approx_grounded_proxy_note": "Phase 0 uses single-sample correctness as a grounded_proxy approximation.",
+  "approx_grounded_proxy_distribution": {
+    "0.00": 16893,
+    "0.50": 298,
+    "1.00": 6809
+  },
+  "scorer_distribution": {
+    "0.00": 238,
+    "0.01": 1,
+    "0.02": 581,
+    "0.03": 103,
+    "0.04": 107,
+    "0.05": 263,
+    "0.06": 30,
+    "0.07": 68,
+    "0.08": 173,
+    "0.09": 1,
+    "0.10": 14,
+    "0.12": 6,
+    "0.14": 3,
+    "0.15": 5170,
+    "0.19": 1,
+    "0.20": 69,
+    "0.23": 2,
+    "0.24": 1,
+    "0.30": 19,
+    "0.31": 1,
+    "0.36": 1,
+    "0.42": 1,
+    "0.51": 1,
+    "0.55": 2,
+    "0.58": 1,
+    "0.65": 2,
+    "0.67": 3,
+    "0.68": 2,
+    "0.70": 9721,
+    "0.72": 1,
+    "0.73": 1,
+    "0.74": 1,
+    "0.77": 1,
+    "0.80": 1,
+    "0.85": 2,
+    "0.86": 2,
+    "0.89": 1,
+    "1.00": 7405
+  },
+  "top_problem_types": [
+    {
+      "problem_type": "hyperbaton",
+      "n_records": 880,
+      "mean_scorer": 0.6911,
+      "mean_correctness": 0.0023,
+      "spearman_scorer_correctness": 0.0571
+    },
+    {
+      "problem_type": "snarks",
+      "n_records": 880,
+      "mean_scorer": 0.6466,
+      "mean_correctness": 0.0045,
+      "spearman_scorer_correctness": 0.0525
+    },
+    {
+      "problem_type": "cryptonite",
+      "n_records": 736,
+      "mean_scorer": 0.5658,
+      "mean_correctness": 0.0401,
+      "spearman_scorer_correctness": 0.1068
+    },
+    {
+      "problem_type": "language_identification",
+      "n_records": 736,
+      "mean_scorer": 0.6909,
+      "mean_correctness": 0.0095,
+      "spearman_scorer_correctness": 0.0298
+    },
+    {
+      "problem_type": "matrixshapes",
+      "n_records": 736,
+      "mean_scorer": 0.6527,
+      "mean_correctness": 0.3302,
+      "spearman_scorer_correctness": -0.0631
+    },
+    {
+      "problem_type": "mnist_ascii",
+      "n_records": 736,
+      "mean_scorer": 0.651,
+      "mean_correctness": 0.0,
+      "spearman_scorer_correctness": null
+    },
+    {
+      "problem_type": "vitaminc_fact_verification",
+      "n_records": 736,
+      "mean_scorer": 0.7078,
+      "mean_correctness": 0.0496,
+      "spearman_scorer_correctness": 0.0005
+    },
+    {
+      "problem_type": "contextual_parametric_knowledge_conflicts",
+      "n_records": 720,
+      "mean_scorer": 0.7621,
+      "mean_correctness": 0.7646,
+      "spearman_scorer_correctness": 0.0143
+    },
+    {
+      "problem_type": "disfl_qa",
+      "n_records": 720,
+      "mean_scorer": 0.7396,
+      "mean_correctness": 0.3201,
+      "spearman_scorer_correctness": 0.0564
+    },
+    {
+      "problem_type": "elementary_math_qa",
+      "n_records": 720,
+      "mean_scorer": 0.5965,
+      "mean_correctness": 0.0007,
+      "spearman_scorer_correctness": 0.0063
+    }
+  ]
+}
