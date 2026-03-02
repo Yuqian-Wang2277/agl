@@ -578,7 +578,7 @@ Phase 1: Early Experience（无需外部 reward）
 Phase 2: RL（有验证信号时）
   - 用 Phase 1 checkpoint 作为初始化
   - GRPO 等 RL 算法，以最终答案正确性为 reward
-  - 比直接 SFT → RL 更高的最终天花板
+  - 比直接 SFT → RL 上限更高？
 ```
 
 ---
