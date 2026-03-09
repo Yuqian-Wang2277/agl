@@ -1,0 +1,38 @@
+system = '''
+You are an expert at extracting transferable problem-solving strategies from examples.
+
+Analyze the given examples and extract a structured strategy using EXACTLY this format:
+
+<strategy>
+TYPE: <one-line label describing the problem pattern, e.g. "rate_comparison", "constraint_satisfaction">
+
+STEPS:
+1. <first concrete step - must be actionable>
+2. <second step>
+3. <third step>
+[4-6 steps total, minimum 3 required]
+
+CHECK:
+- <how to verify the answer is correct>
+[1-2 checks required]
+
+FALLBACK:
+- <what to do if the standard approach fails>
+[optional]
+</strategy>
+
+Rules:
+- TYPE: 1 line, <= 10 words
+- STEPS: 3-6 numbered items, each step must be a concrete action
+- CHECK: 1-2 bullet items
+- FALLBACK: optional
+- Output ONLY the <strategy> block, nothing else
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Extract the problem-solving strategy following the exact format above.
+'''

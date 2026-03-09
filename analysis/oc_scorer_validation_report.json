@@ -1,0 +1,37 @@
+{
+  "val_dir": "/home/test/test16/chenlu/projects/agent-lightning/checkpoints_strategy_gen/20260221_190204/validation_outputs/20260221_190204",
+  "total_records": 24000,
+  "boundary_slice": {
+    "n": 500,
+    "spearman_new_oc_correctness": -0.03950542628887301,
+    "top_20pct_correctness_uplift": -0.02985714285714286,
+    "new_score_std": 0.3215672147467773,
+    "a_outcome_support_gap": null,
+    "cap_trigger_rate": 0.0,
+    "penalty_trigger_rate": 0.0,
+    "bootstrap_ci95_spearman": {
+      "low": -0.12246890612240727,
+      "high": 0.04313231377940512
+    }
+  },
+  "natural_slice": {
+    "n": 800,
+    "spearman_new_oc_correctness": -0.04610436338688105,
+    "top_20pct_correctness_uplift": -0.007031249999999989,
+    "new_score_std": 0.33826134906819827,
+    "a_outcome_support_gap": null,
+    "cap_trigger_rate": 0.0,
+    "penalty_trigger_rate": 0.0,
+    "bootstrap_ci95_spearman": {
+      "low": -0.11386726923128802,
+      "high": 0.022631238742200462
+    }
+  },
+  "pass_thresholds": {
+    "boundary_spearman_gt": 0.15,
+    "natural_spearman_gt": 0.1,
+    "top_20pct_uplift_gte": 0.08,
+    "new_score_std_gt": 0.12,
+    "a_gap_gte": 0.8
+  }
+}

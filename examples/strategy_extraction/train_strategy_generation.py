@@ -155,6 +155,8 @@ def _create_strategy_generation_dataset(
                 "num_shots": len(valid_fewshot),
                 "problem": problem_text,
                 "ground_truth": ground_truth,
+                "ground_truths": [ground_truth],
+                "task_meta": {"problem_type": problem_type},
                 "source_problem_type": None,
             })
             sample_counts[problem_type] += 1
@@ -166,6 +168,38 @@ def _create_strategy_generation_dataset(
 
     logger.info(f"Dataset created: {len(dataset)} samples, distribution: {sample_counts}")
     return dataset
+
+
+def _load_strategy_dataset_from_file(path: str) -> list[dict[str, object]]:
+    """Load pre-built dataset from JSON/JSONL file."""
+    dataset_path = Path(path)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+
+    records: list[dict[str, object]] = []
+    if dataset_path.suffix.lower() == ".jsonl":
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    records.append(item)
+    else:
+        loaded = json.loads(dataset_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, list):
+            records = [item for item in loaded if isinstance(item, dict)]
+        else:
+            raise ValueError(f"JSON dataset must be a list: {dataset_path}")
+
+    for item in records:
+        ground_truth = str(item.get("ground_truth", "") or "")
+        if "ground_truths" not in item:
+            item["ground_truths"] = [ground_truth] if ground_truth else []
+        if "task_meta" not in item:
+            item["task_meta"] = {"problem_type": item.get("problem_type", "unknown")}
+    return records
 
 
 # ---- Merge remaining validation files (same as strategy_application) ---- #
@@ -250,6 +284,9 @@ def train(
     resume_from_path: str | None,
     format_weight: float,
     scorer_weight: float,
+    grounded_proxy_weight: float,
+    reward_mode: str,
+    grounded_proxy_k: int,
     correctness_weight: float,
     numeric_tolerance: float,
     f1_threshold: float,
@@ -265,6 +302,7 @@ def train(
     answer_model_path: str,
     answer_model_base_url: str,
     answer_model_name: str,
+    train_dataset_json: str,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -362,6 +400,9 @@ def train(
                         "lora_rank": lora_rank,
                         "format_weight": format_weight,
                         "correctness_weight": correctness_weight,
+                        "grounded_proxy_weight": grounded_proxy_weight,
+                        "reward_mode": reward_mode,
+                        "grounded_proxy_k": grounded_proxy_k,
                         "numeric_tolerance": numeric_tolerance,
                         "f1_threshold": f1_threshold,
                         "strategy_prompt_version": strategy_prompt_version,
@@ -375,6 +416,7 @@ def train(
                         "answer_model_path": answer_model_path,
                         "answer_model_base_url": answer_model_base_url,
                         "answer_model_name": answer_model_name,
+                        "train_dataset_json": train_dataset_json,
                         "wandb_project": wandb_project,
                         "wandb_experiment": wandb_experiment,
                         "checkpoint_dir": checkpoint_dir,
@@ -389,10 +431,14 @@ def train(
 
     # ---- Load datasets ---- #
     logger.info("Loading training dataset...")
-    print(f"[{datetime.now().isoformat()}] Loading training dataset from: {train_dir}")
-    train_dataset = _create_strategy_generation_dataset(
-        train_dir, fewshot_min, fewshot_max, num_train_samples, seed=42,
-    )
+    if train_dataset_json:
+        print(f"[{datetime.now().isoformat()}] Loading pre-built training dataset: {train_dataset_json}")
+        train_dataset = _load_strategy_dataset_from_file(train_dataset_json)
+    else:
+        print(f"[{datetime.now().isoformat()}] Loading training dataset from: {train_dir}")
+        train_dataset = _create_strategy_generation_dataset(
+            train_dir, fewshot_min, fewshot_max, num_train_samples, seed=42,
+        )
     print(f"[{datetime.now().isoformat()}] Training dataset: {len(train_dataset)} samples")
 
     logger.info("Loading validation datasets...")
@@ -419,6 +465,8 @@ def train(
             raise ValueError(f"Train sample {i} has no problem")
         if not s.get("ground_truth"):
             raise ValueError(f"Train sample {i} has no ground_truth")
+        if not s.get("ground_truths"):
+            raise ValueError(f"Train sample {i} has no ground_truths")
     logger.info("✓ Dataset validation passed")
 
     train_dataset = cast(agl.Dataset[StrategyGenerationTask], train_dataset)
@@ -460,6 +508,9 @@ def train(
         test_freq=test_freq,
         format_weight=format_weight,
         scorer_weight=scorer_weight,
+        proxy_weight=grounded_proxy_weight,
+        reward_mode=reward_mode,
+        grounded_proxy_k=grounded_proxy_k,
         correctness_weight=correctness_weight,
         numeric_tolerance=numeric_tolerance,
         f1_threshold=f1_threshold,
@@ -507,6 +558,12 @@ def main() -> None:
     # Data
     parser.add_argument("--data-base-path", type=str, default=StrategyConfig.data_base_path)
     parser.add_argument("--train-subdir", type=str, default=StrategyConfig.train_subdir)
+    parser.add_argument(
+        "--train-dataset-json",
+        type=str,
+        default="",
+        help="Use pre-built JSON/JSONL dataset instead of generating from train-subdir.",
+    )
     parser.add_argument("--val-subdir", type=str, default=StrategyConfig.val_subdir)
     parser.add_argument("--val-subdirs", type=str, nargs="+", default=None)
 
@@ -539,6 +596,25 @@ def main() -> None:
     # Reward weights
     parser.add_argument("--format-weight", type=float, default=0.1, help="Weight for strategy format reward")
     parser.add_argument("--scorer-weight", type=float, default=0.9, help="Weight for strategy scorer reward (v2)")
+    parser.add_argument(
+        "--grounded-proxy-weight",
+        type=float,
+        default=0.5,
+        help="Weight for grounded proxy in hybrid reward mode",
+    )
+    parser.add_argument(
+        "--reward-mode",
+        type=str,
+        choices=["scorer_only", "hybrid_grounded"],
+        default="hybrid_grounded",
+        help="Reward routing mode",
+    )
+    parser.add_argument(
+        "--grounded-proxy-k",
+        type=int,
+        default=4,
+        help="K samples used to compute grounded proxy",
+    )
     parser.add_argument("--correctness-weight", type=float, default=0.0, help="Weight for answer correctness reward (0 = disabled)")
     parser.add_argument("--numeric-tolerance", type=float, default=0.02, help="Numeric tolerance for answer matching")
     parser.add_argument("--f1-threshold", type=float, default=0.5, help="F1 threshold for partial answer match")
@@ -550,7 +626,7 @@ def main() -> None:
                         help="Model name in the scorer vLLM API (must match --served-model-name)")
     parser.add_argument("--strategy-scorer-base-url", type=str, default="",
                         help="Base URL of the vLLM server for the strategy scorer (e.g. http://localhost:8100/v1)")
-    parser.add_argument("--strategy-scoring-prompt-version", type=str, default="v1",
+    parser.add_argument("--strategy-scoring-prompt-version", type=str, default=StrategyConfig.strategy_scoring_prompt_version,
                         help="Prompt version for strategy scoring (see prompt/strategy_scoring/)")
 
     # Fixed answer-generation model (frozen copy, not trained)
@@ -594,6 +670,7 @@ def main() -> None:
     train(
         data_base_path=args.data_base_path,
         train_subdir=args.train_subdir,
+        train_dataset_json=args.train_dataset_json,
         val_subdir=args.val_subdir,
         val_subdirs=args.val_subdirs if args.val_subdirs else (
             StrategyConfig.val_subdirs if hasattr(StrategyConfig, "val_subdirs") else None
@@ -617,6 +694,9 @@ def main() -> None:
         resume_from_path=args.resume_from_path,
         format_weight=args.format_weight,
         scorer_weight=args.scorer_weight,
+        grounded_proxy_weight=args.grounded_proxy_weight,
+        reward_mode=args.reward_mode,
+        grounded_proxy_k=args.grounded_proxy_k,
         correctness_weight=args.correctness_weight,
         numeric_tolerance=args.numeric_tolerance,
         f1_threshold=args.f1_threshold,

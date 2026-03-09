@@ -25,6 +25,7 @@ import re
 from typing import Optional
 
 from . import RewardConfig, register
+from .hybrid_grounded_reward import parse_oc_scorer_response
 
 logger = logging.getLogger(__name__)
 
@@ -56,15 +57,21 @@ def extract_score(output: str) -> float:
 
     # 1a. Direct JSON parse
     obj = _try_parse_json(text)
-    if obj is not None and "score" in obj:
-        return _clamp01(float(obj["score"]))
+    if obj is not None:
+        if "score" in obj:
+            return _clamp01(float(obj["score"]))
+        if "dimension_scores" in obj:
+            return _clamp01(float(parse_oc_scorer_response(text)["final_score_01"]))
 
     # 1b. Regex fallback — find the outermost { … } block
     m = re.search(r"\{[\s\S]*\}", text)
     if m:
         obj = _try_parse_json(m.group(0))
-        if obj is not None and "score" in obj:
-            return _clamp01(float(obj["score"]))
+        if obj is not None:
+            if "score" in obj:
+                return _clamp01(float(obj["score"]))
+            if "dimension_scores" in obj:
+                return _clamp01(float(parse_oc_scorer_response(m.group(0))["final_score_01"]))
 
     # 2. Standalone number on a line (most common for simple scorers)
     for line in text.splitlines():

@@ -1,0 +1,18 @@
+{
+  "n_total_records": 24000,
+  "n_groups_total": 1500,
+  "n_groups_eligible": 1500,
+  "pairwise_accuracy_in_group": 0.30777047220561865,
+  "pairwise_accuracy_in_group_old_reward": 0.3077106993424985,
+  "pairwise_margin_calibration": 0.351486689293507,
+  "effective_gradient_group_rate": 0.9986666666666667,
+  "reward_std_within_group": 0.27964981587936527,
+  "reward_std_within_group_old_reward": 0.3093771175641758,
+  "thresholds": {
+    "pairwise_accuracy_in_group_gt": 0.6,
+    "effective_gradient_group_rate_gt": 0.55
+  },
+  "notes": {
+    "cross_sample_pairwise": "Not treated as gate metric; in-group metrics are primary."
+  }
+}
