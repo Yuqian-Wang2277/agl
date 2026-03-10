@@ -70,7 +70,7 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --num-val-samples 500 \
     --n-runners 10 \
     --n-gpus 6 \
-    --reward-version v2 \
+    --reward-version v3 \
     --reward-mode hybrid_grounded \
     --format-weight 0.1 \
     --scorer-weight 0.4 \
@@ -84,8 +84,8 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --answer-model-path /home/test/test16/chenlu/model/Qwen3-4B \
     --answer-model-base-url http://localhost:8200/v1 \
     --answer-model-name Qwen3-4B \
-    --strategy-prompt-version strategy_structured_schema \
+    --strategy-prompt-version strategy_update_2026-03-09 \
     --answer-prompt-version v1 \
     --wandb-project StrategyGeneration \
-    --wandb-experiment strategy_gen_v2 \
+    --wandb-experiment strategy_gen_v3 \
     "$@"

@@ -104,6 +104,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # Fixed answer-generation model (frozen weights, not trained)
         answer_model_base_url: str = "",
         answer_model_name: str = "",
+        use_strategy_for_answer: bool = True,
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
@@ -135,6 +136,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # Fixed answer model
         self.answer_model_base_url = answer_model_base_url
         self.answer_model_name = answer_model_name
+        self.use_strategy_for_answer = use_strategy_for_answer
 
         # Load TOML prompts and reward config
         self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
@@ -180,6 +182,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             f"reward_mode={reward_mode}, grounded_proxy_k={self.grounded_proxy_k}, "
             f"scorer_url={'SET' if strategy_scorer_base_url else 'NONE'}, "
             f"answer_url={'SET' if answer_model_base_url else 'training-model'}, "
+            f"use_strategy_for_answer={self.use_strategy_for_answer}, "
             f"strategy_prompt={strategy_prompt_version}, "
             f"answer_prompt={answer_prompt_version}, "
             f"reward={self.reward_config.name}, pid={os.getpid()})"
@@ -499,11 +502,12 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     ans_model = self.answer_model_name or llm.model
 
                     async def _answer_once(bound_strategy: str) -> str:
+                        answer_strategy = bound_strategy if self.use_strategy_for_answer else ""
                         return await self._generate_answer_untraced(
                             base_url=ans_base_url,
                             api_key=ans_api_key,
                             model=ans_model,
-                            strategy=bound_strategy,
+                            strategy=answer_strategy,
                             problem=task["problem"],
                             temperature=llm.sampling_parameters.get("temperature", 0.7),
                             max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
@@ -598,11 +602,12 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         ans_base_url = self.answer_model_base_url or base_url
                         ans_api_key = llm.api_key or "dummy-key"
                         ans_model = self.answer_model_name or llm.model
+                        answer_strategy = strategy if self.use_strategy_for_answer else ""
                         answer_output = await self._generate_answer_untraced(
                             base_url=ans_base_url,
                             api_key=ans_api_key,
                             model=ans_model,
-                            strategy=strategy,
+                            strategy=answer_strategy,
                             problem=task["problem"],
                             temperature=llm.sampling_parameters.get("temperature", 0.7),
                             max_tokens=llm.sampling_parameters.get("max_tokens", 4000),

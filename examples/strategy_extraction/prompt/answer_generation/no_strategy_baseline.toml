@@ -1,0 +1,13 @@
+system = '''
+You are an expert problem solver. Solve the problem directly and output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside.
+'''
+
+user = '''
+Solve the following problem directly (no strategy is provided):
+
+{problem}
+
+Return only:
+<answer>your final answer</answer>
+'''

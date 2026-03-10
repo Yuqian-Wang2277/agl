@@ -170,6 +170,118 @@ def _create_strategy_generation_dataset(
     return dataset
 
 
+def _create_strategy_generation_dataset_per_subtask(
+    data_dir: str,
+    fewshot_min: int,
+    fewshot_max: int,
+    samples_per_subtask: int,
+    seed: int = 42,
+) -> list[dict[str, object]]:
+    """Create validation dataset with fixed quota per subtask JSON file.
+
+    Sampling rule:
+    - Iterate all ``<problem_type>/*.json`` files in deterministic order.
+    - Sample exactly ``samples_per_subtask`` records per subtask file.
+    - Randomness is controlled by a single seed for full reproducibility.
+    """
+    import random
+
+    rng = random.Random(seed)
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Validation directory not found: {data_dir}")
+
+    dataset: list[dict[str, object]] = []
+    subtask_counter = 0
+    split_name = data_path.name
+
+    for problem_type_dir in sorted([p for p in data_path.iterdir() if p.is_dir()], key=lambda p: p.name):
+        problem_type = problem_type_dir.name
+        for subtask_file in sorted(problem_type_dir.glob("*.json"), key=lambda p: p.name):
+            try:
+                raw = json.loads(subtask_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"Skip invalid json file {subtask_file}: {e}")
+                continue
+
+            examples_raw = raw.get("examples", [])
+            if not isinstance(examples_raw, list):
+                logger.warning(f"Skip malformed examples field: {subtask_file}")
+                continue
+
+            examples_pool: list[dict[str, object]] = []
+            for ex in examples_raw:
+                if not isinstance(ex, dict):
+                    continue
+                ex_input = ex.get("input", "")
+                ex_target = ex.get("target", [])
+                if not ex_input or not str(ex_input).strip():
+                    continue
+                if isinstance(ex_target, list):
+                    if not ex_target:
+                        continue
+                    if not str(ex_target[0]).strip():
+                        continue
+                elif not str(ex_target).strip():
+                    continue
+                examples_pool.append(ex)
+
+            if len(examples_pool) < 2:
+                logger.warning(f"Skip tiny subtask (<2 valid examples): {subtask_file}")
+                continue
+
+            subtask_name = subtask_file.stem
+            subtask_id = f"{problem_type}/{subtask_name}"
+
+            for _ in range(samples_per_subtask):
+                # Need at least one problem sample in addition to few-shot examples.
+                effective_fewshot_max = min(fewshot_max, len(examples_pool) - 1)
+                if effective_fewshot_max < fewshot_min:
+                    n_shots = max(1, effective_fewshot_max)
+                else:
+                    n_shots = rng.randint(fewshot_min, effective_fewshot_max)
+
+                picked = rng.sample(examples_pool, n_shots + 1)
+                fewshot = picked[:-1]
+                problem_ex = picked[-1]
+
+                problem_text = str(problem_ex.get("input", "") or "")
+                target_val = problem_ex.get("target", [])
+                if isinstance(target_val, list):
+                    ground_truth = str(target_val[0]) if target_val else ""
+                else:
+                    ground_truth = str(target_val)
+                if not problem_text.strip() or not ground_truth.strip():
+                    continue
+
+                dataset.append(
+                    {
+                        "problem_type": problem_type,
+                        "examples": fewshot,
+                        "num_shots": len(fewshot),
+                        "problem": problem_text,
+                        "ground_truth": ground_truth,
+                        "ground_truths": [ground_truth],
+                        "task_meta": {
+                            "problem_type": problem_type,
+                            "subtask": subtask_name,
+                            "subtask_id": subtask_id,
+                            "validation_split": split_name,
+                        },
+                        "source_problem_type": subtask_id,
+                    }
+                )
+            subtask_counter += 1
+
+    logger.info(
+        "Per-subtask validation dataset created: %d samples, %d subtasks, %d per subtask",
+        len(dataset),
+        subtask_counter,
+        samples_per_subtask,
+    )
+    return dataset
+
+
 def _load_strategy_dataset_from_file(path: str) -> list[dict[str, object]]:
     """Load pre-built dataset from JSON/JSONL file."""
     dataset_path = Path(path)
@@ -242,6 +354,122 @@ def _merge_remaining_validation_files(validation_output_dir: str) -> None:
                 logger.error(f"Merge failed for {merged_path}: {e}")
 
 
+def _summarize_validation_outputs(saved_path: str) -> None:
+    """Print baseline accuracy summary from saved validation outputs."""
+    try:
+        with open(saved_path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load validation outputs for summary: {e}")
+        return
+
+    if not isinstance(rows, list) or not rows:
+        logger.warning(f"Validation output file is empty: {saved_path}")
+        return
+
+    overall_scores: list[float] = []
+    by_split: dict[str, list[float]] = {}
+    by_source_type: dict[str, list[float]] = {}
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        reward = item.get("reward", {})
+        if not isinstance(reward, dict):
+            continue
+        correctness = reward.get("correctness", None)
+        if correctness is None:
+            continue
+        try:
+            score = float(correctness)
+        except Exception:
+            continue
+        overall_scores.append(score)
+
+        task_meta = item.get("input", {}).get("task_meta", {})
+        if isinstance(task_meta, dict):
+            split = str(task_meta.get("validation_split", "unknown"))
+            by_split.setdefault(split, []).append(score)
+
+        source_type = item.get("source_problem_type", None)
+        if source_type is not None:
+            key = str(source_type).split("/")[0]
+            by_source_type.setdefault(key, []).append(score)
+
+    if not overall_scores:
+        logger.warning(f"No valid correctness values found in {saved_path}")
+        return
+
+    def _mean(vals: list[float]) -> float:
+        return sum(vals) / len(vals) if vals else 0.0
+
+    print("\n" + "=" * 90)
+    print("No-Strategy Baseline (v3 correctness) — Validation Summary")
+    print("=" * 90)
+    print(f"File         : {saved_path}")
+    print(f"Samples      : {len(overall_scores)}")
+    print(f"Acc_soft(all): {_mean(overall_scores):.4f}")
+
+    if by_split:
+        print("\nBy validation split:")
+        for split in sorted(by_split.keys()):
+            vals = by_split[split]
+            print(f"  - {split:20s} n={len(vals):4d}  acc_soft={_mean(vals):.4f}")
+    elif by_source_type:
+        print("\nBy source problem type:")
+        for key in sorted(by_source_type.keys()):
+            vals = by_source_type[key]
+            print(f"  - {key:24s} n={len(vals):4d}  acc_soft={_mean(vals):.4f}")
+    print("=" * 90 + "\n")
+
+
+def _recover_validation_outputs_from_rollout_traces(
+    *,
+    rollout_traces_file: str,
+    validation_output_dir: str,
+    step: int = 0,
+) -> Optional[str]:
+    """Recover validation outputs from rollout traces when worker flush did not happen."""
+    if not os.path.isfile(rollout_traces_file):
+        return None
+
+    recovered_rows: list[dict[str, object]] = []
+    try:
+        with open(rollout_traces_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("mode", "")) == "train":
+                    continue
+                recovered_rows.append(row)
+    except Exception as e:
+        logger.warning(f"Failed to read rollout traces for recovery: {e}")
+        return None
+
+    if not recovered_rows:
+        return None
+
+    os.makedirs(validation_output_dir, exist_ok=True)
+    recovered_path = os.path.join(validation_output_dir, f"validation_global_step{step}.json")
+    try:
+        with open(recovered_path, "w", encoding="utf-8") as f:
+            json.dump(recovered_rows, f, ensure_ascii=False, indent=2)
+        logger.warning(
+            f"Recovered {len(recovered_rows)} validation rows from traces -> {recovered_path}"
+        )
+        return recovered_path
+    except Exception as e:
+        logger.warning(f"Failed to write recovered validation outputs: {e}")
+        return None
+
+
 def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
     """Find an available port starting from start_port."""
     for port in range(start_port, start_port + max_attempts):
@@ -270,6 +498,9 @@ def train(
     fewshot_max: int,
     num_train_samples: int,
     num_val_samples: int,
+    val_sampling_mode: str,
+    val_samples_per_subtask: int,
+    val_sampling_seed: int,
     n_runners: int,
     n_gpus: int,
     lora: bool,
@@ -302,7 +533,9 @@ def train(
     answer_model_path: str,
     answer_model_base_url: str,
     answer_model_name: str,
+    use_strategy_for_answer: bool,
     train_dataset_json: str,
+    val_only: bool,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -339,6 +572,8 @@ def train(
     train_dir = os.path.join(data_base_path, train_subdir)
     validation_subdirs = val_subdirs if val_subdirs else [val_subdir]
     logger.info(f"Validation sets: {validation_subdirs}")
+    if val_sampling_mode == "per_subtask_fixed" and val_samples_per_subtask <= 0:
+        raise ValueError("val_samples_per_subtask must be > 0 in per_subtask_fixed mode")
 
     # Experiment ID
     experiment_id: str | None = None
@@ -430,16 +665,21 @@ def train(
             logger.warning(f"Failed to save config: {e}")
 
     # ---- Load datasets ---- #
-    logger.info("Loading training dataset...")
-    if train_dataset_json:
-        print(f"[{datetime.now().isoformat()}] Loading pre-built training dataset: {train_dataset_json}")
-        train_dataset = _load_strategy_dataset_from_file(train_dataset_json)
+    train_dataset: list[dict[str, object]]
+    if val_only:
+        logger.info("val_only=True: skip loading training dataset from disk.")
+        train_dataset = []
     else:
-        print(f"[{datetime.now().isoformat()}] Loading training dataset from: {train_dir}")
-        train_dataset = _create_strategy_generation_dataset(
-            train_dir, fewshot_min, fewshot_max, num_train_samples, seed=42,
-        )
-    print(f"[{datetime.now().isoformat()}] Training dataset: {len(train_dataset)} samples")
+        logger.info("Loading training dataset...")
+        if train_dataset_json:
+            print(f"[{datetime.now().isoformat()}] Loading pre-built training dataset: {train_dataset_json}")
+            train_dataset = _load_strategy_dataset_from_file(train_dataset_json)
+        else:
+            print(f"[{datetime.now().isoformat()}] Loading training dataset from: {train_dir}")
+            train_dataset = _create_strategy_generation_dataset(
+                train_dir, fewshot_min, fewshot_max, num_train_samples, seed=42,
+            )
+        print(f"[{datetime.now().isoformat()}] Training dataset: {len(train_dataset)} samples")
 
     logger.info("Loading validation datasets...")
     import itertools
@@ -448,14 +688,45 @@ def train(
     for i, vs in enumerate(validation_subdirs):
         vd = os.path.join(data_base_path, vs)
         logger.info(f"Loading val set {i + 1}/{len(validation_subdirs)}: {vs}")
-        vds = _create_strategy_generation_dataset(
-            vd, fewshot_min, fewshot_max, num_val_samples, seed=43 + i,
-        )
+        if val_sampling_mode == "per_subtask_fixed":
+            vds = _create_strategy_generation_dataset_per_subtask(
+                vd,
+                fewshot_min=fewshot_min,
+                fewshot_max=fewshot_max,
+                samples_per_subtask=val_samples_per_subtask,
+                seed=val_sampling_seed,
+            )
+        else:
+            vds = _create_strategy_generation_dataset(
+                vd, fewshot_min, fewshot_max, num_val_samples, seed=43 + i,
+            )
         val_datasets.append(vds)
         logger.info(f"  {vs}: {len(vds)} samples")
     val_dataset = list(itertools.chain.from_iterable(val_datasets))
 
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    if val_only:
+        if not val_dataset:
+            raise ValueError("Validation dataset is empty in val_only mode.")
+        # VERL still builds train_dataloader in val_only init path; provide one
+        # guaranteed-short placeholder sample to avoid empty-train assertion.
+        train_dataset = [
+            {
+                "problem_type": "__val_only_placeholder__",
+                "examples": [
+                    {"input": "1 + 1 = ?", "target": ["2"]},
+                    {"input": "2 + 2 = ?", "target": ["4"]},
+                    {"input": "3 + 3 = ?", "target": ["6"]},
+                ],
+                "num_shots": 3,
+                "problem": "1 + 2 = ?",
+                "ground_truth": "3",
+                "ground_truths": ["3"],
+                "task_meta": {"problem_type": "__val_only_placeholder__"},
+                "source_problem_type": "__val_only_placeholder__",
+            }
+        ]
 
     # Validate
     for i, s in enumerate(train_dataset):
@@ -482,6 +753,11 @@ def train(
         checkpoint_dir=checkpoint_dir,
         n_gpus=n_gpus,
     )
+    if val_only:
+        config["trainer"]["val_only"] = True
+        # Ensure trainer init can always form at least one train batch.
+        config["data"]["train_batch_size"] = 1
+        config["data"]["filter_overlong_prompts"] = False
     config["trainer"]["project_name"] = wandb_project
     config["trainer"]["experiment_name"] = wandb_experiment
     config["trainer"]["default_local_dir"] = checkpoint_dir
@@ -519,6 +795,7 @@ def train(
         strategy_scoring_prompt_version=strategy_scoring_prompt_version,
         answer_model_base_url=answer_model_base_url,
         answer_model_name=answer_model_name or answer_model_path,
+        use_strategy_for_answer=use_strategy_for_answer,
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
@@ -538,6 +815,30 @@ def train(
         raise
 
     _merge_remaining_validation_files(validation_output_dir)
+
+    if val_only:
+        merged_files = sorted(glob.glob(os.path.join(validation_output_dir, "validation_global_step*.json")))
+        if merged_files:
+            latest_path = merged_files[-1]
+            logger.info(f"val_only run: using validation outputs at {latest_path}")
+            _summarize_validation_outputs(latest_path)
+        else:
+            rollout_traces_file = os.path.join(
+                rollout_traces_dir,
+                experiment_id,
+                "rollout_traces.jsonl",
+            )
+            recovered_path = _recover_validation_outputs_from_rollout_traces(
+                rollout_traces_file=rollout_traces_file,
+                validation_output_dir=validation_output_dir,
+                step=0,
+            )
+            if recovered_path:
+                _summarize_validation_outputs(recovered_path)
+            else:
+                logger.warning(
+                    "val_only run produced no validation output files and could not recover from traces."
+                )
 
     logger.info("=" * 80)
     logger.info("Training completed!")
@@ -577,6 +878,25 @@ def main() -> None:
     # Dataset size
     parser.add_argument("--num-train-samples", type=int, default=StrategyConfig.num_train_samples)
     parser.add_argument("--num-val-samples", type=int, default=StrategyConfig.num_val_samples)
+    parser.add_argument(
+        "--val-sampling-mode",
+        type=str,
+        choices=["problem_type_balanced", "per_subtask_fixed"],
+        default="problem_type_balanced",
+        help="Validation sampling mode: legacy balanced-by-problem-type or fixed per subtask.",
+    )
+    parser.add_argument(
+        "--val-samples-per-subtask",
+        type=int,
+        default=20,
+        help="Used when --val-sampling-mode=per_subtask_fixed. Samples per subtask JSON.",
+    )
+    parser.add_argument(
+        "--val-sampling-seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible validation sampling.",
+    )
 
     # Training
     parser.add_argument("--n-runners", type=int, default=StrategyConfig.n_runners)
@@ -653,9 +973,24 @@ def main() -> None:
         default=StrategyConfig.reward_version,
         help=f"Reward version key (available: {', '.join(list_reward_versions())})",
     )
+    strategy_answer_group = parser.add_mutually_exclusive_group()
+    strategy_answer_group.add_argument(
+        "--use-strategy-for-answer",
+        dest="use_strategy_for_answer",
+        action="store_true",
+        help="Use generated strategy when calling the answer model.",
+    )
+    strategy_answer_group.add_argument(
+        "--no-strategy-for-answer",
+        dest="use_strategy_for_answer",
+        action="store_false",
+        help="Do not pass generated strategy to answer model (no-strategy baseline).",
+    )
+    parser.set_defaults(use_strategy_for_answer=True)
 
     # Infrastructure
     parser.add_argument("--external-store-address", type=str, default="")
+    parser.add_argument("--val-only", action="store_true", help="Run validation before training and exit.")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--save-full-output", action="store_true", default=True)
 
@@ -680,6 +1015,9 @@ def main() -> None:
         fewshot_max=args.fewshot_max,
         num_train_samples=args.num_train_samples,
         num_val_samples=args.num_val_samples,
+        val_sampling_mode=args.val_sampling_mode,
+        val_samples_per_subtask=args.val_samples_per_subtask,
+        val_sampling_seed=args.val_sampling_seed,
         n_runners=args.n_runners,
         n_gpus=args.n_gpus,
         lora=args.lora,
@@ -710,6 +1048,8 @@ def main() -> None:
         answer_model_path=args.answer_model_path,
         answer_model_base_url=args.answer_model_base_url,
         answer_model_name=args.answer_model_name,
+        use_strategy_for_answer=args.use_strategy_for_answer,
+        val_only=args.val_only,
     )
 
 

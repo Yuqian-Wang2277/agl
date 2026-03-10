@@ -23,6 +23,19 @@ Default training script that uses configuration from `config.py`.
 - Checkpoints: `checkpoints/`
 - Model outputs: Saved to log file if `save_full_output=True` in config
 
+### `eval_no_strategy_baseline.sh`
+
+Evaluation-oriented script for the no-strategy baseline:
+
+- Uses `reward/v3.py` answer judging path (`--reward-version v3`)
+- Uses fixed validation sampling: 20 samples per subtask, seed 42
+- Disables strategy usage in answer generation (`--no-strategy-for-answer`)
+
+**Usage:**
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/eval_no_strategy_baseline.sh
+```
+
 ## Adding New Scripts
 
 You can create additional training scripts for different configurations:
