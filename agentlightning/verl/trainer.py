@@ -218,22 +218,46 @@ class AgentLightningTrainer(RayPPOTrainer):
                 raise
 
     def _validate(self):
-        assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
-
-        test_data = next(iter(self.val_dataloader))
-        test_batch = DataProto.from_single_dict(test_data)
+        metric_batches: list[dict] = []
 
         self.async_rollout_manager.wake_up()
-        self.agent_mode_daemon.set_up_data_and_server(
-            test_batch.non_tensor_batch,
-            self.async_rollout_manager.server_addresses,
-            is_train=False,
-        )
-        self.agent_mode_daemon.run_until_all_finished()
-        test_metrics = self.agent_mode_daemon.get_test_metrics()
-        self.agent_mode_daemon.clear_data_and_server()
-        self.async_rollout_manager.sleep()
-        return test_metrics
+        try:
+            for test_data in self.val_dataloader:
+                test_batch = DataProto.from_single_dict(test_data)
+                self.agent_mode_daemon.set_up_data_and_server(
+                    test_batch.non_tensor_batch,
+                    self.async_rollout_manager.server_addresses,
+                    is_train=False,
+                )
+                self.agent_mode_daemon.run_until_all_finished()
+                batch_metrics = self.agent_mode_daemon.get_test_metrics()
+                if isinstance(batch_metrics, dict):
+                    metric_batches.append(batch_metrics)
+                self.agent_mode_daemon.clear_data_and_server()
+        finally:
+            self.async_rollout_manager.sleep()
+
+        if not metric_batches:
+            return {}
+
+        merged_metrics: dict = {"val_num_batches": len(metric_batches)}
+        all_keys = set().union(*(m.keys() for m in metric_batches))
+        for key in all_keys:
+            numeric_vals = []
+            last_val = None
+            for m in metric_batches:
+                if key not in m:
+                    continue
+                val = m[key]
+                last_val = val
+                if isinstance(val, (int, float)):
+                    numeric_vals.append(float(val))
+            if numeric_vals:
+                merged_metrics[key] = sum(numeric_vals) / len(numeric_vals)
+            elif last_val is not None:
+                merged_metrics[key] = last_val
+
+        return merged_metrics
 
     def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
         """Compute reference log probability using the correct worker based on LoRA configuration.

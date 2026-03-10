@@ -34,6 +34,7 @@ from .reward.hybrid_grounded_reward import (
     select_effective_proxy,
     select_representative_answer,
 )
+from .reward.v3 import compute_answer_judgement
 from .reward.strategy_ir_parser import compute_format_reward_structured
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         answer_model_base_url: str = "",
         answer_model_name: str = "",
         use_strategy_for_answer: bool = True,
+        skip_strategy_generation: bool = False,
+        answer_temperature: Optional[float] = None,
+        use_hard_correctness_metric: bool = False,
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
@@ -137,6 +141,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self.answer_model_base_url = answer_model_base_url
         self.answer_model_name = answer_model_name
         self.use_strategy_for_answer = use_strategy_for_answer
+        self.skip_strategy_generation = skip_strategy_generation
+        self.answer_temperature = answer_temperature
+        self.use_hard_correctness_metric = use_hard_correctness_metric
 
         # Load TOML prompts and reward config
         self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
@@ -183,6 +190,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             f"scorer_url={'SET' if strategy_scorer_base_url else 'NONE'}, "
             f"answer_url={'SET' if answer_model_base_url else 'training-model'}, "
             f"use_strategy_for_answer={self.use_strategy_for_answer}, "
+            f"skip_strategy_generation={self.skip_strategy_generation}, "
+            f"answer_temperature={self.answer_temperature}, "
+            f"use_hard_correctness_metric={self.use_hard_correctness_metric}, "
             f"strategy_prompt={strategy_prompt_version}, "
             f"answer_prompt={answer_prompt_version}, "
             f"reward={self.reward_config.name}, pid={os.getpid()})"
@@ -444,38 +454,49 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
             examples_text = format_examples(task["examples"])
 
-            # ---- Step 1: Generate strategy (TRACED — will be trained) ---- #
-            system_prompt = self.strategy_prompt["system"]
-            user_prompt = self.strategy_prompt["user"].format(
-                examples_text=examples_text,
-            )
-
-            client = AsyncOpenAI(
-                base_url=base_url,
-                api_key=llm.api_key or "dummy-key",
-            )
-
-            response = await client.chat.completions.create(
-                model=llm.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=llm.sampling_parameters.get("temperature", 0.7),
-                max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
-            )
-
-            strategy_output = response.choices[0].message.content or ""
-            strategy = extract_strategy(strategy_output)
-            if self._use_structured_format_reward:
-                format_reward = compute_format_reward_structured(strategy_output)
+            strategy_output = ""
+            strategy = ""
+            format_reward = 0.0
+            if self.skip_strategy_generation:
+                system_prompt = ""
+                user_prompt = ""
+                logger.info(
+                    f"[Rollout {attempted_rollout.rollout_id}] "
+                    "Skipping strategy generation (strict no-strategy baseline)"
+                )
             else:
-                format_reward = compute_format_reward(strategy_output)
+                # ---- Step 1: Generate strategy (TRACED — will be trained) ---- #
+                system_prompt = self.strategy_prompt["system"]
+                user_prompt = self.strategy_prompt["user"].format(
+                    examples_text=examples_text,
+                )
 
-            logger.info(
-                f"[Rollout {attempted_rollout.rollout_id}] Strategy: "
-                f"format={format_reward}, length={len(strategy) if strategy else 0}"
-            )
+                client = AsyncOpenAI(
+                    base_url=base_url,
+                    api_key=llm.api_key or "dummy-key",
+                )
+
+                response = await client.chat.completions.create(
+                    model=llm.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=llm.sampling_parameters.get("temperature", 0.7),
+                    max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                )
+
+                strategy_output = response.choices[0].message.content or ""
+                strategy = extract_strategy(strategy_output)
+                if self._use_structured_format_reward:
+                    format_reward = compute_format_reward_structured(strategy_output)
+                else:
+                    format_reward = compute_format_reward(strategy_output)
+
+                logger.info(
+                    f"[Rollout {attempted_rollout.rollout_id}] Strategy: "
+                    f"format={format_reward}, length={len(strategy) if strategy else 0}"
+                )
 
             use_scorer = self.reward_config.extract_score is not None and self.strategy_scorer_base_url
 
@@ -494,6 +515,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             oc_penalties: List[str] = []
             oc_final_score_100 = 0.0
             used_soft_fallback = False
+            hard_correct = 0
+            hard_correct_mean = 0.0
+            hard_correct_list: List[int] = []
 
             if strategy and self.reward_mode == "hybrid_grounded":
                 try:
@@ -541,6 +565,17 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         extracted_answer = answer_extracted_list[rep_idx]
                     else:
                         extracted_answer = self.reward_config.extract_answer(answer_output)
+                    if extracted_answer:
+                        hard_detail = compute_answer_judgement(
+                            answer=extracted_answer,
+                            ground_truth=task["ground_truth"],
+                            numeric_tolerance=self.numeric_tolerance,
+                            f1_threshold=self.f1_threshold,
+                            task_meta=task.get("task_meta", {}),
+                        )
+                        hard_correct = int(hard_detail.get("hard_correct", 0))
+                    hard_correct_list = [hard_correct]
+                    hard_correct_mean = float(hard_correct)
                     rep_label = str(representative.get("representative_label", "incorrect"))
 
                     if use_scorer:
@@ -583,7 +618,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     final_reward = 0.0
             else:
                 run_answer = bool(
-                    strategy
+                    (self.skip_strategy_generation or strategy)
                     and (
                         self.correctness_weight > 0
                         or not use_scorer
@@ -602,27 +637,101 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         ans_base_url = self.answer_model_base_url or base_url
                         ans_api_key = llm.api_key or "dummy-key"
                         ans_model = self.answer_model_name or llm.model
-                        answer_strategy = strategy if self.use_strategy_for_answer else ""
-                        answer_output = await self._generate_answer_untraced(
-                            base_url=ans_base_url,
-                            api_key=ans_api_key,
-                            model=ans_model,
-                            strategy=answer_strategy,
-                            problem=task["problem"],
-                            temperature=llm.sampling_parameters.get("temperature", 0.7),
-                            max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                        answer_strategy = (
+                            strategy
+                            if (self.use_strategy_for_answer and not self.skip_strategy_generation)
+                            else ""
                         )
-                        extracted_answer = self.reward_config.extract_answer(answer_output)
-                        if extracted_answer:
-                            correctness = self.reward_config.compute_answer_correctness(
-                                extracted_answer,
-                                task["ground_truth"],
-                                self.numeric_tolerance,
-                                self.f1_threshold,
+                        answer_temperature = (
+                            self.answer_temperature
+                            if self.answer_temperature is not None
+                            else llm.sampling_parameters.get("temperature", 0.7)
+                        )
+                        should_use_k_answers = (
+                            self.reward_mode == "scorer_only"
+                            and self.correctness_weight > 0
+                            and self.grounded_proxy_k > 1
+                        )
+                        if should_use_k_answers:
+                            for _ in range(self.grounded_proxy_k):
+                                answer_raw = await self._generate_answer_untraced(
+                                    base_url=ans_base_url,
+                                    api_key=ans_api_key,
+                                    model=ans_model,
+                                    strategy=answer_strategy,
+                                    problem=task["problem"],
+                                    temperature=answer_temperature,
+                                    max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                                )
+                                answer_raw_list.append(answer_raw)
+                                answer_extracted = self.reward_config.extract_answer(answer_raw) or ""
+                                answer_extracted_list.append(answer_extracted)
+                                soft_score = self.reward_config.compute_answer_correctness(
+                                    answer_extracted,
+                                    task["ground_truth"],
+                                    self.numeric_tolerance,
+                                    self.f1_threshold,
+                                ) if answer_extracted else 0.0
+                                router_scores.append(float(soft_score))
+                                hard_detail = compute_answer_judgement(
+                                    answer=answer_extracted,
+                                    ground_truth=task["ground_truth"],
+                                    numeric_tolerance=self.numeric_tolerance,
+                                    f1_threshold=self.f1_threshold,
+                                    task_meta=task.get("task_meta", {}),
+                                ) if answer_extracted else {"hard_correct": 0}
+                                hard_correct_list.append(int(hard_detail.get("hard_correct", 0)))
+                                if self.use_hard_correctness_metric:
+                                    router_scores[-1] = float(hard_correct_list[-1])
+
+                            soft_correctness_mean = (
+                                sum(router_scores) / len(router_scores) if router_scores else 0.0
                             )
-                        answer_raw_list = [answer_output]
-                        answer_extracted_list = [extracted_answer or ""]
-                        router_scores = [correctness]
+                            correctness = soft_correctness_mean
+                            hard_correct_mean = (
+                                sum(hard_correct_list) / len(hard_correct_list) if hard_correct_list else 0.0
+                            )
+
+                            representative = select_representative_answer(answer_raw_list, router_scores)
+                            rep_idx = int(representative.get("representative_index", 0))
+                            if not (0 <= rep_idx < len(answer_raw_list)):
+                                rep_idx = 0
+                            answer_output = answer_raw_list[rep_idx]
+                            extracted_answer = answer_extracted_list[rep_idx] if rep_idx < len(answer_extracted_list) else ""
+                            hard_correct = hard_correct_list[rep_idx] if rep_idx < len(hard_correct_list) else 0
+                        else:
+                            answer_output = await self._generate_answer_untraced(
+                                base_url=ans_base_url,
+                                api_key=ans_api_key,
+                                model=ans_model,
+                                strategy=answer_strategy,
+                                problem=task["problem"],
+                                    temperature=answer_temperature,
+                                max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                            )
+                            extracted_answer = self.reward_config.extract_answer(answer_output)
+                            if extracted_answer:
+                                correctness = self.reward_config.compute_answer_correctness(
+                                    extracted_answer,
+                                    task["ground_truth"],
+                                    self.numeric_tolerance,
+                                    self.f1_threshold,
+                                )
+                                hard_detail = compute_answer_judgement(
+                                    answer=extracted_answer,
+                                    ground_truth=task["ground_truth"],
+                                    numeric_tolerance=self.numeric_tolerance,
+                                    f1_threshold=self.f1_threshold,
+                                    task_meta=task.get("task_meta", {}),
+                                )
+                                hard_correct = int(hard_detail.get("hard_correct", 0))
+                                if self.use_hard_correctness_metric:
+                                    correctness = float(hard_correct)
+                            answer_raw_list = [answer_output]
+                            answer_extracted_list = [extracted_answer or ""]
+                            router_scores = [correctness]
+                            hard_correct_list = [hard_correct]
+                            hard_correct_mean = float(hard_correct)
                     except Exception as e:
                         logger.warning(
                             f"[Rollout {attempted_rollout.rollout_id}] "
@@ -649,6 +758,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 "format": format_reward,
                 "scorer": scorer_reward,
                 "correctness": correctness,
+                "hard_correct": hard_correct,
+                "hard_correct_mean": hard_correct_mean,
+                "hard_correct_list": hard_correct_list,
                 "grounded_proxy": grounded_proxy,
                 "soft_correctness_mean": soft_correctness_mean,
                 "multi_sample_k": self.grounded_proxy_k,

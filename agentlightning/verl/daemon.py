@@ -628,8 +628,16 @@ class AgentModeDaemon:
         2. Triplets: obtained by querying spans and feeding into the adapter
         3. Final reward: extracted from last triplet's reward, searching backwards if not found
         """
-        # Query spans for this rollout (latest attempt)
+        # Query spans for this rollout (latest attempt).
+        # In practice there can be a short delay between rollout terminal status
+        # and span persistence, so retry briefly for succeeded rollouts.
         spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
+        if not spans and rollout.status == "succeeded":
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
+                if spans:
+                    break
 
         # Convert spans to triplets using the adapter
         if not spans:
@@ -656,13 +664,16 @@ class AgentModeDaemon:
             metadata=rollout.metadata or {},
         )
 
+        result_metadata = dict(rollout.metadata or {})
+        result_metadata["rollout_status"] = rollout.status
+
         # Create the Rollout object (without trace and logs as per user's note)
         result_rollout = RolloutLegacy(
             rollout_id=rollout.rollout_id,
             task=task,
             final_reward=final_reward,
             triplets=triplets,
-            metadata=rollout.metadata or {},
+            metadata=result_metadata,
         )
 
         # Run the same validation as v0
@@ -733,7 +744,15 @@ class AgentModeDaemon:
             final_reward_raw: Optional[float] = rollout.final_reward
             final_reward = self._fillna_reward(rollout)
             if not rollout.triplets:
-                print(f"Warning: No triplets found for test rollout {rollout.rollout_id}.")
+                rollout_status = (
+                    rollout.metadata.get("rollout_status", "unknown")
+                    if isinstance(rollout.metadata, dict)
+                    else "unknown"
+                )
+                print(
+                    f"Warning: No triplets found for test rollout {rollout.rollout_id} "
+                    f"(rollout_status={rollout_status})."
+                )
                 sample_stat_list.append({"reward": final_reward, "has_reward": final_reward_raw is not None})
                 continue
             response_length_list = [len(triplet.response.get("token_ids", [])) for triplet in rollout.triplets]

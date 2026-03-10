@@ -367,9 +367,12 @@ def _summarize_validation_outputs(saved_path: str) -> None:
         logger.warning(f"Validation output file is empty: {saved_path}")
         return
 
-    overall_scores: list[float] = []
-    by_split: dict[str, list[float]] = {}
-    by_source_type: dict[str, list[float]] = {}
+    overall_soft_scores: list[float] = []
+    overall_hard_scores: list[float] = []
+    by_split_soft: dict[str, list[float]] = {}
+    by_split_hard: dict[str, list[float]] = {}
+    by_source_type_soft: dict[str, list[float]] = {}
+    by_source_type_hard: dict[str, list[float]] = {}
 
     for item in rows:
         if not isinstance(item, dict):
@@ -377,27 +380,38 @@ def _summarize_validation_outputs(saved_path: str) -> None:
         reward = item.get("reward", {})
         if not isinstance(reward, dict):
             continue
-        correctness = reward.get("correctness", None)
-        if correctness is None:
-            continue
-        try:
-            score = float(correctness)
-        except Exception:
-            continue
-        overall_scores.append(score)
-
         task_meta = item.get("input", {}).get("task_meta", {})
+        split = "unknown"
         if isinstance(task_meta, dict):
             split = str(task_meta.get("validation_split", "unknown"))
-            by_split.setdefault(split, []).append(score)
 
         source_type = item.get("source_problem_type", None)
-        if source_type is not None:
-            key = str(source_type).split("/")[0]
-            by_source_type.setdefault(key, []).append(score)
+        source_key = str(source_type).split("/")[0] if source_type is not None else None
 
-    if not overall_scores:
-        logger.warning(f"No valid correctness values found in {saved_path}")
+        correctness = reward.get("correctness", None)
+        if correctness is not None:
+            try:
+                soft_score = float(correctness)
+                overall_soft_scores.append(soft_score)
+                by_split_soft.setdefault(split, []).append(soft_score)
+                if source_key is not None:
+                    by_source_type_soft.setdefault(source_key, []).append(soft_score)
+            except Exception:
+                pass
+
+        hard_correct = reward.get("hard_correct", None)
+        if hard_correct is not None:
+            try:
+                hard_score = float(hard_correct)
+                overall_hard_scores.append(hard_score)
+                by_split_hard.setdefault(split, []).append(hard_score)
+                if source_key is not None:
+                    by_source_type_hard.setdefault(source_key, []).append(hard_score)
+            except Exception:
+                pass
+
+    if not overall_soft_scores and not overall_hard_scores:
+        logger.warning(f"No valid correctness/hard_correct values found in {saved_path}")
         return
 
     def _mean(vals: list[float]) -> float:
@@ -407,19 +421,31 @@ def _summarize_validation_outputs(saved_path: str) -> None:
     print("No-Strategy Baseline (v3 correctness) — Validation Summary")
     print("=" * 90)
     print(f"File         : {saved_path}")
-    print(f"Samples      : {len(overall_scores)}")
-    print(f"Acc_soft(all): {_mean(overall_scores):.4f}")
+    print(f"Samples(soft): {len(overall_soft_scores)}")
+    print(f"Samples(hard): {len(overall_hard_scores)}")
+    if overall_soft_scores:
+        print(f"Acc_soft(all): {_mean(overall_soft_scores):.4f}")
+    if overall_hard_scores:
+        print(f"Acc_hard(all): {_mean(overall_hard_scores):.4f}")
 
-    if by_split:
+    if by_split_soft or by_split_hard:
         print("\nBy validation split:")
-        for split in sorted(by_split.keys()):
-            vals = by_split[split]
-            print(f"  - {split:20s} n={len(vals):4d}  acc_soft={_mean(vals):.4f}")
-    elif by_source_type:
+        for split in sorted(set(by_split_soft.keys()) | set(by_split_hard.keys())):
+            soft_vals = by_split_soft.get(split, [])
+            hard_vals = by_split_hard.get(split, [])
+            soft_part = f"acc_soft={_mean(soft_vals):.4f}" if soft_vals else "acc_soft=NA"
+            hard_part = f"acc_hard={_mean(hard_vals):.4f}" if hard_vals else "acc_hard=NA"
+            n_part = max(len(soft_vals), len(hard_vals))
+            print(f"  - {split:20s} n={n_part:4d}  {soft_part}  {hard_part}")
+    elif by_source_type_soft or by_source_type_hard:
         print("\nBy source problem type:")
-        for key in sorted(by_source_type.keys()):
-            vals = by_source_type[key]
-            print(f"  - {key:24s} n={len(vals):4d}  acc_soft={_mean(vals):.4f}")
+        for key in sorted(set(by_source_type_soft.keys()) | set(by_source_type_hard.keys())):
+            soft_vals = by_source_type_soft.get(key, [])
+            hard_vals = by_source_type_hard.get(key, [])
+            soft_part = f"acc_soft={_mean(soft_vals):.4f}" if soft_vals else "acc_soft=NA"
+            hard_part = f"acc_hard={_mean(hard_vals):.4f}" if hard_vals else "acc_hard=NA"
+            n_part = max(len(soft_vals), len(hard_vals))
+            print(f"  - {key:24s} n={n_part:4d}  {soft_part}  {hard_part}")
     print("=" * 90 + "\n")
 
 
@@ -470,6 +496,18 @@ def _recover_validation_outputs_from_rollout_traces(
         return None
 
 
+def _count_validation_rows(saved_path: str) -> int:
+    """Count rows in a saved validation JSON list file."""
+    try:
+        with open(saved_path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            return 0
+        return len(rows)
+    except Exception:
+        return 0
+
+
 def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
     """Find an available port starting from start_port."""
     for port in range(start_port, start_port + max_attempts):
@@ -501,6 +539,8 @@ def train(
     val_sampling_mode: str,
     val_samples_per_subtask: int,
     val_sampling_seed: int,
+    val_batch_size: int,
+    min_val_trace_ratio: float,
     n_runners: int,
     n_gpus: int,
     lora: bool,
@@ -534,6 +574,9 @@ def train(
     answer_model_base_url: str,
     answer_model_name: str,
     use_strategy_for_answer: bool,
+    skip_strategy_generation: bool,
+    answer_temperature: float | None,
+    use_hard_correctness_metric: bool,
     train_dataset_json: str,
     val_only: bool,
 ) -> None:
@@ -574,6 +617,8 @@ def train(
     logger.info(f"Validation sets: {validation_subdirs}")
     if val_sampling_mode == "per_subtask_fixed" and val_samples_per_subtask <= 0:
         raise ValueError("val_samples_per_subtask must be > 0 in per_subtask_fixed mode")
+    if not (0.0 <= min_val_trace_ratio <= 1.0):
+        raise ValueError("min_val_trace_ratio must be within [0, 1]")
 
     # Experiment ID
     experiment_id: str | None = None
@@ -651,6 +696,9 @@ def train(
                         "answer_model_path": answer_model_path,
                         "answer_model_base_url": answer_model_base_url,
                         "answer_model_name": answer_model_name,
+                        "skip_strategy_generation": skip_strategy_generation,
+                        "answer_temperature": answer_temperature,
+                        "use_hard_correctness_metric": use_hard_correctness_metric,
                         "train_dataset_json": train_dataset_json,
                         "wandb_project": wandb_project,
                         "wandb_experiment": wandb_experiment,
@@ -758,6 +806,8 @@ def train(
         # Ensure trainer init can always form at least one train batch.
         config["data"]["train_batch_size"] = 1
         config["data"]["filter_overlong_prompts"] = False
+        # Avoid enqueueing an oversized validation burst that can starve traces.
+        config["data"]["val_batch_size"] = max(1, val_batch_size)
     config["trainer"]["project_name"] = wandb_project
     config["trainer"]["experiment_name"] = wandb_experiment
     config["trainer"]["default_local_dir"] = checkpoint_dir
@@ -796,6 +846,9 @@ def train(
         answer_model_base_url=answer_model_base_url,
         answer_model_name=answer_model_name or answer_model_path,
         use_strategy_for_answer=use_strategy_for_answer,
+        skip_strategy_generation=skip_strategy_generation,
+        answer_temperature=answer_temperature,
+        use_hard_correctness_metric=use_hard_correctness_metric,
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
@@ -817,11 +870,22 @@ def train(
     _merge_remaining_validation_files(validation_output_dir)
 
     if val_only:
+        expected_val_count = len(val_dataset)
         merged_files = sorted(glob.glob(os.path.join(validation_output_dir, "validation_global_step*.json")))
         if merged_files:
             latest_path = merged_files[-1]
             logger.info(f"val_only run: using validation outputs at {latest_path}")
             _summarize_validation_outputs(latest_path)
+            observed_count = _count_validation_rows(latest_path)
+            coverage = observed_count / max(1, expected_val_count)
+            logger.info(
+                f"val_only coverage check: observed={observed_count}, expected={expected_val_count}, ratio={coverage:.4f}"
+            )
+            if coverage < min_val_trace_ratio:
+                raise RuntimeError(
+                    f"Validation coverage too low: {coverage:.4f} < min_val_trace_ratio={min_val_trace_ratio:.4f}. "
+                    "Results are likely invalid due to missing traces."
+                )
         else:
             rollout_traces_file = os.path.join(
                 rollout_traces_dir,
@@ -835,6 +899,16 @@ def train(
             )
             if recovered_path:
                 _summarize_validation_outputs(recovered_path)
+                observed_count = _count_validation_rows(recovered_path)
+                coverage = observed_count / max(1, expected_val_count)
+                logger.info(
+                    f"val_only coverage check: observed={observed_count}, expected={expected_val_count}, ratio={coverage:.4f}"
+                )
+                if coverage < min_val_trace_ratio:
+                    raise RuntimeError(
+                        f"Validation coverage too low: {coverage:.4f} < min_val_trace_ratio={min_val_trace_ratio:.4f}. "
+                        "Recovered outputs are insufficient."
+                    )
             else:
                 logger.warning(
                     "val_only run produced no validation output files and could not recover from traces."
@@ -896,6 +970,18 @@ def main() -> None:
         type=int,
         default=42,
         help="Random seed for reproducible validation sampling.",
+    )
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=64,
+        help="Validation batch size used by VERL (important for val_only stability).",
+    )
+    parser.add_argument(
+        "--min-val-trace-ratio",
+        type=float,
+        default=0.9,
+        help="Minimum accepted ratio: saved validation rows / expected validation rows in val_only mode.",
     )
 
     # Training
@@ -987,6 +1073,27 @@ def main() -> None:
         help="Do not pass generated strategy to answer model (no-strategy baseline).",
     )
     parser.set_defaults(use_strategy_for_answer=True)
+    parser.add_argument(
+        "--skip-strategy-generation",
+        action="store_true",
+        help="Skip strategy generation entirely and run direct answer-only evaluation.",
+    )
+    parser.add_argument(
+        "--answer-temperature",
+        type=float,
+        default=None,
+        help="Override answer decoding temperature. If unset, uses rollout sampling temperature.",
+    )
+    parser.add_argument(
+        "--use-hard-correctness-metric",
+        action="store_true",
+        help="Use exact/hard correctness as the correctness metric instead of soft scorer correctness.",
+    )
+    parser.add_argument(
+        "--strict-no-strategy-baseline",
+        action="store_true",
+        help="One-shot direct baseline: skip strategy generation, k=1, temperature=0, hard correctness metric.",
+    )
 
     # Infrastructure
     parser.add_argument("--external-store-address", type=str, default="")
@@ -995,6 +1102,13 @@ def main() -> None:
     parser.add_argument("--save-full-output", action="store_true", default=True)
 
     args = parser.parse_args()
+
+    if args.strict_no_strategy_baseline:
+        args.skip_strategy_generation = True
+        args.use_strategy_for_answer = False
+        args.grounded_proxy_k = 1
+        args.answer_temperature = 0.0
+        args.use_hard_correctness_metric = True
 
     if args.external_store_address:
         from agentlightning.env_var import LightningEnvVar, resolve_bool_env_var
@@ -1018,6 +1132,8 @@ def main() -> None:
         val_sampling_mode=args.val_sampling_mode,
         val_samples_per_subtask=args.val_samples_per_subtask,
         val_sampling_seed=args.val_sampling_seed,
+        val_batch_size=args.val_batch_size,
+        min_val_trace_ratio=args.min_val_trace_ratio,
         n_runners=args.n_runners,
         n_gpus=args.n_gpus,
         lora=args.lora,
@@ -1049,6 +1165,9 @@ def main() -> None:
         answer_model_base_url=args.answer_model_base_url,
         answer_model_name=args.answer_model_name,
         use_strategy_for_answer=args.use_strategy_for_answer,
+        skip_strategy_generation=args.skip_strategy_generation,
+        answer_temperature=args.answer_temperature,
+        use_hard_correctness_metric=args.use_hard_correctness_metric,
         val_only=args.val_only,
     )
 
