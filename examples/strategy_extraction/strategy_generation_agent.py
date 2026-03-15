@@ -315,7 +315,14 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.warning(
+                    f"Answer model HTTP error {e.response.status_code} "
+                    f"(url={url}, model={model}): {e.response.text[:300]}"
+                )
+                return ""
             data = resp.json()
 
         choices = data.get("choices", [])
