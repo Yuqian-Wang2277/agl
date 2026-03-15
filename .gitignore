@@ -225,3 +225,6 @@ model/
 checkpoints_strategy_gen/
 analysis/charts_validation_6points/
 checkpoints_strategy_gen_no_strategy_baseline/
+checkpoints_strategy_gen_with_strategy_baseline/
+checkpoints_strategy_gen_with_strategy_baseline_warmup/
+

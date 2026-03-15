@@ -69,7 +69,7 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --num-train-samples 20000 \
     --num-val-samples 500 \
     --n-runners 10 \
-    --n-gpus 6 \
+    --n-gpus 8 \
     --reward-version v3 \
     --reward-mode hybrid_grounded \
     --format-weight 0.1 \

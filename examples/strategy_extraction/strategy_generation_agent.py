@@ -109,6 +109,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         skip_strategy_generation: bool = False,
         answer_temperature: Optional[float] = None,
         use_hard_correctness_metric: bool = False,
+        answer_no_think: bool = False,
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
@@ -144,6 +145,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self.skip_strategy_generation = skip_strategy_generation
         self.answer_temperature = answer_temperature
         self.use_hard_correctness_metric = use_hard_correctness_metric
+        self.answer_no_think = answer_no_think
 
         # Load TOML prompts and reward config
         self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
@@ -304,6 +306,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self.answer_no_think:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",

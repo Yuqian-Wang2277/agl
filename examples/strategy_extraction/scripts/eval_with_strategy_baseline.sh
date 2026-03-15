@@ -1,12 +1,14 @@
 #!/bin/bash
-# Evaluate no-strategy baseline with reward v3 accuracy routing.
+# Evaluate strategy-enabled baseline with reward v3 accuracy routing.
 #
 # Key settings:
 # - Validation sampling: fixed 20 per subtask json (57 subtasks total => 1140 samples)
 # - Seed: 42 for reproducibility
-# - No-strategy baseline: skip strategy generation, answer directly with Qwen3-8B
+# - Strategy baseline: generate strategy, then use strategy for answer
+# - Strategy prompt: strategy_update_2026-03-09
 # - Accuracy metric path: reward v3 (type-routed answer judging)
 # - val_only: run validation and exit before any training update
+# - Strategy generation: 4 GPUs (N_GPUS=4)
 # - Answer model: Qwen3-8B on 4 GPUs (think mode disabled)
 #
 # Safety checks:
@@ -30,14 +32,14 @@
 #   Verify it is ready:
 #     curl -s http://localhost:8200/v1/models | python -m json.tool
 #
-#   Terminal 2 — run this eval (GPUs 0-3 for veRL model, GPUs 4-7 for answer server):
+#   Terminal 2 — run this eval (GPUs 0-3 for strategy generation, GPUs 4-7 for answer server):
 #     CUDA_VISIBLE_DEVICES=0,1,2,3 N_GPUS=4 \
 #       ANSWER_MODEL_BASE_URL=http://localhost:8200/v1 \
 #       ANSWER_MODEL_NAME=Qwen3-8B \
-#       bash scripts/eval_no_strategy_baseline.sh
+#       bash scripts/eval_with_strategy_baseline.sh
 #
 # Usage (single-terminal fallback, slower due to GPU contention):
-#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 N_GPUS=4 bash scripts/eval_no_strategy_baseline.sh
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 N_GPUS=4 bash scripts/eval_with_strategy_baseline.sh
 
 set -euo pipefail
 export WANDB_MODE="${WANDB_MODE:-disabled}"
@@ -73,7 +75,7 @@ fi
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     echo "[ERROR] CUDA_VISIBLE_DEVICES is empty."
-    echo "        Example: CUDA_VISIBLE_DEVICES=0,1,2,3 N_GPUS=4 bash scripts/eval_no_strategy_baseline.sh"
+    echo "        Example: CUDA_VISIBLE_DEVICES=0,1,2,3 N_GPUS=4 bash scripts/eval_with_strategy_baseline.sh"
     exit 1
 fi
 
@@ -138,7 +140,7 @@ if bad:
 print(f"[INFO] GPU precheck passed: visible={len(visible)}, min_free_mem={min_free} MiB")
 PY
 
-echo "[INFO] Launching no-strategy baseline with N_GPUS=$N_GPUS (visible=$CUDA_VISIBLE_DEVICES)"
+echo "[INFO] Launching strategy baseline with N_GPUS=$N_GPUS (visible=$CUDA_VISIBLE_DEVICES)"
 echo "[INFO] Throughput config: N_RUNNERS=$N_RUNNERS, VAL_BATCH_SIZE=$VAL_BATCH_SIZE"
 echo "[INFO] Formal guardrail: max_retries=$FORMAL_MAX_RETRIES, actor_lookup_fail_threshold=$ACTOR_LOOKUP_FAIL_THRESHOLD, min_val_trace_count=$FORMAL_MIN_VAL_TRACE_COUNT, min_val_first_batch_ratio=$FORMAL_MIN_VAL_FIRST_BATCH_RATIO"
 
@@ -164,7 +166,7 @@ else
 fi
 
 echo "[INFO] Stage 1/1: formal run (1140 validation samples target) ..."
-FORMAL_LOG_DIR="./checkpoints_strategy_gen_no_strategy_baseline/formal_logs"
+FORMAL_LOG_DIR="./checkpoints_strategy_gen_with_strategy_baseline/formal_logs"
 mkdir -p "$FORMAL_LOG_DIR"
 
 attempt=1
@@ -199,15 +201,15 @@ while (( attempt <= FORMAL_MAX_RETRIES )); do
         --grounded-proxy-k 1 \
         --correctness-weight 1.0 \
         --val-only \
-        --skip-strategy-generation \
-        --no-strategy-for-answer \
-        --answer-prompt-version no_strategy_baseline \
+        --strategy-prompt-version strategy_update_2026-03-09 \
+        --use-strategy-for-answer \
+        --answer-prompt-version v1 \
         --answer-no-think \
         --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B \
         ${ANSWER_MODEL_BASE_URL:+--answer-model-base-url "$ANSWER_MODEL_BASE_URL"} \
         ${ANSWER_MODEL_NAME:+--answer-model-name "$ANSWER_MODEL_NAME"} \
-        --wandb-experiment no_strategy_baseline_v3 \
-        --checkpoint-dir ./checkpoints_strategy_gen_no_strategy_baseline \
+        --wandb-experiment with_strategy_baseline_v3 \
+        --checkpoint-dir ./checkpoints_strategy_gen_with_strategy_baseline \
         "$@" 2>&1 | tee "$FORMAL_LOG"
     RUN_EXIT=${PIPESTATUS[0]}
     set -e

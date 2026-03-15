@@ -123,7 +123,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },
             "actor": {
-                "ppo_mini_batch_size": 24,
+                "ppo_mini_batch_size": 28,
                 "ppo_micro_batch_size_per_gpu": 4,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": False,

@@ -541,6 +541,8 @@ def train(
     val_sampling_seed: int,
     val_batch_size: int,
     min_val_trace_ratio: float,
+    min_val_trace_count: int,
+    min_val_first_batch_ratio: float,
     n_runners: int,
     n_gpus: int,
     lora: bool,
@@ -577,6 +579,7 @@ def train(
     skip_strategy_generation: bool,
     answer_temperature: float | None,
     use_hard_correctness_metric: bool,
+    answer_no_think: bool,
     train_dataset_json: str,
     val_only: bool,
 ) -> None:
@@ -619,6 +622,10 @@ def train(
         raise ValueError("val_samples_per_subtask must be > 0 in per_subtask_fixed mode")
     if not (0.0 <= min_val_trace_ratio <= 1.0):
         raise ValueError("min_val_trace_ratio must be within [0, 1]")
+    if min_val_trace_count < 0:
+        raise ValueError("min_val_trace_count must be >= 0")
+    if not (0.0 <= min_val_first_batch_ratio <= 1.0):
+        raise ValueError("min_val_first_batch_ratio must be within [0, 1]")
 
     # Experiment ID
     experiment_id: str | None = None
@@ -675,6 +682,10 @@ def train(
                         "fewshot_max": fewshot_max,
                         "num_train_samples": num_train_samples,
                         "num_val_samples": num_val_samples,
+                        "val_batch_size": val_batch_size,
+                        "min_val_trace_ratio": min_val_trace_ratio,
+                        "min_val_trace_count": min_val_trace_count,
+                        "min_val_first_batch_ratio": min_val_first_batch_ratio,
                         "n_runners": n_runners,
                         "lora": lora,
                         "lora_rank": lora_rank,
@@ -849,6 +860,7 @@ def train(
         skip_strategy_generation=skip_strategy_generation,
         answer_temperature=answer_temperature,
         use_hard_correctness_metric=use_hard_correctness_metric,
+        answer_no_think=answer_no_think,
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
@@ -871,21 +883,42 @@ def train(
 
     if val_only:
         expected_val_count = len(val_dataset)
+        first_batch_target = min(expected_val_count, max(1, val_batch_size))
         merged_files = sorted(glob.glob(os.path.join(validation_output_dir, "validation_global_step*.json")))
-        if merged_files:
-            latest_path = merged_files[-1]
-            logger.info(f"val_only run: using validation outputs at {latest_path}")
-            _summarize_validation_outputs(latest_path)
-            observed_count = _count_validation_rows(latest_path)
+
+        def _enforce_val_only_trace_guards(observed_count: int, source: str) -> None:
+            if observed_count < min_val_trace_count:
+                raise RuntimeError(
+                    f"Validation trace count too low ({source}): observed={observed_count} < "
+                    f"min_val_trace_count={min_val_trace_count}. "
+                    "Likely execution-layer instability (actor/server startup or rollout failures)."
+                )
+            if min_val_first_batch_ratio > 0:
+                min_first_batch_count = int(first_batch_target * min_val_first_batch_ratio + 1e-9)
+                if observed_count < min_first_batch_count:
+                    raise RuntimeError(
+                        f"Validation first-batch trace gate failed ({source}): observed={observed_count} < "
+                        f"required_first_batch_count={min_first_batch_count} "
+                        f"(first_batch_target={first_batch_target}, "
+                        f"min_val_first_batch_ratio={min_val_first_batch_ratio:.4f})."
+                    )
             coverage = observed_count / max(1, expected_val_count)
             logger.info(
-                f"val_only coverage check: observed={observed_count}, expected={expected_val_count}, ratio={coverage:.4f}"
+                f"val_only coverage check ({source}): observed={observed_count}, "
+                f"expected={expected_val_count}, ratio={coverage:.4f}"
             )
             if coverage < min_val_trace_ratio:
                 raise RuntimeError(
                     f"Validation coverage too low: {coverage:.4f} < min_val_trace_ratio={min_val_trace_ratio:.4f}. "
                     "Results are likely invalid due to missing traces."
                 )
+
+        if merged_files:
+            latest_path = merged_files[-1]
+            logger.info(f"val_only run: using validation outputs at {latest_path}")
+            _summarize_validation_outputs(latest_path)
+            observed_count = _count_validation_rows(latest_path)
+            _enforce_val_only_trace_guards(observed_count, "merged_file")
         else:
             rollout_traces_file = os.path.join(
                 rollout_traces_dir,
@@ -900,15 +933,7 @@ def train(
             if recovered_path:
                 _summarize_validation_outputs(recovered_path)
                 observed_count = _count_validation_rows(recovered_path)
-                coverage = observed_count / max(1, expected_val_count)
-                logger.info(
-                    f"val_only coverage check: observed={observed_count}, expected={expected_val_count}, ratio={coverage:.4f}"
-                )
-                if coverage < min_val_trace_ratio:
-                    raise RuntimeError(
-                        f"Validation coverage too low: {coverage:.4f} < min_val_trace_ratio={min_val_trace_ratio:.4f}. "
-                        "Recovered outputs are insufficient."
-                    )
+                _enforce_val_only_trace_guards(observed_count, "recovered_traces")
             else:
                 logger.warning(
                     "val_only run produced no validation output files and could not recover from traces."
@@ -982,6 +1007,18 @@ def main() -> None:
         type=float,
         default=0.9,
         help="Minimum accepted ratio: saved validation rows / expected validation rows in val_only mode.",
+    )
+    parser.add_argument(
+        "--min-val-trace-count",
+        type=int,
+        default=0,
+        help="Absolute minimum number of validation traces required in val_only mode.",
+    )
+    parser.add_argument(
+        "--min-val-first-batch-ratio",
+        type=float,
+        default=0.0,
+        help="Fail-fast guard in val_only mode: observed traces must be >= this ratio * min(expected_val_count, val_batch_size).",
     )
 
     # Training
@@ -1090,6 +1127,11 @@ def main() -> None:
         help="Use exact/hard correctness as the correctness metric instead of soft scorer correctness.",
     )
     parser.add_argument(
+        "--answer-no-think",
+        action="store_true",
+        help="Disable think mode for the answer model (sets enable_thinking=False in chat_template_kwargs).",
+    )
+    parser.add_argument(
         "--strict-no-strategy-baseline",
         action="store_true",
         help="One-shot direct baseline: skip strategy generation, k=1, temperature=0, hard correctness metric.",
@@ -1134,6 +1176,8 @@ def main() -> None:
         val_sampling_seed=args.val_sampling_seed,
         val_batch_size=args.val_batch_size,
         min_val_trace_ratio=args.min_val_trace_ratio,
+        min_val_trace_count=args.min_val_trace_count,
+        min_val_first_batch_ratio=args.min_val_first_batch_ratio,
         n_runners=args.n_runners,
         n_gpus=args.n_gpus,
         lora=args.lora,
@@ -1168,6 +1212,7 @@ def main() -> None:
         skip_strategy_generation=args.skip_strategy_generation,
         answer_temperature=args.answer_temperature,
         use_hard_correctness_metric=args.use_hard_correctness_metric,
+        answer_no_think=args.answer_no_think,
         val_only=args.val_only,
     )
 
