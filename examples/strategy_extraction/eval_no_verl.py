@@ -237,6 +237,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Number of concurrent async workers for evaluation. "
         "Each worker owns its own agent instance to avoid shared-state conflicts.",
     )
+    parser.add_argument(
+        "--skip-strategy-generation",
+        action="store_true",
+        default=False,
+        help="Skip strategy generation and evaluate raw answer accuracy (no-strategy baseline). "
+        "When set, the strategy model server is not called at all.",
+    )
 
     return parser
 
@@ -342,7 +349,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
             answer_model_base_url=args.answer_model_base_url,
             answer_model_name=args.answer_model_name or args.answer_model_path,
             use_strategy_for_answer=True,
-            skip_strategy_generation=False,
+            skip_strategy_generation=args.skip_strategy_generation,
             strategy_prompt_version=args.strategy_prompt_version,
             answer_prompt_version=args.answer_prompt_version,
             reward_version=args.reward_version,

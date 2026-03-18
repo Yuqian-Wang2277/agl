@@ -46,9 +46,9 @@ cd "$REPO_ROOT"
 python -m examples.strategy_extraction.eval_no_verl \
   --data-base-path /home/test/test16/chenlu/projects/LLMReflection/data/ \
   --val-subdirs test-id-subtask test-ood-task test-bbh \
-  --model-path /home/test/test16/chenlu/model/Qwen3-4B \
+  --model-path /home/test/test16/chenlu/model/Qwen3-1.7B \
   --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}" \
-  --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}" \
+  --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-1.7B}" \
   --answer-model-path /home/test/test16/chenlu/model/Qwen3-1.7B \
   --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}" \
   --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-1.7B}" \
