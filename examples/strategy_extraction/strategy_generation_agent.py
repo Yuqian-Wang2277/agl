@@ -155,6 +155,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self._strategy_prompt_version = strategy_prompt_version
         self._answer_prompt_version = answer_prompt_version
         self._use_structured_format_reward = strategy_prompt_version == "strategy_structured_schema"
+        self.debug_baseline = os.environ.get("AGL_DEBUG_BASELINE", "0") == "1"
 
         # Load scorer prompt (only when a scorer is configured)
         self.scoring_prompt: Optional[Dict[str, str]] = None
@@ -199,6 +200,15 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             f"answer_prompt={answer_prompt_version}, "
             f"reward={self.reward_config.name}, pid={os.getpid()})"
         )
+        if self.debug_baseline:
+            logger.warning("AGL_DEBUG_BASELINE=1 enabled: rollout diagnostics are active.")
+
+    def _debug_rollout(self, rollout_id: str, stage: str, **fields: Any) -> None:
+        """Emit compact rollout diagnostics when baseline debug is enabled."""
+        if not self.debug_baseline:
+            return
+        ordered = ", ".join(f"{k}={fields[k]!r}" for k in sorted(fields))
+        logger.warning("[BaselineDebug][%s][%s] %s", rollout_id, stage, ordered)
 
     # ------------------------------------------------------------------ #
     #  Worker / validation helpers (same pattern as StrategyApplicationAgent)
@@ -236,6 +246,35 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
         self._pending_merge_step = step
         return temp_file
+
+    def _append_validation_entry_to_worker_file(self, step: int, entry: Dict[str, Any]) -> Optional[str]:
+        """Append one validation entry to worker shard file on disk."""
+        if not self.validation_output_dir:
+            return None
+
+        worker_file = os.path.join(
+            self.validation_output_dir,
+            f"validation_step{step}_worker{self.worker_id}.json",
+        )
+        try:
+            existing: List[Dict[str, Any]] = []
+            if os.path.exists(worker_file):
+                with open(worker_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    existing = [row for row in loaded if isinstance(row, dict)]
+            existing.append(entry)
+            with open(worker_file, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            return worker_file
+        except Exception as e:
+            logger.warning(
+                "[Worker %s] Failed to append validation entry to %s: %s",
+                self.worker_id,
+                worker_file,
+                e,
+            )
+            return None
 
     def _merge_worker_validation_files(self, step: int) -> Optional[str]:
         """Merge all worker validation files for a given step."""
@@ -457,10 +496,21 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 attempted_rollout.rollout_id,
                 attempted_rollout.attempt.attempt_id,
             )
+            traced_strategy_call = False
+            answer_call_attempted = False
+            answer_call_succeeded = False
 
             logger.info(
                 f"[Rollout {attempted_rollout.rollout_id}] START - "
                 f"Type: {task['problem_type']}, Mode: {rollout.mode}"
+            )
+            self._debug_rollout(
+                attempted_rollout.rollout_id,
+                "start",
+                mode=str(getattr(rollout, "mode", "unknown")),
+                skip_strategy_generation=self.skip_strategy_generation,
+                answer_model_base_url=bool(self.answer_model_base_url),
+                answer_model_name=self.answer_model_name or llm.model,
             )
 
             examples_text = format_examples(task["examples"])
@@ -481,6 +531,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 user_prompt = self.strategy_prompt["user"].format(
                     examples_text=examples_text,
                 )
+                traced_strategy_call = True
 
                 client = AsyncOpenAI(
                     base_url=base_url,
@@ -494,7 +545,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=llm.sampling_parameters.get("temperature", 0.7),
-                    max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                    max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
                 )
 
                 strategy_output = response.choices[0].message.content or ""
@@ -545,7 +596,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             strategy=answer_strategy,
                             problem=task["problem"],
                             temperature=llm.sampling_parameters.get("temperature", 0.7),
-                            max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                            max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
                         )
 
                     eval_result = await evaluate_strategy_k_samples(
@@ -644,6 +695,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     )
                     logger.info(f"[Rollout {attempted_rollout.rollout_id}] Scorer: {scorer_reward:.3f}")
                 if run_answer:
+                    answer_call_attempted = True
                     try:
                         ans_base_url = self.answer_model_base_url or base_url
                         ans_api_key = llm.api_key or "dummy-key"
@@ -672,7 +724,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                     strategy=answer_strategy,
                                     problem=task["problem"],
                                     temperature=answer_temperature,
-                                    max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                                    max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
                                 )
                                 answer_raw_list.append(answer_raw)
                                 answer_extracted = self.reward_config.extract_answer(answer_raw) or ""
@@ -710,6 +762,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             answer_output = answer_raw_list[rep_idx]
                             extracted_answer = answer_extracted_list[rep_idx] if rep_idx < len(answer_extracted_list) else ""
                             hard_correct = hard_correct_list[rep_idx] if rep_idx < len(hard_correct_list) else 0
+                            answer_call_succeeded = len(answer_raw_list) > 0
                         else:
                             answer_output = await self._generate_answer_untraced(
                                 base_url=ans_base_url,
@@ -718,7 +771,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                 strategy=answer_strategy,
                                 problem=task["problem"],
                                     temperature=answer_temperature,
-                                max_tokens=llm.sampling_parameters.get("max_tokens", 4000),
+                                max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
                             )
                             extracted_answer = self.reward_config.extract_answer(answer_output)
                             if extracted_answer:
@@ -743,6 +796,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             router_scores = [correctness]
                             hard_correct_list = [hard_correct]
                             hard_correct_mean = float(hard_correct)
+                            answer_call_succeeded = bool(answer_output)
                     except Exception as e:
                         logger.warning(
                             f"[Rollout {attempted_rollout.rollout_id}] "
@@ -806,39 +860,43 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     self.validation_step_counter += 1
 
             if is_validation and self.validation_output_dir:
-                self.validation_outputs.append(
-                    {
-                        "rollout_id": attempted_rollout.rollout_id,
-                        "timestamp": datetime.now().isoformat(),
-                        "problem_type": task["problem_type"],
-                        "source_problem_type": task.get("source_problem_type"),
-                        "input": {
-                            "system_prompt": system_prompt,
-                            "user_prompt": user_prompt,
-                            "examples": task["examples"],
-                            "problem": task["problem"],
-                            "ground_truth": task["ground_truth"],
-                            "ground_truths": task.get("ground_truths", [task["ground_truth"]]),
-                            "task_meta": task.get("task_meta", {}),
-                        },
-                        "output": {
-                            "strategy_raw": strategy_output,
-                            "strategy_extracted": strategy or "",
-                            "answer_raw": answer_output,
-                            "answer_extracted": extracted_answer or "",
-                            "answer_raw_list": answer_raw_list,
-                            "answer_extracted_list": answer_extracted_list,
-                            "router_scores": router_scores,
-                        },
-                        "reward": reward_details,
-                        "metadata": {
-                            "model": llm.model,
-                            "temperature": llm.sampling_parameters.get("temperature", 0.7),
-                            "max_tokens": llm.sampling_parameters.get("max_tokens", 4000),
-                            "rollout_mode": str(current_mode),
-                        },
-                    }
+                actual_step = (
+                    0 if self.validation_step_counter == 0 else self.test_freq * self.validation_step_counter
                 )
+                val_entry = {
+                    "rollout_id": attempted_rollout.rollout_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "problem_type": task["problem_type"],
+                    "source_problem_type": task.get("source_problem_type"),
+                    "input": {
+                        "system_prompt": system_prompt,
+                        "user_prompt": user_prompt,
+                        "examples": task["examples"],
+                        "problem": task["problem"],
+                        "ground_truth": task["ground_truth"],
+                        "ground_truths": task.get("ground_truths", [task["ground_truth"]]),
+                        "task_meta": task.get("task_meta", {}),
+                    },
+                    "output": {
+                        "strategy_raw": strategy_output,
+                        "strategy_extracted": strategy or "",
+                        "answer_raw": answer_output,
+                        "answer_extracted": extracted_answer or "",
+                        "answer_raw_list": answer_raw_list,
+                        "answer_extracted_list": answer_extracted_list,
+                        "router_scores": router_scores,
+                    },
+                    "reward": reward_details,
+                    "metadata": {
+                        "model": llm.model,
+                        "temperature": llm.sampling_parameters.get("temperature", 0.7),
+                        "max_tokens": llm.sampling_parameters.get("max_tokens", 16384),
+                        "rollout_mode": str(current_mode),
+                    },
+                }
+                self.validation_outputs.append(val_entry)
+                # val_only has no val->train transition; append per-sample to disk.
+                self._append_validation_entry_to_worker_file(actual_step, val_entry)
 
             self.last_rollout_mode = current_mode
 
@@ -900,6 +958,18 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 logger.info(
                     f"[Rollout {attempted_rollout.rollout_id}] reward={final_reward:.3f}"
                 )
+            self._debug_rollout(
+                attempted_rollout.rollout_id,
+                "finish",
+                traced_strategy_call=traced_strategy_call,
+                run_answer=run_answer if "run_answer" in locals() else False,
+                answer_call_attempted=answer_call_attempted,
+                answer_call_succeeded=answer_call_succeeded,
+                strategy_len=len(strategy) if strategy else 0,
+                answer_len=len(answer_output) if answer_output else 0,
+                extracted_answer_present=bool(extracted_answer),
+                final_reward=float(final_reward),
+            )
 
             agl.emit_reward(final_reward)
             return float(final_reward)

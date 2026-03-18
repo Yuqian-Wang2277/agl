@@ -165,7 +165,7 @@ class StrategyExtractionAgent(agl.LitAgent[StrategyTask]):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=llm.sampling_parameters.get("temperature", 0.7),
-                max_tokens=llm.sampling_parameters.get("max_tokens", 4000),  # Reasonable output length for strategy extraction
+                max_tokens=llm.sampling_parameters.get("max_tokens", 16384),  # Reasonable output length for strategy extraction
             )
             
             # Extract response text
@@ -227,7 +227,7 @@ class StrategyExtractionAgent(agl.LitAgent[StrategyTask]):
                     "metadata": {
                         "model": llm.model,
                         "temperature": llm.sampling_parameters.get("temperature", 0.7),
-                        "max_tokens": llm.sampling_parameters.get("max_tokens", 4000),
+                        "max_tokens": llm.sampling_parameters.get("max_tokens", 16384),
                         "rollout_mode": str(current_mode),
                     },
                 }

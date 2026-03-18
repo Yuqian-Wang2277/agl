@@ -321,7 +321,14 @@ def _merge_remaining_validation_files(validation_output_dir: str) -> None:
     if not os.path.isdir(validation_output_dir):
         return
 
-    worker_files = glob.glob(os.path.join(validation_output_dir, "validation_step*_worker*.json"))
+    # NOTE:
+    # `StrategyGenerationAgent` nests worker files under
+    #   validation_output_dir / experiment_id / validation_step*_worker*.json
+    # so we must scan subdirectories as well.
+    worker_files = glob.glob(
+        os.path.join(validation_output_dir, "**", "validation_step*_worker*.json"),
+        recursive=True,
+    )
     step_pattern = re.compile(r"validation_step(\d+)_worker")
     steps: set[int] = set()
     for wf in worker_files:
@@ -334,8 +341,9 @@ def _merge_remaining_validation_files(validation_output_dir: str) -> None:
         if os.path.exists(merged_path):
             continue
 
-        pattern = os.path.join(validation_output_dir, f"validation_step{step}_worker*.json")
-        wfiles = sorted(glob.glob(pattern))
+        # Same reason as above: worker shards may live under an experiment_id subdirectory.
+        pattern = os.path.join(validation_output_dir, "**", f"validation_step{step}_worker*.json")
+        wfiles = sorted(glob.glob(pattern, recursive=True))
         all_outputs: list[dict[str, object]] = []
         for swf in wfiles:
             try:
@@ -878,6 +886,14 @@ def train(
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
         raise
+
+    if val_only:
+        try:
+            forced_saved = agent.save_validation_outputs(0)
+            if forced_saved:
+                logger.info(f"val_only final flush saved validation outputs to: {forced_saved}")
+        except Exception as e:
+            logger.warning(f"val_only final flush failed (non-fatal): {e}")
 
     _merge_remaining_validation_files(validation_output_dir)
 

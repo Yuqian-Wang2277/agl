@@ -389,11 +389,26 @@ def _score_yes_no(pred: str, gt: str) -> Tuple[float, int]:
 def _score_option_letter(pred: str, gt: str) -> Tuple[float, int]:
     p = _normalize_for_exact(pred)
     g = _normalize_for_exact(gt)
-    # tolerate "(a)" / "a." / "a)"
-    p = re.sub(r"^[\(\[]?([a-z])[\)\]\.\s]*$", r"\1", p)
-    g = re.sub(r"^[\(\[]?([a-z])[\)\]\.\s]*$", r"\1", g)
-    ok = int(p == g)
-    return float(ok), ok
+
+    # 1. 基础清理：解决纯选项的符号包裹问题（原版已实现）
+    # 容忍 "(a)" / "a." / "a)"
+    p_clean = re.sub(r"^[\(\[]?([a-z])[\)\]\.\s]*$", r"\1", p)
+    g_clean = re.sub(r"^[\(\[]?([a-z])[\)\]\.\s]*$", r"\1", g)
+    if p_clean == g_clean:
+        return 1.0, 1
+
+    # 2. 进阶优化：解决“选项+文字”共存的问题（新增方案）
+    # 场景：模型输出 "a. 苹果" 或 "a) apple" 或 "a: 苹果"
+    # 正则释义：匹配开头的一个字母，紧接着必须是标点(.) (:) ()) 或空格，然后跟着任意长度的其他文字
+    match = re.match(r"^[\(\[]?([a-z])[\)\]\.\s:]+(.+)$", p)
+    if match:
+        extracted_letter = match.group(1)  # 只把最前面的选项字母抠出来
+        if extracted_letter == g_clean:
+            # 只要抬头阵的选项字母对了，我们就认为答对了！
+            return 1.0, 1
+
+    # 如果以上都不满足，说明选项真的选错了
+    return 0.0, 0
 
 
 def _score_numeric(
