@@ -43,6 +43,8 @@ set -euo pipefail
 export WANDB_MODE="${WANDB_MODE:-disabled}"
 export WANDB_SILENT="${WANDB_SILENT:-true}"
 export PYTHONUNBUFFERED=1
+# Optional rollout diagnostics for baseline trace/reward path.
+export AGL_DEBUG_BASELINE="${AGL_DEBUG_BASELINE:-0}"
 # Isolate Ray temp artifacts per user to avoid stale permission issues in /tmp/ray.
 export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray_${USER}}"
 
@@ -141,6 +143,7 @@ PY
 echo "[INFO] Launching no-strategy baseline with N_GPUS=$N_GPUS (visible=$CUDA_VISIBLE_DEVICES)"
 echo "[INFO] Throughput config: N_RUNNERS=$N_RUNNERS, VAL_BATCH_SIZE=$VAL_BATCH_SIZE"
 echo "[INFO] Formal guardrail: max_retries=$FORMAL_MAX_RETRIES, actor_lookup_fail_threshold=$ACTOR_LOOKUP_FAIL_THRESHOLD, min_val_trace_count=$FORMAL_MIN_VAL_TRACE_COUNT, min_val_first_batch_ratio=$FORMAL_MIN_VAL_FIRST_BATCH_RATIO"
+echo "[INFO] Baseline debug: AGL_DEBUG_BASELINE=$AGL_DEBUG_BASELINE"
 
 if [[ -n "$ANSWER_MODEL_BASE_URL" ]]; then
     echo "[INFO] Answer model server: $ANSWER_MODEL_BASE_URL (model=$ANSWER_MODEL_NAME)"

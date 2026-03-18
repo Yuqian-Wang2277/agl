@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import agentlightning as agl
 
@@ -129,6 +129,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "If empty, falls back to answer-model-base-url.",
     )
     parser.add_argument(
+        "--strategy-model-name",
+        type=str,
+        default="",
+        help="Model name used when calling the strategy server. "
+        "If empty, falls back to model-path.",
+    )
+    parser.add_argument(
         "--answer-model-path",
         type=str,
         default="/home/test/test16/chenlu/model/Qwen3-8B",
@@ -223,6 +230,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional hard cap on number of validation samples (for quick smoke tests).",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent async workers for evaluation. "
+        "Each worker owns its own agent instance to avoid shared-state conflicts.",
+    )
 
     return parser
 
@@ -276,8 +290,6 @@ async def _run_eval(args: argparse.Namespace) -> None:
     # Create an experiment-scoped subdirectory under output-dir, similar to training.
     output_root = os.path.abspath(args.output_dir)
     if args.experiment_id is None:
-        from datetime import datetime
-
         args.experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_dir = os.path.join(output_root, args.experiment_id)
     os.makedirs(exp_dir, exist_ok=True)
@@ -306,38 +318,44 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     validation_output_dir = exp_dir
 
-    agent = StrategyGenerationAgent(
-        save_full_output=False,
-        rollout_traces_dir=rollout_traces_dir,
-        validation_output_dir=validation_output_dir,
-        experiment_id=args.experiment_id,
-        test_freq=test_freq,
-        format_weight=args.format_weight,
-        scorer_weight=args.scorer_weight,
-        proxy_weight=args.grounded_proxy_weight,
-        reward_mode=args.reward_mode,
-        grounded_proxy_k=args.grounded_proxy_k,
-        correctness_weight=args.correctness_weight,
-        strategy_scorer_base_url="",  # disabled by default in this lightweight eval
-        strategy_scorer_model="",
-        answer_model_base_url=args.answer_model_base_url,
-        answer_model_name=args.answer_model_name or args.answer_model_path,
-        use_strategy_for_answer=True,
-        skip_strategy_generation=False,
-        strategy_prompt_version=args.strategy_prompt_version,
-        answer_prompt_version=args.answer_prompt_version,
-        reward_version=args.reward_version,
-    )
+    # Build per-worker agent instances to avoid shared-state conflicts under concurrency.
+    # Each worker writes its own validation shard: validation_step0_worker{worker_id}.json
+    strategy_base_url = args.strategy_model_base_url or args.answer_model_base_url
+    concurrency = max(1, int(args.concurrency or 1))
+    strategy_model_name = args.strategy_model_name or args.model_path
 
-    # Dummy LLM used for traced strategy generation calls.
-    strategy_base_url = (
-        args.strategy_model_base_url or args.answer_model_base_url
-    )
-    main_llm = _DummyLLM(
-        model=args.model_path,
-        base_url=strategy_base_url,
-    )
-    resources: agl.NamedResources = {"main_llm": main_llm}
+    def _make_worker(worker_idx: int) -> Tuple[StrategyGenerationAgent, agl.NamedResources]:
+        agent = StrategyGenerationAgent(
+            save_full_output=False,
+            rollout_traces_dir=rollout_traces_dir,
+            validation_output_dir=validation_output_dir,
+            experiment_id=args.experiment_id,
+            test_freq=test_freq,
+            format_weight=args.format_weight,
+            scorer_weight=args.scorer_weight,
+            proxy_weight=args.grounded_proxy_weight,
+            reward_mode=args.reward_mode,
+            grounded_proxy_k=args.grounded_proxy_k,
+            correctness_weight=args.correctness_weight,
+            strategy_scorer_base_url="",  # disabled by default in this lightweight eval
+            strategy_scorer_model="",
+            answer_model_base_url=args.answer_model_base_url,
+            answer_model_name=args.answer_model_name or args.answer_model_path,
+            use_strategy_for_answer=True,
+            skip_strategy_generation=False,
+            strategy_prompt_version=args.strategy_prompt_version,
+            answer_prompt_version=args.answer_prompt_version,
+            reward_version=args.reward_version,
+        )
+        # Ensure shard filenames don't collide across workers in the same process.
+        agent._worker_id = f"{os.getpid()}_{worker_idx}"
+
+        main_llm = _DummyLLM(
+            model=strategy_model_name,
+            base_url=strategy_base_url,
+        )
+        resources: agl.NamedResources = {"main_llm": main_llm}
+        return agent, resources
 
     # Run rollouts sequentially (no VERL / Ray).
     overall_soft: List[float] = []
@@ -349,7 +367,22 @@ async def _run_eval(args: argparse.Namespace) -> None:
     start_ts = datetime.now().isoformat()
     print(f"[{start_ts}] Starting eval_no_verl over {len(val_dataset)} samples")
 
+    queue: asyncio.Queue[Tuple[int, StrategyGenerationTask]] = asyncio.Queue()
     for idx, task in enumerate(val_dataset):
+        queue.put_nowait((idx, task))
+
+    stats_lock = asyncio.Lock()
+    workers: List[Tuple[StrategyGenerationAgent, agl.NamedResources]] = [
+        _make_worker(i) for i in range(concurrency)
+    ]
+
+    async def _process_one(
+        *,
+        idx: int,
+        task: StrategyGenerationTask,
+        agent: StrategyGenerationAgent,
+        resources: agl.NamedResources,
+    ) -> None:
         rollout_id = f"val-{idx:06d}"
         rollout = _SimpleRollout(
             rollout_id=rollout_id,
@@ -360,10 +393,10 @@ async def _run_eval(args: argparse.Namespace) -> None:
             _ = await agent.rollout_async(task, resources, rollout)
         except Exception as e:  # noqa: BLE001
             logger.warning("Rollout %s failed (non-fatal): %s", rollout_id, e)
-            continue
+            return
 
         if not agent.validation_outputs:
-            continue
+            return
         entry = agent.validation_outputs[-1]
         reward = entry.get("reward", {}) or {}
         task_meta = entry.get("input", {}).get("task_meta", {}) or {}
@@ -371,20 +404,43 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
         soft = reward.get("correctness", None)
         hard = reward.get("hard_correct", None)
-        if soft is not None:
+        async with stats_lock:
+            if soft is not None:
+                try:
+                    s = float(soft)
+                    overall_soft.append(s)
+                    by_split_soft.setdefault(split, []).append(s)
+                except Exception:  # noqa: BLE001
+                    pass
+            if hard is not None:
+                try:
+                    h = float(hard)
+                    overall_hard.append(h)
+                    by_split_hard.setdefault(split, []).append(h)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def _worker_loop(worker_idx: int) -> None:
+        agent, resources = workers[worker_idx]
+        while True:
             try:
-                s = float(soft)
-                overall_soft.append(s)
-                by_split_soft.setdefault(split, []).append(s)
-            except Exception:  # noqa: BLE001
-                pass
-        if hard is not None:
+                idx, task = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
             try:
-                h = float(hard)
-                overall_hard.append(h)
-                by_split_hard.setdefault(split, []).append(h)
-            except Exception:  # noqa: BLE001
-                pass
+                await _process_one(idx=idx, task=task, agent=agent, resources=resources)
+            finally:
+                queue.task_done()
+
+        # Flush this worker's buffered validation outputs to disk.
+        try:
+            saved = agent.save_validation_outputs(0)
+            if saved:
+                logger.info("[Worker %s] Saved validation shard: %s", agent.worker_id, saved)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Worker %s] Failed to save shard: %s", agent.worker_id, e)
+
+    await asyncio.gather(*[_worker_loop(i) for i in range(concurrency)])
 
     def _mean(xs: List[float]) -> float:
         return sum(xs) / len(xs) if xs else 0.0

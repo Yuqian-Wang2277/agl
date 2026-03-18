@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
@@ -19,6 +20,7 @@ from agentlightning.utils.otel import filter_and_unflatten_attributes
 from .base import TraceAdapter
 
 logger = logging.getLogger(__name__)
+DEBUG_BASELINE = os.environ.get("AGL_DEBUG_BASELINE", "0") == "1"
 
 
 def _attributes_get_multiple(attributes: Dict[str, Any], keys: List[str]) -> Optional[str]:
@@ -1023,6 +1025,16 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                         response_id=item["request_id"],
                     ),
                 )
+            )
+
+        if DEBUG_BASELINE:
+            logger.warning(
+                "[BaselineDebug][triplet_adapter] spans=%d llm_items=%d rewards=%d assigned=%d triplets=%d",
+                len(spans),
+                len(llm_items),
+                len(rewards),
+                len(assigned),
+                len(triplets),
             )
 
         return triplets

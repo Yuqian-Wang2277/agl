@@ -17,6 +17,7 @@ import asyncio
 import functools
 import logging
 import time
+import traceback
 import warnings
 from collections import defaultdict
 from contextvars import ContextVar
@@ -1601,6 +1602,25 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
             # Also update end_time if the status indicates completion
             if status in ["failed", "succeeded"]:
                 attempt.end_time = time.time()
+            if status == "failed" and isinstance(metadata, Unset) and attempt.metadata is None:
+                public_method, private_method = get_current_store_methods()
+                stack_fingerprint = " | ".join(
+                    line.strip() for line in traceback.format_stack(limit=8)[-6:-1]
+                )
+                attempt.metadata = {
+                    "failure_reason": "failed_without_metadata",
+                    "store_public_method": public_method or "",
+                    "store_private_method": private_method or "",
+                    "store_stack_fingerprint": stack_fingerprint,
+                }
+                logger.warning(
+                    "Attempt marked failed without explicit metadata; rollout=%s attempt=%s source=%s/%s stack=%s",
+                    rollout_id,
+                    attempt.attempt_id,
+                    public_method,
+                    private_method,
+                    stack_fingerprint,
+                )
             worker_sync_required = worker_sync_required or bool(attempt.worker_id)
         if not isinstance(last_heartbeat_time, Unset):
             attempt.last_heartbeat_time = last_heartbeat_time
@@ -1746,8 +1766,30 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
         rollouts: List[Tuple[Rollout, Sequence[str]]] = []
         attempts: List[Attempt] = []
         for (rollout_id, attempt_id), status in candidate_updates.items():
+            target_rollout = next(
+                (r for r in running_rollouts if r.rollout_id == rollout_id and r.attempt.attempt_id == attempt_id),
+                None,
+            )
+            health_metadata: Dict[str, Any] = {"failure_reason": f"healthcheck_{status}"}
+            if target_rollout is not None:
+                now = time.time()
+                health_metadata["elapsed_since_attempt_start"] = now - target_rollout.attempt.start_time
+                health_metadata["last_heartbeat_time"] = target_rollout.attempt.last_heartbeat_time
+                if target_rollout.attempt.last_heartbeat_time is not None:
+                    health_metadata["elapsed_since_last_heartbeat"] = now - target_rollout.attempt.last_heartbeat_time
+            logger.warning(
+                "Healthcheck marks rollout=%s attempt=%s as %s; metadata=%s",
+                rollout_id,
+                attempt_id,
+                status,
+                health_metadata,
+            )
             attempt, rollout_update, worker_sync_required = await self._unlocked_update_attempt_and_rollout(
-                collections, rollout_id, attempt_id, status=status
+                collections,
+                rollout_id,
+                attempt_id,
+                status=status,
+                metadata=health_metadata,
             )
             if rollout_update:
                 rollouts.append(rollout_update)

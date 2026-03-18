@@ -215,11 +215,15 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
     # ------------------------------------------------------------------ #
 
     @property
-    def worker_id(self) -> int:
+    def worker_id(self):
         if self._worker_id is None:
             self._worker_id = os.getpid()
             logger.info(f"Resolved worker_id = {self._worker_id}")
         return self._worker_id
+
+    @worker_id.setter
+    def worker_id(self, value) -> None:
+        self._worker_id = value
 
     def save_validation_outputs(self, step: int) -> Optional[str]:
         """Save collected validation outputs to a per-worker JSON file."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import threading
 import time
@@ -55,6 +56,8 @@ from .base import Runner
 T_task = TypeVar("T_task")
 
 logger = logging.getLogger(__name__)
+DEBUG_BASELINE = os.environ.get("AGL_DEBUG_BASELINE", "0") == "1"
+RUNNER_DEBUG_SCHEMA_VERSION = "runner_debug_v2_baseexception"
 
 
 class LitAgentRunner(Runner[T_task]):
@@ -654,6 +657,7 @@ class LitAgentRunner(Runner[T_task]):
 
         trace_spans: List[ReadableSpan] | List[Span] = []
         has_exception: bool = False
+        failure_metadata: Optional[dict[str, Any]] = None
 
         try:
             await self._trigger_hooks(hook_type="on_rollout_start", agent=agent, runner=self, rollout=next_rollout)
@@ -707,12 +711,45 @@ class LitAgentRunner(Runner[T_task]):
                 f"Final reward: {last_reward}"
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception(f"{self._log_prefix(rollout_id)} Exception during rollout.")
             has_exception = True
+            failure_metadata = {
+                "failure_reason": "exception_during_rollout",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            }
+            if DEBUG_BASELINE:
+                logger.warning(
+                    "[BaselineDebug][runner][%s] failure_metadata=%s",
+                    rollout_id,
+                    failure_metadata,
+                )
 
             if raise_on_exception:
                 raise
+        except BaseException as exc:
+            # Capture cancellations/system-level interrupts separately so failed rollouts
+            # are still attributable instead of becoming failed-without-metadata.
+            has_exception = True
+            failure_metadata = {
+                "failure_reason": "base_exception_during_rollout",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            }
+            logger.warning(
+                "%s BaseException during rollout: %s(%s)",
+                self._log_prefix(rollout_id),
+                type(exc).__name__,
+                exc,
+            )
+            if DEBUG_BASELINE:
+                logger.warning(
+                    "[BaselineDebug][runner][%s] failure_metadata=%s",
+                    rollout_id,
+                    failure_metadata,
+                )
+            raise
         finally:
             try:
                 await self._trigger_hooks(
@@ -724,7 +761,12 @@ class LitAgentRunner(Runner[T_task]):
             try:
                 if has_exception:
                     # possibly timed out and cancelled?
-                    await store.update_attempt(rollout_id, next_rollout.attempt.attempt_id, status="failed")
+                    await store.update_attempt(
+                        rollout_id,
+                        next_rollout.attempt.attempt_id,
+                        status="failed",
+                        metadata=failure_metadata,
+                    )
                 else:
                     await store.update_attempt(rollout_id, next_rollout.attempt.attempt_id, status="succeeded")
             except Exception:
@@ -752,6 +794,13 @@ class LitAgentRunner(Runner[T_task]):
         """
         num_tasks_processed = 0
         logger.info(f"{self._log_prefix()} Started async rollouts (max: {self._max_rollouts or 'unlimited'}).")
+        if DEBUG_BASELINE:
+            logger.warning(
+                "[BaselineDebug][runner] schema=%s file=%s worker=%s",
+                RUNNER_DEBUG_SCHEMA_VERSION,
+                __file__,
+                self.get_worker_id(),
+            )
         store = self.get_store()
 
         stop_heartbeat = self._start_heartbeat_loop(store)

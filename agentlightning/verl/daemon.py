@@ -270,6 +270,7 @@ class AgentModeDaemon:
         self.reward_fillna_value = reward_fillna_value
         self.image_base_dir = image_base_dir
         self.trace_aggregator = trace_aggregator
+        self.debug_baseline = os.environ.get("AGL_DEBUG_BASELINE", "0") == "1"
 
         # Check if model requires multimodal position_ids (e.g., Qwen2-VL)
         self._use_mrope = self._is_mrope_model()
@@ -282,6 +283,13 @@ class AgentModeDaemon:
         self._server_thread: Optional[threading.Thread] = None
         self._proxy_thread: Optional[threading.Thread] = None
         self.is_train = True
+
+    def _debug_rollout(self, rollout_id: str, stage: str, **fields: Any) -> None:
+        """Emit rollout diagnostics when baseline debug mode is enabled."""
+        if not self.debug_baseline:
+            return
+        ordered = ", ".join(f"{k}={fields[k]!r}" for k in sorted(fields))
+        print(f"[BaselineDebug][daemon][{rollout_id}][{stage}] {ordered}")
 
     def _internal_loop_runner(self):
         """Run the internal loop."""
@@ -638,6 +646,49 @@ class AgentModeDaemon:
                 spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
                 if spans:
                     break
+        latest_attempt: Optional[Any] = None
+        if self.debug_baseline:
+            span_preview: List[Dict[str, Any]] = []
+            for s in spans[:5]:
+                attrs = s.attributes or {}
+                span_preview.append(
+                    {
+                        "name": getattr(s, "name", ""),
+                        "seq": getattr(s, "sequence_id", -1),
+                        "has_prompt_ids": bool(attrs.get("prompt_token_ids")),
+                        "has_response_ids": bool(attrs.get("response_token_ids")),
+                        "reward_like": any(
+                            key in attrs
+                            for key in (
+                                "reward",
+                                "reward_value",
+                                "gen_ai.reward",
+                                "agentops.reward",
+                            )
+                        ),
+                    }
+                )
+            self._debug_rollout(
+                rollout.rollout_id,
+                "query_spans",
+                rollout_status=rollout.status,
+                span_count=len(spans),
+                span_preview=span_preview,
+            )
+            if rollout.status == "failed":
+                latest_attempt = await self.store.get_latest_attempt(rollout.rollout_id)
+                if latest_attempt is not None:
+                    self._debug_rollout(
+                        rollout.rollout_id,
+                        "latest_attempt",
+                        attempt_id=latest_attempt.attempt_id,
+                        attempt_status=latest_attempt.status,
+                        worker_id=latest_attempt.worker_id,
+                        start_time=latest_attempt.start_time,
+                        end_time=latest_attempt.end_time,
+                        last_heartbeat_time=latest_attempt.last_heartbeat_time,
+                        attempt_metadata=latest_attempt.metadata,
+                    )
 
         # Convert spans to triplets using the adapter
         if not spans:
@@ -645,6 +696,48 @@ class AgentModeDaemon:
             triplets = []
         else:
             triplets = self.adapter.adapt(spans)
+        if self.debug_baseline:
+            triplet_preview = [
+                {
+                    "prompt_len": len(t.prompt.get("token_ids", [])),
+                    "response_len": len(t.response.get("token_ids", [])),
+                    "reward": t.reward,
+                }
+                for t in triplets[:5]
+            ]
+            self._debug_rollout(
+                rollout.rollout_id,
+                "adapt_triplets",
+                span_count=len(spans),
+                triplet_count=len(triplets),
+                triplet_preview=triplet_preview,
+            )
+            if spans and not triplets:
+                llm_like_names = [getattr(s, "name", "") for s in spans if "request" in getattr(s, "name", "")]
+                self._debug_rollout(
+                    rollout.rollout_id,
+                    "adapt_empty_triplets",
+                    reason="spans_present_but_no_triplets",
+                    llm_like_span_names=llm_like_names[:10],
+                )
+            stage_classification = "unknown"
+            if rollout.status == "failed":
+                attempt_status = getattr(latest_attempt, "status", None)
+                if attempt_status in ("timeout", "unresponsive"):
+                    stage_classification = "execution_healthcheck_timeout_or_unresponsive"
+                elif len(spans) <= 1 and all(getattr(s, "name", "").endswith(".session") for s in spans):
+                    stage_classification = "failed_before_any_llm_or_reward_span"
+                else:
+                    stage_classification = "failed_after_partial_span_emission"
+            elif spans and not triplets:
+                stage_classification = "adapter_or_token_extraction_failure"
+            self._debug_rollout(
+                rollout.rollout_id,
+                "pre_reward_stage_classification",
+                rollout_status=rollout.status,
+                attempt_status=getattr(latest_attempt, "status", None) if latest_attempt is not None else None,
+                stage_classification=stage_classification,
+            )
 
         # Extract final reward from triplets
         final_reward: Optional[float] = None
@@ -654,6 +747,17 @@ class AgentModeDaemon:
                 if triplet.reward is not None:
                     final_reward = triplet.reward
                     break
+        if self.debug_baseline:
+            reward_stage = "reward_missing_in_triplets" if triplets and final_reward is None else (
+                "healthy_triplet_and_reward_path" if triplets and final_reward is not None else "no_triplets"
+            )
+            self._debug_rollout(
+                rollout.rollout_id,
+                "reward_stage_classification",
+                reward_stage=reward_stage,
+                final_reward=final_reward,
+                triplet_count=len(triplets),
+            )
 
         # Construct the Task object from Rollout
         task = Task(
