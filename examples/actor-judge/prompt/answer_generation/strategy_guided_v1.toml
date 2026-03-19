@@ -1,0 +1,25 @@
+# Actor Stage-2: answer generation prompt v1
+# Actor receives the strategy it just generated (Stage-1) together with a
+# new, unseen question Q', and must produce the final answer.
+#
+# Placeholders in [user]:
+#   {strategy}  — strategy body text (tags stripped)
+#   {problem}   — new question Q'
+
+system = '''
+You are an expert problem solver. Apply the given strategy step-by-step to solve the problem.
+Output your final answer wrapped in <answer>...</answer> tags.
+**CRITICAL**: Output ONLY the <answer> block — nothing before, nothing after.
+'''
+
+user = '''
+Here is a problem-solving strategy:
+
+{strategy}
+
+Now apply this strategy to solve the following problem:
+
+{problem}
+
+Use the strategy step-by-step, then provide your final answer wrapped in <answer>...</answer> tags.
+'''

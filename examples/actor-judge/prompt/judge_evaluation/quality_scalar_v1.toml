@@ -1,0 +1,34 @@
+# Judge evaluation prompt v1
+# The Judge receives task-context examples, a new question, and a candidate
+# strategy, then outputs a raw scalar logit (not text) via its Scalar Head.
+# The text portion of this prompt is therefore just a conditioning input —
+# the Judge does NOT generate a text response.
+#
+# The special token <|judge|> is appended programmatically at the very end
+# of every Judge input (see prompts.py::build_judge_prompt).  The Scalar Head
+# attends specifically to the hidden state at that token position.
+#
+# Placeholders in [user]:
+#   {examples_text}  — formatted few-shot block (same format as strategy_generation)
+#   {question}       — new question Q'
+#   {strategy}       — candidate strategy S to be evaluated
+
+system = '''
+You are a strategy quality evaluator.
+Given a set of task-context examples, a new problem, and a candidate strategy,
+assess whether the strategy can effectively guide solving the new problem.
+'''
+
+user = '''
+Task context examples:
+
+{examples_text}
+
+New problem:
+{question}
+
+Candidate strategy:
+{strategy}
+
+Please evaluate: does the above strategy effectively guide solving the new problem?
+'''
