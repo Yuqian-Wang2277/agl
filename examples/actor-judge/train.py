@@ -277,38 +277,38 @@ def save_config_snapshot(cfg: ActorJudgeConfig, out_path: Path) -> None:
         json.dump(payload, f, indent=2, default=str)
 
 
-def prune_epoch_checkpoints(cfg: ActorJudgeConfig, metrics_records: List[Dict[str, Any]]) -> None:
-    """Remove ``epoch_*`` dirs not in keep_last_k ∪ keep_best_k (by mean strict Pass@1)."""
+def prune_step_checkpoints(cfg: ActorJudgeConfig, metrics_records: List[Dict[str, Any]]) -> None:
+    """Remove ``step_*`` dirs not in keep_last_k ∪ keep_best_k (by mean strict Pass@1)."""
     if cfg.keep_last_k_checkpoints <= 0 and cfg.keep_best_k_checkpoints <= 0:
         return
     root = Path(cfg.checkpoint_dir)
     if not root.is_dir():
         return
-    epoch_dirs: List[Tuple[int, Path]] = []
+    step_dirs: List[Tuple[int, Path]] = []
     for p in root.iterdir():
-        if p.is_dir() and p.name.startswith("epoch_"):
+        if p.is_dir() and p.name.startswith("step_"):
             try:
-                ep = int(p.name.split("_", 1)[1])
-                epoch_dirs.append((ep, p))
+                st = int(p.name.split("_", 1)[1])
+                step_dirs.append((st, p))
             except ValueError:
                 continue
-    if not epoch_dirs:
+    if not step_dirs:
         return
-    by_ep = {ep: p for ep, p in epoch_dirs}
-    epochs_sorted = sorted(by_ep.keys())
+    by_step = {st: p for st, p in step_dirs}
+    steps_sorted = sorted(by_step.keys())
     keep: set[int] = set()
     if cfg.keep_last_k_checkpoints > 0:
-        keep.update(epochs_sorted[-cfg.keep_last_k_checkpoints :])
+        keep.update(steps_sorted[-cfg.keep_last_k_checkpoints :])
     if cfg.keep_best_k_checkpoints > 0 and metrics_records:
         ranked = sorted(
-            (m for m in metrics_records if int(m.get("epoch", -1)) >= 0),
+            (m for m in metrics_records if int(m.get("step", -1)) >= 0),
             key=lambda m: float(m.get("mean_pass_at_1", -1.0)),
             reverse=True,
         )
         for m in ranked[: cfg.keep_best_k_checkpoints]:
-            keep.add(int(m["epoch"]))
-    for ep, p in by_ep.items():
-        if ep not in keep:
+            keep.add(int(m["step"]))
+    for st, p in by_step.items():
+        if st not in keep:
             logger.info("Pruning old checkpoint directory: %s", p)
             shutil.rmtree(p, ignore_errors=True)
 
@@ -746,9 +746,11 @@ def save_checkpoint(
     accelerator: Accelerator,
     tokenizer,
     eval_results: Optional[Dict[str, Any]] = None,
+    ckpt_subdir: Optional[str] = None,
 ) -> None:
     """Save full training state for potential resume."""
-    ckpt_dir = os.path.join(cfg.checkpoint_dir, f"epoch_{epoch:03d}")
+    sub = ckpt_subdir if ckpt_subdir else f"epoch_{epoch:03d}"
+    ckpt_dir = os.path.join(cfg.checkpoint_dir, sub)
     if accelerator.is_main_process:
         os.makedirs(ckpt_dir, exist_ok=True)
         # Actor weights
@@ -1188,7 +1190,7 @@ def main(cfg: ActorJudgeConfig) -> None:
     accelerator.wait_for_everyone()
 
     # Baseline strict Pass@1 (+ fail-fast) before any RL epoch
-    if cfg.val_before_train and start_epoch == 0 and cfg.val_freq > 0:
+    if cfg.val_before_train and start_epoch == 0:
         base_pack = run_full_validation_vllm(
             tokenizer,
             cfg,
@@ -1228,7 +1230,11 @@ def main(cfg: ActorJudgeConfig) -> None:
             if j_b is not None and j_b >= 0:
                 wandb.log({"val_baseline/joa": j_b}, step=0)
             val_metrics_history.append(
-                {"epoch": -1, "mean_pass_at_1": base_pack["mean_pass_at_1"]}
+                {
+                    "epoch": -1,
+                    "step": 0,
+                    "mean_pass_at_1": base_pack["mean_pass_at_1"],
+                }
             )
         accelerator.wait_for_everyone()
         torch.cuda.empty_cache()
@@ -1303,6 +1309,7 @@ def main(cfg: ActorJudgeConfig) -> None:
 
         for batch_exps in experience_batches:
             global_step += 1
+            eval_pack_step: Optional[Dict[str, Any]] = None
 
             # Step 2: Judge update (OFF-POLICY, uses buffer history)
             judge_loss = 0.0
@@ -1330,6 +1337,84 @@ def main(cfg: ActorJudgeConfig) -> None:
                 if soft_vals:
                     metrics["train/v3_soft_mean"] = sum(soft_vals) / len(soft_vals)
                 wandb.log(metrics, step=global_step)
+
+            # ── Step-level validation + checkpoint (replaces epoch-based val_freq) ──
+            if cfg.val_steps > 0 and global_step % cfg.val_steps == 0:
+                if accelerator.is_main_process:
+                    logger.info("[Step %d] Running vLLM validation ...", global_step)
+                save_actor_for_vllm(actor, tokenizer, accelerator, cfg.weight_sync_tmp_dir)
+                current_model_path = cfg.weight_sync_tmp_dir
+                accelerator.wait_for_everyone()
+                eval_pack_step = run_full_validation_vllm(
+                    tokenizer,
+                    cfg,
+                    cfg.weight_sync_tmp_dir,
+                    judge,
+                    buffer,
+                    accelerator,
+                    epoch=epoch,
+                    global_step=global_step,
+                )
+                if accelerator.is_main_process and eval_pack_step is not None:
+                    _finalize_val_item_storage(
+                        cfg,
+                        eval_pack_step,
+                        f"eval_step_{global_step:06d}_items.jsonl",
+                        global_step,
+                        "val/items_table",
+                    )
+                    with open(
+                        Path(cfg.checkpoint_dir) / f"eval_step_{global_step:06d}.json", "w"
+                    ) as f:
+                        json.dump(eval_pack_step, f, indent=2, default=str)
+                    for sub, row in eval_pack_step["splits"].items():
+                        wandb.log(
+                            {
+                                f"val/{sub}/pass@1_strict": row["pass_at_1"],
+                                f"val/{sub}/v3_soft_mean": row.get("mean_v3_soft", 0.0),
+                            },
+                            step=global_step,
+                        )
+                    wandb.log(
+                        {
+                            "val/mean_pass@1_strict": eval_pack_step["mean_pass_at_1"],
+                            "val/mean_v3_soft": eval_pack_step.get("mean_v3_soft", 0.0),
+                        },
+                        step=global_step,
+                    )
+                    j_e = eval_pack_step.get("joa")
+                    if j_e is not None and j_e >= 0:
+                        wandb.log({"val/joa": j_e}, step=global_step)
+                        logger.info("step %d JOA=%.3f", global_step, j_e)
+                    val_metrics_history.append(
+                        {
+                            "epoch": epoch,
+                            "step": global_step,
+                            "mean_pass_at_1": eval_pack_step["mean_pass_at_1"],
+                        }
+                    )
+                accelerator.wait_for_everyone()
+                torch.cuda.empty_cache()
+
+            if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
+                save_checkpoint(
+                    actor,
+                    judge,
+                    actor_trainer,
+                    judge_trainer,
+                    epoch,
+                    global_step,
+                    cfg,
+                    accelerator,
+                    tokenizer,
+                    eval_results=eval_pack_step,
+                    ckpt_subdir=f"step_{global_step:06d}",
+                )
+                if accelerator.is_main_process and (
+                    cfg.keep_last_k_checkpoints > 0 or cfg.keep_best_k_checkpoints > 0
+                ):
+                    prune_step_checkpoints(cfg, val_metrics_history)
+                accelerator.wait_for_everyone()
 
         # ── End-of-epoch logging ──────────────────────────────────────────
         if accelerator.is_main_process and experience_batches:
@@ -1360,81 +1445,9 @@ def main(cfg: ActorJudgeConfig) -> None:
                         win, reference, recent[-1],
                     )
 
-        # ── Save Actor weights to /dev/shm (vLLM reload + validation) ───────
+        # ── Sync Actor to /dev/shm for next epoch's Phase A vLLM rollout ───────
         save_actor_for_vllm(actor, tokenizer, accelerator, cfg.weight_sync_tmp_dir)
         current_model_path = cfg.weight_sync_tmp_dir
-
-        eval_pack: Optional[Dict[str, Any]] = None
-        if epoch % cfg.val_freq == 0:
-            eval_pack = run_full_validation_vllm(
-                tokenizer,
-                cfg,
-                cfg.weight_sync_tmp_dir,
-                judge,
-                buffer,
-                accelerator,
-                epoch=epoch,
-                global_step=global_step,
-            )
-            if accelerator.is_main_process and eval_pack is not None:
-                _finalize_val_item_storage(
-                    cfg,
-                    eval_pack,
-                    f"eval_epoch_{epoch:03d}_items.jsonl",
-                    global_step,
-                    "val/items_table",
-                )
-                ep_json = Path(cfg.checkpoint_dir) / f"eval_epoch_{epoch:03d}.json"
-                with open(ep_json, "w") as f:
-                    json.dump(eval_pack, f, indent=2, default=str)
-                for sub, row in eval_pack["splits"].items():
-                    wandb.log(
-                        {
-                            f"val/{sub}/pass@1_strict": row["pass_at_1"],
-                            f"val/{sub}/v3_soft_mean": row.get("mean_v3_soft", 0.0),
-                        },
-                        step=global_step,
-                    )
-                wandb.log(
-                    {
-                        "val/mean_pass@1_strict": eval_pack["mean_pass_at_1"],
-                        "val/mean_v3_soft": eval_pack.get("mean_v3_soft", 0.0),
-                    },
-                    step=global_step,
-                )
-                j_e = eval_pack.get("joa")
-                if j_e is not None and j_e >= 0:
-                    wandb.log({"val/joa": j_e}, step=global_step)
-                    logger.info("epoch %d JOA=%.3f", epoch, j_e)
-                val_metrics_history.append(
-                    {
-                        "epoch": epoch,
-                        "mean_pass_at_1": eval_pack["mean_pass_at_1"],
-                    }
-                )
-            accelerator.wait_for_everyone()
-            torch.cuda.empty_cache()
-
-        if epoch % cfg.save_freq == 0:
-            save_checkpoint(
-                actor,
-                judge,
-                actor_trainer,
-                judge_trainer,
-                epoch,
-                global_step,
-                cfg,
-                accelerator,
-                tokenizer,
-                eval_results=eval_pack,
-            )
-
-        if (
-            epoch % cfg.val_freq == 0
-            and (cfg.keep_last_k_checkpoints > 0 or cfg.keep_best_k_checkpoints > 0)
-            and accelerator.is_main_process
-        ):
-            prune_epoch_checkpoints(cfg, val_metrics_history)
 
         accelerator.wait_for_everyone()
 
@@ -1518,6 +1531,18 @@ if __name__ == "__main__":
         "--no_val_before_train",
         action="store_true",
         help="Skip baseline vLLM validation before epoch 0",
+    )
+    parser.add_argument(
+        "--val_steps",
+        type=int,
+        default=100,
+        help="Run vLLM validation every N Phase-B optimizer steps (0 = off)",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=100,
+        help="Save full checkpoint every N steps under step_XXXXXX/ (0 = off)",
     )
     parser.add_argument("--val_strategy_max_tokens", type=int, default=2048)
     parser.add_argument("--val_answer_max_tokens", type=int, default=512)
@@ -1615,6 +1640,8 @@ if __name__ == "__main__":
         run_name=run_name,
         checkpoint_dir=checkpoint_dir,
         val_before_train=not args.no_val_before_train,
+        val_steps=args.val_steps,
+        save_steps=args.save_steps,
         val_strategy_max_tokens=args.val_strategy_max_tokens,
         val_answer_max_tokens=args.val_answer_max_tokens,
         val_num_samples=val_n,

@@ -3,7 +3,7 @@
 # dry_run_phase2.sh — 10 items × 2 epochs smoke test (Scaling Checkpoints)
 #
 # - min_buffer_size=8 so Judge ODVA can run (default 100 would skip on tiny data)
-# - dry_run_val_size=10 so val_before_train + per-epoch val stay small
+# - dry_run_val_size=10 for small val; --val_steps/--save_steps=2 so smoke hits step-level val/save
 # - WANDB_MODE=offline (no upload; Tables still logged locally under wandb/)
 # - Val: per-item details → eval_*_items.jsonl; wandb.Table for sortable UI
 # - Judge: reuse pre-warmed checkpoint (no long warmup on 10 rows)
@@ -49,4 +49,4 @@ exec bash "$SCRIPT_DIR/train.sh" \
     --min_buffer_size 8 \
     --dry_run_val_size 10 \
     --run_name "$RUN_TAG" \
-    --extra "--judge_warmup_mode reuse --judge_init_checkpoint $JUDGE_INIT_DIR --val_item_storage jsonl --val_log_items_wandb_table --keep_last_k_checkpoints 0 --keep_best_k_checkpoints 0"
+    --extra "--judge_warmup_mode reuse --judge_init_checkpoint $JUDGE_INIT_DIR --val_item_storage jsonl --val_log_items_wandb_table --val_steps 2 --save_steps 2 --keep_last_k_checkpoints 0 --keep_best_k_checkpoints 0"

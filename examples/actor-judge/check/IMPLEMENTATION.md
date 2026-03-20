@@ -713,12 +713,10 @@ for epoch in range(config.total_epochs):
         log_prob_ref = compute_log_probs_no_grad(ref_model, experiences)
         actor_trainer.train_step(experiences, log_prob_ref, judge, config)
 
-    # epoch 结束：同步 Actor 权重到 vLLM
+    # epoch 结束：同步 Actor 权重到 vLLM（下一轮 rollout）
     sync_weights_to_vllm(actor, vllm_llm)
 
-    # 定期验证
-    if epoch % config.val_freq == 0:
-        validate(actor, judge, val_dataset, config)
+    # 实际实现：Phase B 内每个 optimizer step 后按 val_steps 做 vLLM 验证（见 train.py）
 ```
 
 ---
@@ -763,7 +761,8 @@ class ActorJudgeConfig:
     judge_batch_size: int = 16
     judge_warmup: bool = True
     warmup_epochs: int = 2
-    val_freq: int = 1                 # 每 N epoch 验证一次
+    val_steps: int = 100              # 每 N 个 Phase-B step 验证一次（RL 建议步级而非按 epoch）
+    save_steps: int = 100             # 每 N step 存 step_XXXXXX/ 全量 checkpoint
 
     # ── 消融实验开关 ──────────────────────────
     freeze_judge: bool = False        # 实验A：冻结 Judge（测试共同进化的必要性）
@@ -773,7 +772,6 @@ class ActorJudgeConfig:
 
     # ── 基础设施 ──────────────────────────────
     checkpoint_dir: str = "./checkpoints_actor_judge"
-    save_freq: int = 1
     n_gpus: int = 8
     weight_sync_tmp_dir: str = "/dev/shm/actor_weight_tmp"
 ```

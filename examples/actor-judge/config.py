@@ -99,7 +99,12 @@ class ActorJudgeConfig:
     judge_warmup_early_stop_min_margin: float = 0.15
     judge_warmup_overfit_warn_acc: float = 0.95     # warn if eval acc >= this (possible hack)
     judge_warmup_reset_optimizer_after: bool = True  # fresh AdamW for Phase II after warmup
-    val_freq: int = 1                  # validate every N epochs
+    # Periodic vLLM validation every N optimizer steps (Phase B); 0 = disabled.
+    # RL is non-smooth vs SFT — prefer step cadence over epoch boundaries.
+    val_steps: int = 100
+    # Full checkpoints (HF actor + judge + optimizers) every N steps; 0 = off.
+    # Align with val_steps to capture peaks when validation runs.
+    save_steps: int = 100
     # Greedy Pass@1 before any RL updates (baseline + fail-fast on val pipeline).
     val_before_train: bool = True
     # Validation generation caps (unified with scripts/validate.sh). Rollout uses strategy_max_tokens.
@@ -124,16 +129,15 @@ class ActorJudgeConfig:
     checkpoint_root: str = "./checkpoints_actor_judge"
     run_name: str = ""                 # empty → auto timestamp in train.py
     checkpoint_dir: str = "./checkpoints_actor_judge"  # overwritten in main()
-    save_freq: int = 1                 # save actor every N epochs
-    # Retain at most this many latest epoch_* dirs (plus best-k below).
+    # Retain at most this many latest step_* dirs (plus best-k below).
     keep_last_k_checkpoints: int = 2
-    # Also retain the top-k epochs by mean Pass@1 (across val_subdirs); 0 = disable.
+    # Also retain the top-k steps by mean Pass@1 (across val_subdirs); 0 = disable.
     keep_best_k_checkpoints: int = 2
     n_gpus: int = 8
     # Shared memory dir for vLLM ↔ FSDP weight hand-off (avoids NVMe bottleneck)
     weight_sync_tmp_dir: str = "/dev/shm/actor_weight_tmp"
     # Resume: set to a checkpoint dir to continue training from that point
-    resume_from_checkpoint: str = ""   # L5: e.g. "./checkpoints_actor_judge/epoch_002"
+    resume_from_checkpoint: str = ""   # L5: e.g. "./checkpoints_actor_judge/step_000100"
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     wandb_project: str = "ActorJudge"
@@ -192,3 +196,7 @@ class ActorJudgeConfig:
             raise ValueError("max_stage1_prompt_tokens must be >= 0 (0 disables the gate).")
         if self.stage1_length_chars_per_token <= 0:
             raise ValueError("stage1_length_chars_per_token must be > 0.")
+        if self.val_steps < 0:
+            raise ValueError("val_steps must be >= 0 (0 disables periodic validation).")
+        if self.save_steps < 0:
+            raise ValueError("save_steps must be >= 0 (0 disables periodic checkpoints).")

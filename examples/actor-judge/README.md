@@ -310,7 +310,7 @@ bash scripts/dry_run_phase2.sh
 
 - **清道夫**（主进程崩后释放显存）：`bash scripts/cleanup_ray_vllm.sh`
 
-手动等价参数见 `train.py`：`--min_buffer_size`、`--dry_run_val_size`（会覆盖 `--val_num_samples`）。
+手动等价参数见 `train.py`：`--min_buffer_size`、`--dry_run_val_size`（会覆盖 `--val_num_samples`）。**验证与存盘**按 **optimizer step** 触发：默认 `--val_steps 100`、`--save_steps 100`（产物 `eval_step_XXXXXX.json` 与 `step_XXXXXX/` checkpoint；`0` 关闭该项）。`dry_run_phase2.sh` 使用 `--val_steps 2 --save_steps 2` 以便短跑也能跑到步级验证。
 
 **验证阶段 Judge 与训练对齐**：val 明细里会写入与 rollout 相同的 `context_text`（`Q: …  A: …` 拼接 few-shot），Judge 编码先截断正文再在末尾拼接 `<|judge|>` token（`judge_encode.encode_batch_for_judge`），与 ODVA / dense reward 一致。
 
@@ -327,13 +327,13 @@ bash scripts/dry_run_phase2.sh
 ```bash
 # 验证单个 split
 bash scripts/validate.sh \
-    --checkpoint ./checkpoints_actor_judge/epoch_004 \
+    --checkpoint ./checkpoints_actor_judge/step_000400 \
     --split test-bbh
 
 # 验证全部三个 split
 for split in test-id-subtask test-ood-task test-bbh; do
     bash scripts/validate.sh \
-        --checkpoint ./checkpoints_actor_judge/epoch_004 \
+        --checkpoint ./checkpoints_actor_judge/step_000400 \
         --split "$split"
 done
 ```
