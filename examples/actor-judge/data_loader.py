@@ -294,11 +294,12 @@ def load_rollout_dataset(cfg) -> ActorJudgeDataset:
 def load_val_dataset(cfg, subdir: str) -> ActorJudgeDataset:
     """Build a validation dataset for one val split."""
     val_dir = os.path.join(cfg.data_base_path, subdir)
+    n_val = getattr(cfg, "val_num_samples", 500)
     return ActorJudgeDataset(
         data_dir=val_dir,
         fewshot_min=cfg.fewshot_min,
         fewshot_max=cfg.fewshot_max,
-        num_samples=500,
+        num_samples=n_val,
         cross_domain_ratio=0.0,   # val is always same-domain
         load_s_gold=False,
     )

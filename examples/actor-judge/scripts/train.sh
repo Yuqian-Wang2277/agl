@@ -38,6 +38,8 @@ DENSE_REWARD_ALPHA=0.3
 FREEZE_JUDGE=""
 DISABLE_UCB_REPLAY=""
 WANDB_RUN_NAME="phase2_co_evolution_$(date +%Y%m%d_%H%M%S)"
+RUN_NAME=""
+CHECKPOINT_ROOT=""
 RESUME_FROM=""
 NUM_TRAIN_SAMPLES=20000
 EXTRA_ARGS=""
@@ -54,6 +56,8 @@ while [[ $# -gt 0 ]]; do
         --freeze_judge)     FREEZE_JUDGE="--freeze_judge"; shift ;;
         --disable_ucb_replay) DISABLE_UCB_REPLAY="--disable_ucb_replay"; shift ;;
         --wandb_run_name)   WANDB_RUN_NAME="$2";            shift 2 ;;
+        --run_name)         RUN_NAME="$2";                  shift 2 ;;
+        --checkpoint_root)  CHECKPOINT_ROOT="$2";           shift 2 ;;
         --resume_from)      RESUME_FROM="$2";               shift 2 ;;
         --num_train_samples) NUM_TRAIN_SAMPLES="$2";        shift 2 ;;
         --judge_warmup_ckpt) JUDGE_WARMUP_CKPT="$2";        shift 2 ;;
@@ -72,14 +76,15 @@ conda activate agl
 cd "$PROJECT_DIR"
 echo "Working directory: $(pwd)"
 
-# ── Cache / artifact cleanup (optional but recommended) ───────────────
-# - If not resuming, wipe local checkpoints directory to avoid mixing runs.
-# - Always clear the vLLM ↔ FSDP shared-memory weight hand-off directory.
-#   Stale files here can cause confusing model-path / reload behavior.
-if [[ -z "$RESUME_FROM" ]]; then
-    rm -rf "$PROJECT_DIR/checkpoints_actor_judge" 2>/dev/null || true
-fi
+[[ -z "$CHECKPOINT_ROOT" ]] && CHECKPOINT_ROOT="$PROJECT_DIR/checkpoints_actor_judge"
+
+# ── Cache / artifact cleanup ──────────────────────────────────────────
+# Checkpoints live under checkpoints_actor_judge/<run_name>/ (per-run isolation).
+# Do not rm the whole tree — that would delete unrelated experiments.
+# Always clear the vLLM ↔ FSDP shared-memory weight hand-off directory.
 rm -rf "/dev/shm/actor_weight_tmp" 2>/dev/null || true
+
+[[ -z "$RUN_NAME" ]] && RUN_NAME="$WANDB_RUN_NAME"
 
 # ── Accelerate FSDP config ────────────────────────────────────────────────────
 # Expects accelerate_fsdp.yaml in the project root; generate a minimal one
@@ -121,6 +126,8 @@ CMD=(
     --alpha "$ALPHA"
     --dense_reward_alpha "$DENSE_REWARD_ALPHA"
     --wandb_run_name "$WANDB_RUN_NAME"
+    --checkpoint_root "$CHECKPOINT_ROOT"
+    --run_name "$RUN_NAME"
     --num_train_samples "$NUM_TRAIN_SAMPLES"
 )
 

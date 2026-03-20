@@ -52,14 +52,17 @@ M4  avg_strategy_lengths uses a bounded deque (no unbounded memory growth).
 
 from __future__ import annotations
 
+import dataclasses
+import datetime
 import json
 import logging
 import os
 import random
+import shutil
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 import torch
@@ -82,7 +85,15 @@ from data_loader import (
 )
 from judge_model import JudgeModel, warmstart_judge_token_embedding
 from judge_trainer import JudgeTrainer
-from prompts import build_judge_prompt
+from env import evaluate
+from prompts import (
+    apply_chat_template,
+    build_answer_prompt,
+    build_judge_prompt,
+    build_strategy_prompt,
+    STRATEGY_CLOSE,
+    STRATEGY_OPEN,
+)
 from rollout_engine import RolloutEngine, VLLMActor
 
 logger = logging.getLogger(__name__)
@@ -262,104 +273,281 @@ def judge_warmup_pairwise_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Validation (C4 fix: load saved HF model on rank-0, not FSDP-wrapped actor)
+# Config snapshot + checkpoint pruning
 # ---------------------------------------------------------------------------
 
-def validate_pass_at_1(
-    model_path: str,               # C4 fix: path to saved HF checkpoint
+
+def save_config_snapshot(cfg: ActorJudgeConfig, out_path: Path) -> None:
+    """Persist full ``ActorJudgeConfig`` for reproducibility (no WandB-only reliance)."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dataclasses.asdict(cfg)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def prune_epoch_checkpoints(cfg: ActorJudgeConfig, metrics_records: List[Dict[str, Any]]) -> None:
+    """Remove ``epoch_*`` dirs not in keep_last_k ∪ keep_best_k (by mean strict Pass@1)."""
+    if cfg.keep_last_k_checkpoints <= 0 and cfg.keep_best_k_checkpoints <= 0:
+        return
+    root = Path(cfg.checkpoint_dir)
+    if not root.is_dir():
+        return
+    epoch_dirs: List[Tuple[int, Path]] = []
+    for p in root.iterdir():
+        if p.is_dir() and p.name.startswith("epoch_"):
+            try:
+                ep = int(p.name.split("_", 1)[1])
+                epoch_dirs.append((ep, p))
+            except ValueError:
+                continue
+    if not epoch_dirs:
+        return
+    by_ep = {ep: p for ep, p in epoch_dirs}
+    epochs_sorted = sorted(by_ep.keys())
+    keep: set[int] = set()
+    if cfg.keep_last_k_checkpoints > 0:
+        keep.update(epochs_sorted[-cfg.keep_last_k_checkpoints :])
+    if cfg.keep_best_k_checkpoints > 0 and metrics_records:
+        ranked = sorted(
+            (m for m in metrics_records if int(m.get("epoch", -1)) >= 0),
+            key=lambda m: float(m.get("mean_pass_at_1", -1.0)),
+            reverse=True,
+        )
+        for m in ranked[: cfg.keep_best_k_checkpoints]:
+            keep.add(int(m["epoch"]))
+    for ep, p in by_ep.items():
+        if ep not in keep:
+            logger.info("Pruning old checkpoint directory: %s", p)
+            shutil.rmtree(p, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Validation — vLLM greedy Pass@1 (strict denominator; matches val token caps)
+# ---------------------------------------------------------------------------
+
+
+def _attach_judge_scores_to_val_items(
+    items: List[Dict[str, Any]],
+    judge: torch.nn.Module,
     tokenizer,
-    val_dataset: ActorJudgeDataset,
-    cfg: ActorJudgeConfig,
     accelerator: Accelerator,
+    batch_size: int,
+    freeze_judge: bool,
+) -> None:
+    """In-place: add judge_logit / judge_prob per item (rank-0 FSDP unwrap)."""
+    if not items:
+        return
+    if freeze_judge:
+        for it in items:
+            it["judge_logit"] = None
+            it["judge_prob"] = None
+        return
+
+    judge_u = accelerator.unwrap_model(judge)
+    was_training = judge_u.training
+    judge_u.eval()
+    device = accelerator.device
+
+    for i in range(0, len(items), batch_size):
+        chunk = items[i : i + batch_size]
+        texts = [
+            build_judge_prompt([], it["question"], it["strategy_text"], context_text_raw="")
+            for it in chunk
+        ]
+        enc = tokenizer(
+            texts, return_tensors="pt", padding=True, truncation=True, max_length=2048
+        )
+        enc = {k: v.to(device) for k, v in enc.items() if isinstance(v, torch.Tensor)}
+        with torch.no_grad():
+            logits = judge_u(**enc).float().reshape(-1)
+        probs = torch.sigmoid(logits).cpu().tolist()
+        log_list = logits.cpu().tolist()
+        for j, it in enumerate(chunk):
+            it["judge_logit"] = float(log_list[j])
+            it["judge_prob"] = float(probs[j])
+
+    if was_training:
+        judge_u.train()
+
+
+def _validate_split_pass1_vllm(
+    tokenizer,
+    cfg: ActorJudgeConfig,
+    vllm_actor,
+    val_dataset: ActorJudgeDataset,
     split_name: str,
-) -> Optional[float]:
-    """Greedy-decode Pass@1 on *val_dataset*, executed on Rank 0 only.
+) -> Tuple[float, int, int, List[Dict[str, Any]]]:
+    """Strict Pass@1: denominator = every problem; format errors (-1) count as incorrect.
 
-    C4 fix: loads the saved HF checkpoint from *model_path* for inference.
-    This avoids FSDP ZeRO-3 issues where the unwrapped model has only the
-    local parameter shard and generate() produces garbage.
-
-    The saved model already exists (written by save_actor_for_vllm which runs
-    at end of epoch, before this function is called).
-
-    Returns None on non-rank-0 processes.
+    Returns (pass1, correct, n, items) where *items* is empty unless cfg.val_save_item_details.
     """
-    from prompts import apply_chat_template, build_strategy_prompt, build_answer_prompt
-    from env import evaluate
+    from vllm import SamplingParams
+
+    samples = list(val_dataset)
+    n = len(samples)
+    if n == 0:
+        return 0.0, 0, 0, []
+
+    prompts1 = [
+        apply_chat_template(tokenizer, build_strategy_prompt(s.fewshot_examples))
+        for s in samples
+    ]
+    sp1 = SamplingParams(
+        temperature=0.0,
+        max_tokens=cfg.val_strategy_max_tokens,
+        stop=[STRATEGY_CLOSE],
+    )
+    raw1 = ray.get(vllm_actor.generate.remote(prompts1, sp1))
+    s_texts = [t + STRATEGY_CLOSE for t in raw1]
+
+    prompts2: List[str] = []
+    idx2: List[int] = []
+    for i, (s_text, sample) in enumerate(zip(s_texts, samples)):
+        if STRATEGY_OPEN in s_text and STRATEGY_CLOSE in s_text:
+            prompts2.append(
+                apply_chat_template(tokenizer, build_answer_prompt(s_text, sample.question))
+            )
+            idx2.append(i)
+
+    sp2 = SamplingParams(
+        temperature=0.0,
+        max_tokens=cfg.val_answer_max_tokens,
+        stop=["</answer>"],
+    )
+    answers: List[str] = [""] * n
+    idx_to_stage2_prompt: Dict[int, str] = {}
+    if prompts2:
+        raw2 = ray.get(vllm_actor.generate.remote(prompts2, sp2))
+        for j, i in enumerate(idx2):
+            answers[i] = raw2[j] + "</answer>"
+            idx_to_stage2_prompt[i] = prompts2[j]
+
+    items: List[Dict[str, Any]] = []
+    correct = 0
+    for i, sample in enumerate(samples):
+        outcome = evaluate(s_texts[i], answers[i], sample.answer_gold)
+        if outcome == 1:
+            correct += 1
+        if cfg.val_save_item_details:
+            p2 = idx_to_stage2_prompt.get(i, "")
+            items.append(
+                {
+                    "split": split_name,
+                    "index_in_split": i,
+                    "domain": sample.domain,
+                    "question": sample.question,
+                    "answer_gold": sample.answer_gold,
+                    "stage1_prompt": prompts1[i],
+                    "stage2_prompt": p2,
+                    "strategy_text": s_texts[i],
+                    "answer_text": answers[i],
+                    "outcome": int(outcome),
+                }
+            )
+
+    pass1 = correct / max(n, 1)
+    logger.info(
+        "Validation [%s] strict Pass@1 = %.4f (%d/%d)",
+        split_name,
+        pass1,
+        correct,
+        n,
+    )
+    return pass1, correct, n, items
+
+
+def run_full_validation_vllm(
+    tokenizer,
+    cfg: ActorJudgeConfig,
+    model_path: str,
+    judge: torch.nn.Module,
+    buffer: UCBBuffer,
+    accelerator: Accelerator,
+    epoch: int,
+    global_step: int,
+) -> Optional[Dict[str, Any]]:
+    """vLLM Pass@1 on rank-0; JOA on all ranks (FSDP). Returns metrics dict on rank-0 only."""
+    split_results: Dict[str, Any] = {}
+    pass_vals: List[float] = []
+    all_items: List[Dict[str, Any]] = []
+    mean_p = 0.0
+
+    if accelerator.is_main_process:
+        logger.info(
+            "vLLM validation: TP=%d strat_tok=%d ans_tok=%d samples/split=%d",
+            cfg.tensor_parallel_size,
+            cfg.val_strategy_max_tokens,
+            cfg.val_answer_max_tokens,
+            cfg.val_num_samples,
+        )
+        vllm_actor = VLLMActor.remote(
+            model_path,
+            tensor_parallel_size=cfg.tensor_parallel_size,
+            gpu_memory_utilization=cfg.gpu_memory_utilization,
+        )
+        try:
+            for subdir in cfg.val_subdirs:
+                val_ds = load_val_dataset(cfg, subdir)
+                p1, c, n, items = _validate_split_pass1_vllm(
+                    tokenizer, cfg, vllm_actor, val_ds, subdir
+                )
+                row: Dict[str, Any] = {"pass_at_1": p1, "correct": c, "total": n}
+                if items:
+                    row["items"] = items
+                split_results[subdir] = row
+                pass_vals.append(p1)
+                all_items.extend(items)
+        finally:
+            ray.kill(vllm_actor)
+
+        mean_p = sum(pass_vals) / max(len(pass_vals), 1)
+        logger.info("Validation finished: mean strict Pass@1 = %.4f", mean_p)
+
+    if accelerator.num_processes > 1:
+        bundle_in = None
+        if accelerator.is_main_process:
+            bundle_in = {
+                "split_results": split_results,
+                "mean_pass_at_1": mean_p,
+                "all_items": all_items,
+            }
+        b = broadcast_object_list_from_rank0(bundle_in, accelerator)
+        assert b is not None
+        split_results = b["split_results"]
+        mean_p = b["mean_pass_at_1"]
+        all_items = b["all_items"]
+
+    if cfg.val_save_item_details and all_items:
+        _attach_judge_scores_to_val_items(
+            all_items,
+            judge,
+            tokenizer,
+            accelerator,
+            cfg.val_judge_score_batch_size,
+            cfg.freeze_judge,
+        )
+
+    accelerator.wait_for_everyone()
+
+    joa_val: Optional[float] = None
+    if not cfg.freeze_judge and len(buffer) >= cfg.min_buffer_size:
+        joa_val = compute_joa(judge, tokenizer, buffer, cfg, accelerator)
 
     if not accelerator.is_main_process:
         return None
 
-    # Load saved full-parameter model (not FSDP-sharded) on rank 0
-    val_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(accelerator.device)
-    val_model.eval()
-
-    correct = 0
-    total   = 0
-
-    # M2: batch validation for speed (batch_size=4 to save memory)
-    val_batch_size = 4
-    samples = list(val_dataset)
-
-    for i in range(0, len(samples), val_batch_size):
-        batch = samples[i : i + val_batch_size]
-
-        # Stage-1: strategy generation (batch)
-        prompts1 = [
-            apply_chat_template(tokenizer, build_strategy_prompt(s.fewshot_examples))
-            for s in batch
-        ]
-        enc1 = tokenizer(prompts1, return_tensors="pt", padding=True,
-                         truncation=True, max_length=2048).to(accelerator.device)
-        with torch.no_grad():
-            out1 = val_model.generate(
-                **enc1,
-                max_new_tokens=cfg.strategy_max_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        s_texts = []
-        for j in range(len(batch)):
-            generated = tokenizer.decode(
-                out1[j][enc1["input_ids"].shape[1]:], skip_special_tokens=False
-            )
-            s_texts.append(generated + "</strategy>")
-
-        # Stage-2: answer generation (batch)
-        prompts2 = [
-            apply_chat_template(tokenizer, build_answer_prompt(s_text, sample.question))
-            for s_text, sample in zip(s_texts, batch)
-        ]
-        enc2 = tokenizer(prompts2, return_tensors="pt", padding=True,
-                         truncation=True, max_length=2048).to(accelerator.device)
-        with torch.no_grad():
-            out2 = val_model.generate(
-                **enc2,
-                max_new_tokens=cfg.answer_max_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-        for j, sample in enumerate(batch):
-            a_text = tokenizer.decode(
-                out2[j][enc2["input_ids"].shape[1]:], skip_special_tokens=False
-            ) + "</answer>"
-            outcome = evaluate(s_texts[j], a_text, sample.answer_gold)
-            if outcome == 1:
-                correct += 1
-            if outcome >= 0:
-                total += 1
-
-    del val_model
-    torch.cuda.empty_cache()
-
-    pass1 = correct / max(total, 1)
-    logger.info("Validation [%s]: Pass@1 = %.3f (%d/%d)", split_name, pass1, correct, total)
-    return pass1
+    pack: Dict[str, Any] = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "splits": split_results,
+        "mean_pass_at_1": mean_p,
+        "joa": joa_val,
+        "val_strategy_max_tokens": cfg.val_strategy_max_tokens,
+        "val_answer_max_tokens": cfg.val_answer_max_tokens,
+        "denominator": "all_items_strict",
+        "val_save_item_details": cfg.val_save_item_details,
+    }
+    return pack
 
 
 # ---------------------------------------------------------------------------
@@ -441,10 +629,16 @@ def save_actor_for_vllm(
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(
-    actor, judge, actor_trainer, judge_trainer,
-    epoch: int, global_step: int,
-    cfg: ActorJudgeConfig, accelerator: Accelerator,
+    actor,
+    judge,
+    actor_trainer,
+    judge_trainer,
+    epoch: int,
+    global_step: int,
+    cfg: ActorJudgeConfig,
+    accelerator: Accelerator,
     tokenizer,
+    eval_results: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Save full training state for potential resume."""
     ckpt_dir = os.path.join(cfg.checkpoint_dir, f"epoch_{epoch:03d}")
@@ -459,13 +653,20 @@ def save_checkpoint(
             os.path.join(ckpt_dir, "judge_model.pt"),
         )
         # Optimizer + scheduler states (for resume)
-        torch.save(actor_trainer.optimizer.state_dict(),
-                   os.path.join(ckpt_dir, "actor_optimizer.pt"))
-        torch.save(judge_trainer.optimizer.state_dict(),
-                   os.path.join(ckpt_dir, "judge_optimizer.pt"))
+        torch.save(
+            actor_trainer.optimizer.state_dict(),
+            os.path.join(ckpt_dir, "actor_optimizer.pt"),
+        )
+        torch.save(
+            judge_trainer.optimizer.state_dict(),
+            os.path.join(ckpt_dir, "judge_optimizer.pt"),
+        )
         # Training metadata
         with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
             json.dump({"epoch": epoch, "global_step": global_step}, f)
+        if eval_results is not None:
+            with open(os.path.join(ckpt_dir, "eval_results.json"), "w") as f:
+                json.dump(eval_results, f, indent=2, default=str)
         logger.info("Saved full checkpoint to %s", ckpt_dir)
     accelerator.wait_for_everyone()
 
@@ -505,6 +706,7 @@ def try_resume(
 # ---------------------------------------------------------------------------
 
 def main(cfg: ActorJudgeConfig) -> None:
+    Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     cfg.validate()
 
     # ── Accelerator (FSDP) ───────────────────────────────────────────────────
@@ -574,6 +776,10 @@ def main(cfg: ActorJudgeConfig) -> None:
     if cfg.total_train_steps == 0:
         cfg.total_train_steps = cfg.total_epochs * steps_per_epoch
         logger.info("auto total_train_steps = %d", cfg.total_train_steps)
+
+    if accelerator.is_main_process:
+        save_config_snapshot(cfg, Path(cfg.checkpoint_dir) / "config.json")
+        logger.info("Wrote config snapshot to %s", Path(cfg.checkpoint_dir) / "config.json")
 
     # ── Trainers & buffer ────────────────────────────────────────────────────
     buffer = UCBBuffer(
@@ -866,6 +1072,45 @@ def main(cfg: ActorJudgeConfig) -> None:
     # M4 fix: bounded deque instead of unbounded list (avoids memory growth over
     # many epochs × many steps × float per entry)
     avg_strategy_lengths: deque = deque(maxlen=cfg.length_hack_window * 10)
+    val_metrics_history: List[Dict[str, Any]] = []
+
+    # Sync Actor to HF dir for vLLM (rollout + validation share this path)
+    save_actor_for_vllm(actor, tokenizer, accelerator, cfg.weight_sync_tmp_dir)
+    current_model_path = cfg.weight_sync_tmp_dir
+    accelerator.wait_for_everyone()
+
+    # Baseline strict Pass@1 (+ fail-fast) before any RL epoch
+    if cfg.val_before_train and start_epoch == 0 and cfg.val_freq > 0:
+        base_pack = run_full_validation_vllm(
+            tokenizer,
+            cfg,
+            cfg.weight_sync_tmp_dir,
+            judge,
+            buffer,
+            accelerator,
+            epoch=-1,
+            global_step=0,
+        )
+        if accelerator.is_main_process and base_pack is not None:
+            with open(Path(cfg.checkpoint_dir) / "eval_baseline.json", "w") as f:
+                json.dump(base_pack, f, indent=2, default=str)
+            for sub, row in base_pack["splits"].items():
+                wandb.log(
+                    {f"val_baseline/{sub}/pass@1_strict": row["pass_at_1"]},
+                    step=0,
+                )
+            wandb.log(
+                {"val_baseline/mean_pass@1_strict": base_pack["mean_pass_at_1"]},
+                step=0,
+            )
+            j_b = base_pack.get("joa")
+            if j_b is not None and j_b >= 0:
+                wandb.log({"val_baseline/joa": j_b}, step=0)
+            val_metrics_history.append(
+                {"epoch": -1, "mean_pass_at_1": base_pack["mean_pass_at_1"]}
+            )
+        accelerator.wait_for_everyone()
+        torch.cuda.empty_cache()
 
     # ── Phase II Main Loop ───────────────────────────────────────────────────
     for epoch in range(start_epoch, cfg.total_epochs):
@@ -987,37 +1232,69 @@ def main(cfg: ActorJudgeConfig) -> None:
                         win, reference, recent[-1],
                     )
 
-        # ── Save Actor weights to /dev/shm for vLLM reload next epoch ────────
+        # ── Save Actor weights to /dev/shm (vLLM reload + validation) ───────
         save_actor_for_vllm(actor, tokenizer, accelerator, cfg.weight_sync_tmp_dir)
         current_model_path = cfg.weight_sync_tmp_dir
 
-        # ── Full checkpoint (actor + judge + optimizers) ──────────────────────
+        eval_pack: Optional[Dict[str, Any]] = None
+        if epoch % cfg.val_freq == 0:
+            eval_pack = run_full_validation_vllm(
+                tokenizer,
+                cfg,
+                cfg.weight_sync_tmp_dir,
+                judge,
+                buffer,
+                accelerator,
+                epoch=epoch,
+                global_step=global_step,
+            )
+            if accelerator.is_main_process and eval_pack is not None:
+                ep_json = Path(cfg.checkpoint_dir) / f"eval_epoch_{epoch:03d}.json"
+                with open(ep_json, "w") as f:
+                    json.dump(eval_pack, f, indent=2, default=str)
+                for sub, row in eval_pack["splits"].items():
+                    wandb.log(
+                        {f"val/{sub}/pass@1_strict": row["pass_at_1"]},
+                        step=global_step,
+                    )
+                wandb.log(
+                    {"val/mean_pass@1_strict": eval_pack["mean_pass_at_1"]},
+                    step=global_step,
+                )
+                j_e = eval_pack.get("joa")
+                if j_e is not None and j_e >= 0:
+                    wandb.log({"val/joa": j_e}, step=global_step)
+                    logger.info("epoch %d JOA=%.3f", epoch, j_e)
+                val_metrics_history.append(
+                    {
+                        "epoch": epoch,
+                        "mean_pass_at_1": eval_pack["mean_pass_at_1"],
+                    }
+                )
+            accelerator.wait_for_everyone()
+            torch.cuda.empty_cache()
+
         if epoch % cfg.save_freq == 0:
             save_checkpoint(
-                actor, judge, actor_trainer, judge_trainer,
-                epoch, global_step, cfg, accelerator, tokenizer,
+                actor,
+                judge,
+                actor_trainer,
+                judge_trainer,
+                epoch,
+                global_step,
+                cfg,
+                accelerator,
+                tokenizer,
+                eval_results=eval_pack,
             )
 
-        # ── Validation: Pass@1 + JOA ──────────────────────────────────────────
-        if epoch % cfg.val_freq == 0:
-            for subdir in cfg.val_subdirs:
-                val_ds  = load_val_dataset(cfg, subdir)
-                # C4 fix: validate using saved HF model on rank 0 only
-                pass1   = validate_pass_at_1(
-                    cfg.weight_sync_tmp_dir,   # path to saved HF checkpoint
-                    tokenizer, val_ds, cfg, accelerator, subdir
-                )
-                if accelerator.is_main_process and pass1 is not None:
-                    wandb.log({f"val/{subdir}/pass@1": pass1}, step=global_step)
+        if (
+            epoch % cfg.val_freq == 0
+            and (cfg.keep_last_k_checkpoints > 0 or cfg.keep_best_k_checkpoints > 0)
+            and accelerator.is_main_process
+        ):
+            prune_epoch_checkpoints(cfg, val_metrics_history)
 
-            # JOA (plan §5): Judge-Outcome Agreement on buffer samples
-            if not cfg.freeze_judge and len(buffer) >= cfg.min_buffer_size:
-                joa = compute_joa(judge, tokenizer, buffer, cfg, accelerator)
-                if accelerator.is_main_process and joa >= 0:
-                    wandb.log({"val/joa": joa}, step=global_step)
-                    logger.info("epoch %d JOA=%.3f", epoch, joa)
-
-        # All ranks must sync before next epoch (save / val may be rank-0 only)
         accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
@@ -1077,7 +1354,38 @@ if __name__ == "__main__":
         action="store_true",
         help="Legacy: set judge_warmup=False (forces cold start regardless of mode)",
     )
+    parser.add_argument(
+        "--checkpoint_root",
+        type=str,
+        default="./checkpoints_actor_judge",
+        help="Parent directory; each run writes to checkpoint_root/run_name/",
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="",
+        help="Subfolder for this run (weights + config.json). Empty → timestamp.",
+    )
+    parser.add_argument(
+        "--no_val_before_train",
+        action="store_true",
+        help="Skip baseline vLLM validation before epoch 0",
+    )
+    parser.add_argument("--val_strategy_max_tokens", type=int, default=2048)
+    parser.add_argument("--val_answer_max_tokens", type=int, default=512)
+    parser.add_argument("--val_num_samples", type=int, default=500)
+    parser.add_argument("--keep_last_k_checkpoints", type=int, default=2)
+    parser.add_argument("--keep_best_k_checkpoints", type=int, default=2)
+    parser.add_argument(
+        "--no_val_save_item_details",
+        action="store_true",
+        help="Omit per-item prompts/generations from eval_*.json (smaller files)",
+    )
+    parser.add_argument("--val_judge_score_batch_size", type=int, default=16)
     args = parser.parse_args()
+
+    run_name = args.run_name.strip() or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = os.path.join(args.checkpoint_root, run_name)
 
     cfg = ActorJudgeConfig(
         actor_sft_checkpoint=args.actor_sft_checkpoint,
@@ -1103,6 +1411,17 @@ if __name__ == "__main__":
         judge_warmup_overfit_warn_acc=args.judge_warmup_overfit_warn_acc,
         judge_warmup_reset_optimizer_after=not args.no_judge_warmup_reset_optimizer,
         judge_warmup=not args.no_judge_warmup,
+        checkpoint_root=args.checkpoint_root,
+        run_name=run_name,
+        checkpoint_dir=checkpoint_dir,
+        val_before_train=not args.no_val_before_train,
+        val_strategy_max_tokens=args.val_strategy_max_tokens,
+        val_answer_max_tokens=args.val_answer_max_tokens,
+        val_num_samples=args.val_num_samples,
+        keep_last_k_checkpoints=args.keep_last_k_checkpoints,
+        keep_best_k_checkpoints=args.keep_best_k_checkpoints,
+        val_save_item_details=not args.no_val_save_item_details,
+        val_judge_score_batch_size=args.val_judge_score_batch_size,
     )
 
     main(cfg)

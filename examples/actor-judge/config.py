@@ -88,6 +88,15 @@ class ActorJudgeConfig:
     judge_warmup_overfit_warn_acc: float = 0.95     # warn if eval acc >= this (possible hack)
     judge_warmup_reset_optimizer_after: bool = True  # fresh AdamW for Phase II after warmup
     val_freq: int = 1                  # validate every N epochs
+    # Greedy Pass@1 before any RL updates (baseline + fail-fast on val pipeline).
+    val_before_train: bool = True
+    # Validation generation caps (unified with scripts/validate.sh). Rollout uses strategy_max_tokens.
+    val_strategy_max_tokens: int = 2048
+    val_answer_max_tokens: int = 512
+    val_num_samples: int = 500         # per val_subdir split
+    # Per-item rows in eval_*.json (prompts, generations, outcome, judge score).
+    val_save_item_details: bool = True
+    val_judge_score_batch_size: int = 16
     # L4: total_train_steps for LR scheduler — set automatically in main() if 0
     total_train_steps: int = 0         # 0 = auto-compute from epochs × steps_per_epoch
 
@@ -95,8 +104,15 @@ class ActorJudgeConfig:
     max_grad_norm: float = 1.0         # L3: gradient clipping (0 = disabled)
 
     # ── Infrastructure ────────────────────────────────────────────────────────
-    checkpoint_dir: str = "./checkpoints_actor_judge"
+    # Resolved at train startup: checkpoint_dir = join(checkpoint_root, run_name)
+    checkpoint_root: str = "./checkpoints_actor_judge"
+    run_name: str = ""                 # empty → auto timestamp in train.py
+    checkpoint_dir: str = "./checkpoints_actor_judge"  # overwritten in main()
     save_freq: int = 1                 # save actor every N epochs
+    # Retain at most this many latest epoch_* dirs (plus best-k below).
+    keep_last_k_checkpoints: int = 2
+    # Also retain the top-k epochs by mean Pass@1 (across val_subdirs); 0 = disable.
+    keep_best_k_checkpoints: int = 2
     n_gpus: int = 8
     # Shared memory dir for vLLM ↔ FSDP weight hand-off (avoids NVMe bottleneck)
     weight_sync_tmp_dir: str = "/dev/shm/actor_weight_tmp"
