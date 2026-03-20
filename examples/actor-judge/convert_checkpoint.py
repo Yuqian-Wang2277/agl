@@ -10,9 +10,15 @@ Usage:
         --checkpoint_dir /path/to/global_step_400/actor \
         --output_dir     /path/to/global_step_400/actor_hf
 
-The script tries accelerate's merge_fsdp_weights first (cleanest).
-If that API is unavailable (version mismatch), it falls back to a manual
-torch.load + state_dict merge routine.
+The script tries ``accelerate.utils.merge_fsdp_weights`` first.  That API
+expects a **PyTorch Distributed Checkpoint** layout (``.metadata`` under
+``checkpoint_dir``).  VERL instead saves **per-rank** ``model_world_size_*_rank_*.pt``
+files containing ``DTensor`` shards, so merge_fsdp_weights usually fails and we
+fall back to a manual ``to_local()`` + ``torch.cat`` merge.
+
+If merge_fsdp_weights raises ``CheckpointException``, note that in recent PyTorch
+it subclasses ``BaseException`` (not ``Exception``); we catch ``BaseException``
+so the manual path actually runs.
 """
 
 from __future__ import annotations
@@ -24,6 +30,9 @@ import shutil
 from pathlib import Path
 
 import torch
+
+# Register DTensor unpickler when checkpoints were saved with torch.save(DTensor, …).
+import torch.distributed.tensor  # noqa: F401
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
@@ -53,7 +62,11 @@ def convert_via_accelerate(checkpoint_dir: str, output_dir: str) -> bool:
         )
         logger.info("Merged successfully → %s", output_dir)
         return True
-    except Exception as exc:
+    except BaseException as exc:
+        # PyTorch's CheckpointException subclasses BaseException, not Exception —
+        # so a bare ``except Exception`` never runs the manual merge fallback.
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         logger.warning("merge_fsdp_weights raised: %s — trying fallback.", exc)
         return False
 
@@ -67,13 +80,31 @@ def _find_shard_files(checkpoint_dir: str) -> list[str]:
     ckpt_path = Path(checkpoint_dir)
     shards = sorted(ckpt_path.glob("model_world_size_*_rank_*.pt"))
     if not shards:
-        # Some VERL versions use a different naming
-        shards = sorted(ckpt_path.glob("*.pt"))
+        # Other layouts: only pick model shards, never optim_*.pt / extra_state_*.pt
+        shards = sorted(
+            p for p in ckpt_path.glob("*.pt") if p.name.startswith("model_")
+        )
     return [str(s) for s in shards]
 
 
+def _local_cpu_tensor(v: object) -> torch.Tensor:
+    """Turn a shard value into a plain CPU tensor for concatenation.
+
+    VERL FSDP checkpoints often store ``DTensor`` objects.  ``torch.cat`` on two
+    DTensors tries to run collective ops and needs a process group; we instead
+    take each rank's ``to_local()`` slice and cat those on CPU.
+    """
+    import torch.distributed.tensor as dist_tensor
+
+    if isinstance(v, dist_tensor.DTensor):
+        return v.to_local().detach().cpu().clone()
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu().clone()
+    raise TypeError(f"Unexpected state_dict value type {type(v)!r} (expected Tensor/DTensor)")
+
+
 def convert_manual(checkpoint_dir: str, output_dir: str) -> None:
-    """Manually merge FSDP shards via torch.load + average/concatenate."""
+    """Manually merge FSDP shards via torch.load + concat along dim 0."""
     shards = _find_shard_files(checkpoint_dir)
     if not shards:
         raise FileNotFoundError(
@@ -84,15 +115,16 @@ def convert_manual(checkpoint_dir: str, output_dir: str) -> None:
     merged: dict[str, torch.Tensor] = {}
     for shard_path in shards:
         logger.info("  Loading shard %s", shard_path)
-        state = torch.load(shard_path, map_location="cpu")
+        state = torch.load(shard_path, map_location="cpu", weights_only=False)
         if isinstance(state, dict) and "module" in state:
             state = state["module"]   # VERL wraps the model under 'module'
         for k, v in state.items():
+            piece = _local_cpu_tensor(v)
             if k not in merged:
-                merged[k] = v.clone()
+                merged[k] = piece
             else:
-                # For FSDP flat parameters, shards are concatenated not summed
-                merged[k] = torch.cat([merged[k], v], dim=0)
+                # Sharded rows / first-dim chunks (FSDP on dim 0)
+                merged[k] = torch.cat([merged[k], piece], dim=0)
 
     logger.info("Merged %d parameter tensors.", len(merged))
 
@@ -112,6 +144,14 @@ def convert_manual(checkpoint_dir: str, output_dir: str) -> None:
 # Tokenizer copy
 # ---------------------------------------------------------------------------
 
+def _copy_file_robust(src: Path, dst: Path) -> None:
+    """Copy bytes without sendfile (some NFS / FUSE mounts break os.sendfile)."""
+    with open(src, "rb") as fsrc:
+        data = fsrc.read()
+    with open(dst, "wb") as fdst:
+        fdst.write(data)
+
+
 def copy_tokenizer(checkpoint_dir: str, output_dir: str) -> None:
     """Copy tokenizer files from checkpoint_dir/huggingface/ to output_dir."""
     hf_dir = Path(checkpoint_dir) / "huggingface"
@@ -120,9 +160,14 @@ def copy_tokenizer(checkpoint_dir: str, output_dir: str) -> None:
         return
 
     os.makedirs(output_dir, exist_ok=True)
-    for f in hf_dir.iterdir():
+    for f in sorted(hf_dir.iterdir(), key=lambda p: p.name):
         dst = Path(output_dir) / f.name
-        shutil.copy2(str(f), str(dst))
+        try:
+            shutil.copy2(str(f), str(dst))
+        except OSError as exc:
+            # copy2/copyfile may both use sendfile; fall back to read/write
+            logger.warning("copy2 failed for %s (%s); retrying with read/write.", f.name, exc)
+            _copy_file_robust(f, dst)
         logger.info("  Copied tokenizer file: %s", f.name)
 
 

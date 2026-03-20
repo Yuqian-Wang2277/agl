@@ -51,11 +51,11 @@ print(f"   start_model_path = {cfg.start_model_path}")
 
 print("── 3. Prompt TOML loading ─────────────────────────────")
 examples = [{"input": "1+1=?", "target": "2"}, {"input": "2+2=?", "target": "4"}]
-msgs1 = build_strategy_prompt(examples, version="v1")
+msgs1 = build_strategy_prompt(examples, version="fewshot_extract_v1")
 print(f"   strategy prompt: system={msgs1[0]['content'][:40]!r}...")
-msgs2 = build_answer_prompt("<strategy>Add numbers</strategy>", "3+3=?", version="v1")
+msgs2 = build_answer_prompt("<strategy>Add numbers</strategy>", "3+3=?", version="strategy_guided_v1")
 print(f"   answer prompt:   system={msgs2[0]['content'][:40]!r}...")
-j_prompt = build_judge_prompt(examples, "5+5=?", "Add the numbers together.", version="v1")
+j_prompt = build_judge_prompt(examples, "5+5=?", "Add the numbers together.", version="quality_scalar_v1")
 assert j_prompt.endswith(JUDGE_TOKEN), "Judge prompt must end with JUDGE_TOKEN"
 print(f"   judge prompt ends with: {j_prompt[-20:]!r} ✓")
 
@@ -69,7 +69,7 @@ print("   evaluate() all cases OK ✓")
 print("── 5. Buffer ──────────────────────────────────────────")
 buf = UCBBuffer(max_size=100, per_q_max=5)
 for i in range(6):
-    exp = UCBBuffer.make_experience("ctx", f"Q{i%3}", f"S{i}", outcome=i%2, timestamp=i)
+    exp = UCBBuffer.make_experience("ctx", "prompt", f"Q{i%3}", f"S{i}", outcome=i%2, timestamp=i)
     buf.add(exp)
 print(f"   buffer size = {len(buf)} (max per-Q=5)")
 pairs = buf.sample_pairwise(4)
