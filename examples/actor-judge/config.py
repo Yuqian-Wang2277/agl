@@ -81,6 +81,8 @@ class ActorJudgeConfig:
     judge_warmup_eval_ratio: float = 0.12
     judge_warmup_eval_every: int = 5   # run eval every N warmup steps
     judge_warmup_early_stop_min_acc: float = 0.75   # stop once eval acc >= this (good enough)
+    # Pairwise mean(sigmoid(win) - sigmoid(lose)) on held-out triples; needs high acc *and* margin
+    judge_warmup_early_stop_min_margin: float = 0.15
     judge_warmup_overfit_warn_acc: float = 0.95     # warn if eval acc >= this (possible hack)
     judge_warmup_reset_optimizer_after: bool = True  # fresh AdamW for Phase II after warmup
     val_freq: int = 1                  # validate every N epochs

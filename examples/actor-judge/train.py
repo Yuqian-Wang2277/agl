@@ -203,19 +203,24 @@ def sample_warmup_negative(
     return " ".join(w), "word_shuffle", "word_shuffle"
 
 
-def judge_warmup_pairwise_accuracy(
+def _warmup_batch_to_device(batch, device: torch.device) -> Dict[str, torch.Tensor]:
+    return {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+
+def judge_warmup_pairwise_metrics(
     judge: torch.nn.Module,
     tokenizer,
     device: torch.device,
     triples: List[Tuple[str, str, str]],
     batch_size: int = 16,
-) -> float:
-    """Fraction of pairs where sigmoid(logit_win) > sigmoid(logit_lose)."""
+) -> Tuple[float, float]:
+    """Return (acc, avg_margin): acc uses logit_win > logit_lose; margin = mean(sigmoid(w)-sigmoid(l))."""
     if not triples:
-        return 0.0
+        return 0.0, 0.0
     judge.eval()
     n_ok = 0
     n_tot = 0
+    margin_sum = 0.0
 
     with torch.no_grad():
         for i in range(0, len(triples), batch_size):
@@ -225,28 +230,35 @@ def judge_warmup_pairwise_accuracy(
             neg = [t[2] for t in chunk]
             win_texts = [build_judge_prompt([], q, sp) for q, sp in zip(qs, pos)]
             lose_texts = [build_judge_prompt([], q, sn) for q, sn in zip(qs, neg)]
-            inputs_win = tokenizer(
-                win_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            ).to(device)
-            inputs_lose = tokenizer(
-                lose_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            ).to(device)
-            lw = judge(**inputs_win)
-            ll = judge(**inputs_lose)
-            sw = torch.sigmoid(lw)
-            sl = torch.sigmoid(ll)
-            n_ok += int((sw > sl).sum().item())
+            inputs_win = _warmup_batch_to_device(
+                tokenizer(
+                    win_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                ),
+                device,
+            )
+            inputs_lose = _warmup_batch_to_device(
+                tokenizer(
+                    lose_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                ),
+                device,
+            )
+            lw = judge(**inputs_win).float()
+            ll = judge(**inputs_lose).float()
+            n_ok += int((lw > ll).sum().item())
             n_tot += len(chunk)
+            margin_sum += (torch.sigmoid(lw) - torch.sigmoid(ll)).sum().item()
     judge.train()
-    return n_ok / max(n_tot, 1)
+    acc = n_ok / max(n_tot, 1)
+    avg_margin = margin_sum / max(n_tot, 1)
+    return acc, avg_margin
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +769,7 @@ def main(cfg: ActorJudgeConfig) -> None:
                         and cfg.judge_warmup_eval_every > 0
                         and (step + 1) % cfg.judge_warmup_eval_every == 0
                     ):
-                        acc = judge_warmup_pairwise_accuracy(
+                        acc, avg_margin = judge_warmup_pairwise_metrics(
                             judge,
                             tokenizer,
                             accelerator.device,
@@ -765,11 +777,18 @@ def main(cfg: ActorJudgeConfig) -> None:
                             batch_size=min(16, cfg.judge_batch_size),
                         )
                         if accelerator.is_main_process:
-                            wandb.log({"warmup/eval_pairwise_acc": acc}, step=step)
+                            wandb.log(
+                                {
+                                    "warmup/eval_pairwise_acc": acc,
+                                    "warmup/eval_avg_margin": avg_margin,
+                                },
+                                step=step,
+                            )
                         logger.info(
-                            "Warmup eval step %d: pairwise_acc=%.4f (n_eval=%d)",
+                            "Warmup eval step %d: pairwise_acc=%.4f avg_margin=%.4f (n_eval=%d)",
                             step,
                             acc,
+                            avg_margin,
                             len(eval_triples),
                         )
                         if acc >= cfg.judge_warmup_overfit_warn_acc:
@@ -779,11 +798,16 @@ def main(cfg: ActorJudgeConfig) -> None:
                                 acc,
                                 cfg.judge_warmup_overfit_warn_acc,
                             )
-                        if acc >= cfg.judge_warmup_early_stop_min_acc:
+                        if (
+                            acc >= cfg.judge_warmup_early_stop_min_acc
+                            and avg_margin >= cfg.judge_warmup_early_stop_min_margin
+                        ):
                             logger.info(
-                                "Warmup early stop: eval acc %.3f >= target %.3f",
+                                "Warmup early stop: acc %.3f >= %.3f and avg_margin %.3f >= %.3f",
                                 acc,
                                 cfg.judge_warmup_early_stop_min_acc,
+                                avg_margin,
+                                cfg.judge_warmup_early_stop_min_margin,
                             )
                             early_stopped = True
                             break
@@ -1020,6 +1044,7 @@ if __name__ == "__main__":
     parser.add_argument("--judge_warmup_eval_ratio", type=float, default=0.12)
     parser.add_argument("--judge_warmup_eval_every", type=int, default=5)
     parser.add_argument("--judge_warmup_early_stop_min_acc", type=float, default=0.75)
+    parser.add_argument("--judge_warmup_early_stop_min_margin", type=float, default=0.15)
     parser.add_argument("--judge_warmup_overfit_warn_acc", type=float, default=0.95)
     parser.add_argument(
         "--no_judge_warmup_reset_optimizer",
@@ -1053,6 +1078,7 @@ if __name__ == "__main__":
         judge_warmup_eval_ratio=args.judge_warmup_eval_ratio,
         judge_warmup_eval_every=args.judge_warmup_eval_every,
         judge_warmup_early_stop_min_acc=args.judge_warmup_early_stop_min_acc,
+        judge_warmup_early_stop_min_margin=args.judge_warmup_early_stop_min_margin,
         judge_warmup_overfit_warn_acc=args.judge_warmup_overfit_warn_acc,
         judge_warmup_reset_optimizer_after=not args.no_judge_warmup_reset_optimizer,
         judge_warmup=not args.no_judge_warmup,

@@ -5,13 +5,17 @@
 # Usage:
 #   bash scripts/warmup_judge.sh --sft_checkpoint /path/to/actor_hf
 #
-# Output:
-#   ./judge_warmup_ckpt/
+# Output (default):
+#   ./judge_warmup_ckpt/YYYY-MM-DD/
 #     - judge_model.pt
 #     - model.safetensors / config.json ... (HF backbone)
 #     - tokenizer files
 #     - warmup_meta.json
 #     - judge_warmup_pairs.jsonl
+#     - judge_warmup_eval_scores.jsonl  (per-eval per-pair logits / probs / margin)
+#
+# Each run defaults to today's date folder so different actor checkpoints stay separated.
+# Override with --output_dir /path/to/custom_dir (same day re-run: use a custom path to avoid overwrite).
 # =============================================================================
 
 set -euo pipefail
@@ -19,15 +23,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Subfolder name for this run (local date). Override only via --output_dir on the whole path.
+WARMUP_DATE="$(date +%Y-%m-%d)"
+
 SFT_CHECKPOINT=""
 MODEL_PATH="/home/test/test16/chenlu/model/Qwen3-4B"
-OUTPUT_DIR="$PROJECT_DIR/judge_warmup_ckpt"
+OUTPUT_DIR="$PROJECT_DIR/judge_warmup_ckpt/$WARMUP_DATE"
 WARMUP_STEPS=100
 BATCH_SIZE=16
 WARMUP_LR=0
 EVAL_RATIO=0.12
 EVAL_EVERY=5
 EARLY_STOP_ACC=0.75
+EARLY_STOP_MARGIN=0.15
 OVERFIT_WARN_ACC=0.95
 WARMUP_SEED=42
 NUM_TRAIN_SAMPLES=20000
@@ -45,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --eval_ratio)       EVAL_RATIO="$2"; shift 2 ;;
         --eval_every)       EVAL_EVERY="$2"; shift 2 ;;
         --early_stop_acc)   EARLY_STOP_ACC="$2"; shift 2 ;;
+        --early_stop_margin) EARLY_STOP_MARGIN="$2"; shift 2 ;;
         --overfit_warn_acc) OVERFIT_WARN_ACC="$2"; shift 2 ;;
         --warmup_seed)      WARMUP_SEED="$2"; shift 2 ;;
         --num_train_samples) NUM_TRAIN_SAMPLES="$2"; shift 2 ;;
@@ -92,6 +101,7 @@ CMD=(
     --judge_warmup_eval_ratio "$EVAL_RATIO"
     --judge_warmup_eval_every "$EVAL_EVERY"
     --judge_warmup_early_stop_min_acc "$EARLY_STOP_ACC"
+    --judge_warmup_early_stop_min_margin "$EARLY_STOP_MARGIN"
     --judge_warmup_overfit_warn_acc "$OVERFIT_WARN_ACC"
     --warmup_seed "$WARMUP_SEED"
     --num_train_samples "$NUM_TRAIN_SAMPLES"

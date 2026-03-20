@@ -14,7 +14,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -42,18 +42,32 @@ def sample_negative(
     return " ".join(words), "word_shuffle", "word_shuffle"
 
 
-def eval_pairwise_acc(
+def _batch_to_device(batch, device: torch.device) -> Dict[str, torch.Tensor]:
+    """Move tokenizer outputs to ``device`` (BatchEncoding.to can be unreliable)."""
+    return {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+
+def eval_pairwise_metrics(
     judge: JudgeModel,
     tokenizer,
     device: torch.device,
     triples: List[Tuple[str, str, str]],
     batch_size: int = 16,
-) -> float:
+    scores_path: Optional[Path] = None,
+    step: int = -1,
+) -> Tuple[float, float]:
+    """Pairwise eval: accuracy via raw logits (monotonic with sigmoid); margin = mean(sigmoid(w)-sigmoid(l)).
+
+    Returns:
+        (acc, avg_margin) with acc = fraction where logit_win > logit_lose.
+    """
     if not triples:
-        return 0.0
+        return 0.0, 0.0
     judge.eval()
     ok = 0
     total = 0
+    margin_sum = 0.0
+    pair_base = 0
     with torch.no_grad():
         for i in range(0, len(triples), batch_size):
             chunk = triples[i : i + batch_size]
@@ -62,14 +76,56 @@ def eval_pairwise_acc(
             neg = [x[2] for x in chunk]
             win = [build_judge_prompt([], q, s) for q, s in zip(qs, pos)]
             lose = [build_judge_prompt([], q, s) for q, s in zip(qs, neg)]
-            in_win = tokenizer(win, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
-            in_lose = tokenizer(lose, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
-            sw = torch.sigmoid(judge(**in_win))
-            sl = torch.sigmoid(judge(**in_lose))
-            ok += int((sw > sl).sum().item())
+            in_win = _batch_to_device(
+                tokenizer(win, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+                device,
+            )
+            in_lose = _batch_to_device(
+                tokenizer(lose, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+                device,
+            )
+            lw = judge(**in_win).float()
+            ll = judge(**in_lose).float()
+            ok += int((lw > ll).sum().item())
             total += len(chunk)
+            pw = torch.sigmoid(lw)
+            pl = torch.sigmoid(ll)
+            margins = pw - pl
+            margin_sum += margins.sum().item()
+            if scores_path is not None:
+                margins_list = margins.detach().cpu().tolist()
+                correct_list = (lw > ll).detach().cpu().tolist()
+                lw_list = lw.detach().cpu().tolist()
+                ll_list = ll.detach().cpu().tolist()
+                pw_list = pw.detach().cpu().tolist()
+                pl_list = pl.detach().cpu().tolist()
+                with open(scores_path, "a", encoding="utf-8") as sf:
+                    for j, (q, sp, sn) in enumerate(zip(qs, pos, neg)):
+                        idx = pair_base + j
+                        sf.write(
+                            json.dumps(
+                                {
+                                    "step": step,
+                                    "pair_idx": idx,
+                                    "logit_win": lw_list[j],
+                                    "logit_lose": ll_list[j],
+                                    "prob_win": pw_list[j],
+                                    "prob_lose": pl_list[j],
+                                    "margin": margins_list[j],
+                                    "correct": bool(correct_list[j]),
+                                    "question": q,
+                                    "positive_strategy": sp,
+                                    "negative_strategy": sn,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+            pair_base += len(chunk)
     judge.train()
-    return ok / max(total, 1)
+    acc = ok / max(total, 1)
+    avg_margin = margin_sum / max(total, 1)
+    return acc, avg_margin
 
 
 def main() -> None:
@@ -83,6 +139,12 @@ def main() -> None:
     parser.add_argument("--judge_warmup_eval_ratio", type=float, default=0.12)
     parser.add_argument("--judge_warmup_eval_every", type=int, default=5)
     parser.add_argument("--judge_warmup_early_stop_min_acc", type=float, default=0.75)
+    parser.add_argument(
+        "--judge_warmup_early_stop_min_margin",
+        type=float,
+        default=0.15,
+        help="Mean prob(win)-prob(lose) on held-out pairs; early stop requires acc and margin.",
+    )
     parser.add_argument("--judge_warmup_overfit_warn_acc", type=float, default=0.95)
     parser.add_argument("--warmup_seed", type=int, default=42)
     parser.add_argument("--num_train_samples", type=int, default=20000)
@@ -109,6 +171,7 @@ def main() -> None:
         judge_warmup_eval_ratio=args.judge_warmup_eval_ratio,
         judge_warmup_eval_every=args.judge_warmup_eval_every,
         judge_warmup_early_stop_min_acc=args.judge_warmup_early_stop_min_acc,
+        judge_warmup_early_stop_min_margin=args.judge_warmup_early_stop_min_margin,
         judge_warmup_overfit_warn_acc=args.judge_warmup_overfit_warn_acc,
         warmup_seed=args.warmup_seed,
         num_train_samples=args.num_train_samples,
@@ -231,8 +294,12 @@ def main() -> None:
     pairs_path = out_dir / "judge_warmup_pairs.jsonl"
     if pairs_path.exists():
         pairs_path.unlink()
+    scores_path = out_dir / "judge_warmup_eval_scores.jsonl"
+    if scores_path.exists():
+        scores_path.unlink()
 
     best_eval = -1.0
+    best_eval_margin = -1.0
     best_step = -1
     early_stopped = False
     max_grad_norm = cfg.max_grad_norm
@@ -264,8 +331,14 @@ def main() -> None:
 
         win_texts = [build_judge_prompt([], q, s) for q, s in zip(questions, s_golds)]
         lose_texts = [build_judge_prompt([], q, s) for q, s in zip(questions, s_negs)]
-        inputs_win = tokenizer(win_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(model_device)
-        inputs_lose = tokenizer(lose_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(model_device)
+        inputs_win = _batch_to_device(
+            tokenizer(win_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+            model_device,
+        )
+        inputs_lose = _batch_to_device(
+            tokenizer(lose_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+            model_device,
+        )
 
         if step == 0:
             print("[warmup] === step 0 runtime probes (before forward) ===")
@@ -291,15 +364,33 @@ def main() -> None:
         optimizer.step()
 
         if eval_triples and cfg.judge_warmup_eval_every > 0 and (step + 1) % cfg.judge_warmup_eval_every == 0:
-            acc = eval_pairwise_acc(judge, tokenizer, model_device, eval_triples, batch_size=min(16, cfg.judge_batch_size))
-            print(f"[warmup] step={step} loss={loss.item():.4f} eval_acc={acc:.4f}")
-            if acc > best_eval:
+            acc, avg_margin = eval_pairwise_metrics(
+                judge,
+                tokenizer,
+                model_device,
+                eval_triples,
+                batch_size=min(16, cfg.judge_batch_size),
+                scores_path=scores_path,
+                step=step,
+            )
+            print(
+                f"[warmup] step={step} loss={loss.item():.4f} "
+                f"eval_acc={acc:.4f} eval_avg_margin={avg_margin:.4f}"
+            )
+            if acc > best_eval or (acc == best_eval and avg_margin > best_eval_margin):
                 best_eval = acc
+                best_eval_margin = avg_margin
                 best_step = step
             if acc >= cfg.judge_warmup_overfit_warn_acc:
                 print(f"[warmup][warn] eval_acc {acc:.3f} >= overfit threshold {cfg.judge_warmup_overfit_warn_acc:.3f}")
-            if acc >= cfg.judge_warmup_early_stop_min_acc:
-                print(f"[warmup] early stop at step={step}, eval_acc={acc:.4f}")
+            if (
+                acc >= cfg.judge_warmup_early_stop_min_acc
+                and avg_margin >= cfg.judge_warmup_early_stop_min_margin
+            ):
+                print(
+                    f"[warmup] early stop at step={step}, eval_acc={acc:.4f}, "
+                    f"eval_avg_margin={avg_margin:.4f}"
+                )
                 early_stopped = True
                 break
 
@@ -322,7 +413,10 @@ def main() -> None:
                 "eval_every": cfg.judge_warmup_eval_every,
                 "eval_pairs": len(eval_triples),
                 "best_eval_pairwise_acc": best_eval,
+                "best_eval_avg_margin": best_eval_margin,
                 "best_step": best_step,
+                "judge_warmup_early_stop_min_margin": cfg.judge_warmup_early_stop_min_margin,
+                "eval_scores_file": str(scores_path) if eval_triples else "",
                 "early_stopped": early_stopped,
             },
             f,
@@ -333,6 +427,8 @@ def main() -> None:
     print(f"  - {out_dir / 'judge_model.pt'}")
     print(f"  - {out_dir / 'warmup_meta.json'}")
     print(f"  - {out_dir / 'judge_warmup_pairs.jsonl'}")
+    if eval_triples:
+        print(f"  - {scores_path}")
 
 
 if __name__ == "__main__":
