@@ -41,7 +41,9 @@ class ActorJudgeConfig:
     cross_domain_ratio: float = 0.0    # fraction of cross-domain batches
 
     # vLLM engine settings (P3: ≤ 0.75 to leave room for PyTorch CUDA Context)
-    gpu_memory_utilization: float = 0.80
+    # PyTorch CUDA Context pins ~1-1.5 GB/GPU that empty_cache() cannot free;
+    # 0.80 will OOM the moment vLLM starts on an 80 GB A100.
+    gpu_memory_utilization: float = 0.75
     tensor_parallel_size: int = 8
 
     # ── Buffer ────────────────────────────────────────────────────────────────

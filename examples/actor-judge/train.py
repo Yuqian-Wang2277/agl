@@ -553,6 +553,12 @@ def main(cfg: ActorJudgeConfig) -> None:
         accelerator.prepare(ref_model),
         accelerator.prepare(judge),
     )
+    # Permanently freeze ref_model in eval mode so Dropout layers (if any in
+    # Qwen3 attention) never fire during the KL forward pass.  Without eval(),
+    # requires_grad_(False) alone prevents weight updates but does NOT disable
+    # stochastic behaviour — the KL baseline would jitter every step and cause
+    # the Actor to diverge.
+    ref_model.eval()
 
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
     train_dataset = load_rollout_dataset(cfg)
@@ -756,12 +762,27 @@ def main(cfg: ActorJudgeConfig) -> None:
                                     + "\n"
                                 )
 
+                    # Build few-shot context for each sample (aligns warmup
+                    # distribution with Phase II where Judge always receives
+                    # context_text_raw from rollout_engine).
+                    warmup_contexts = []
+                    for s in batch_w:
+                        lines = []
+                        for ex in (s.fewshot_examples or []):
+                            inp = ex.get("input", "")
+                            tgt = ex.get("target", "")
+                            if isinstance(tgt, list):
+                                tgt = tgt[0] if tgt else ""
+                            lines.append(f"Q: {inp}  A: {tgt}")
+                        warmup_contexts.append("\n".join(lines))
+
                     judge_trainer.warmup_step(
                         s_golds,
                         s_negs,
                         questions,
                         global_step=step,
                         advance_scheduler=False,
+                        context_texts=warmup_contexts,
                     )
 
                     if (

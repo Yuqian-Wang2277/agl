@@ -143,10 +143,18 @@ class JudgeTrainer:
         global_step: int = 0,
         *,
         advance_scheduler: bool = True,
+        context_texts: Optional[List[str]] = None,
     ) -> float:
         """Pre-train Judge on (S_gold, S_neg) pairs before Phase II starts.
 
         s_neg_texts should be perturbed / shuffled versions of s_gold_texts.
+
+        context_texts: optional list of few-shot Q&A context strings, one per
+        sample (same format as Experience.context_text built in rollout_engine).
+        Passing these aligns the warmup distribution with Phase II, where Judge
+        always receives context_text_raw from the rollout experience.  When None
+        or all-empty, the prompt reduces to (Q, S) only — acceptable but causes
+        a minor distribution shift vs Phase II.
 
         During Phase II–only warmup, pass ``advance_scheduler=False`` so the
         cosine schedule (sized for main training) is not consumed by warmup steps.
@@ -154,11 +162,15 @@ class JudgeTrainer:
         assert len(s_gold_texts) == len(s_neg_texts) == len(questions)
         device = self.accel.device
 
-        # Warmup uses (question, strategy) pairs only — no few-shot context available
-        win_texts  = [build_judge_prompt([], q, s) for q, s in zip(questions, s_gold_texts)]
-        lose_texts = [build_judge_prompt([], q, s) for q, s in zip(questions, s_neg_texts)]
-        # context_text_raw left empty intentionally: gold strategies don't have
-        # a corresponding few-shot context stored; judge still sees Q+S.
+        ctxs = context_texts if context_texts is not None else [""] * len(questions)
+        win_texts  = [
+            build_judge_prompt([], q, s, context_text_raw=ctx)
+            for q, s, ctx in zip(questions, s_gold_texts, ctxs)
+        ]
+        lose_texts = [
+            build_judge_prompt([], q, s, context_text_raw=ctx)
+            for q, s, ctx in zip(questions, s_neg_texts, ctxs)
+        ]
 
         inputs_win  = self.tok(win_texts,  return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
         inputs_lose = self.tok(lose_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
