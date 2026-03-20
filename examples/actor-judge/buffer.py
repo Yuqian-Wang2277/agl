@@ -46,6 +46,7 @@ class Experience:
     question: str       # new question Q'
     strategy: str       # generated strategy S (full text including tags)
     outcome: int        # y ∈ {-1, 0, 1}; -1 = format error, not used in pairwise
+    outcome_soft: float = 0.0   # v3 soft score [0,1]; monitoring only (not used in RL)
     n_sampled: int = 0       # how many times this traj was sampled by Judge
     v_pred: float = 0.5      # Judge's latest predicted score (initialised at 0.5)
     timestamp: int = 0       # global step when this experience was added
@@ -288,6 +289,7 @@ class UCBBuffer:
         strategy: str,
         outcome: int,
         timestamp: int = 0,
+        outcome_soft: float = 0.0,
     ) -> Experience:
         """Create a new Experience with a fresh UUID traj_id."""
         return Experience(
@@ -297,5 +299,6 @@ class UCBBuffer:
             question=question,
             strategy=strategy,
             outcome=outcome,
+            outcome_soft=outcome_soft,
             timestamp=timestamp,
         )

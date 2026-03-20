@@ -51,6 +51,7 @@ import logging
 from typing import List, Optional, Tuple
 
 import torch
+import wandb
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -68,7 +69,9 @@ logger = logging.getLogger(__name__)
 def tokenise_strategy_batch(
     experiences: List[Experience],
     tokenizer: PreTrainedTokenizer,
-    model_max_length: int = 4096,
+    model_max_length: int = 8192,
+    *,
+    accel=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
     """Tokenise (prompt + strategy) pairs and build three-part action_mask.
 
@@ -108,6 +111,18 @@ def tokenise_strategy_batch(
         # even when the left-truncation eats into the prompt region.
         if len(f_ids) > model_max_length:
             overflow = len(f_ids) - model_max_length
+            # Left truncation drops the start of the prompt — few-shot lives there.
+            # If this fires often, reduce fewshot_max or raise actor_max_length (config).
+            msg = (
+                f"WARNING: Actor left truncation occurred! Lost {overflow} tokens. "
+                "Few-shot at the start of the prompt may be damaged."
+            )
+            logger.warning(msg)
+            if accel is not None and accel.is_main_process:
+                try:
+                    wandb.log({"train/actor_left_truncation_tokens": overflow}, commit=False)
+                except Exception:
+                    pass
             f_ids = f_ids[overflow:]
             p_len = max(0, len(p_ids) - overflow)
         else:
@@ -276,8 +291,12 @@ class ActorTrainer:
         BK = len(valid_exps)
 
         # ── Tokenise ─────────────────────────────────────────────────────
+        amax = int(getattr(self.cfg, "actor_max_length", 8192))
         input_ids, attn_mask, action_mask, _ = tokenise_strategy_batch(
-            valid_exps, self.tok
+            valid_exps,
+            self.tok,
+            model_max_length=amax,
+            accel=self.accel,
         )
         input_ids   = input_ids.to(device)
         attn_mask   = attn_mask.to(device)
@@ -395,25 +414,23 @@ class ActorTrainer:
         device: torch.device,
     ) -> torch.Tensor:
         """Run Judge model in no_grad mode to obtain σ(logit) scores."""
-        from prompts import build_judge_prompt
+        from judge_encode import encode_batch_for_judge
+        from prompts import build_judge_prompt_body
 
-        texts = [
-            build_judge_prompt(
-                fewshot_examples=[],
-                question=e.question,
-                strategy=e.strategy,
+        bodies = [
+            build_judge_prompt_body(
+                [],
+                e.question,
+                e.strategy,
                 context_text_raw=e.context_text,
             )
             for e in experiences
         ]
-
-        enc = self.tok(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-        ).to(device)
+        jmax = int(getattr(self.cfg, "judge_max_length", 8192))
+        enc = {
+            k: v.to(device)
+            for k, v in encode_batch_for_judge(self.tok, bodies, jmax).items()
+        }
 
         judge_model.eval()
         with torch.no_grad():

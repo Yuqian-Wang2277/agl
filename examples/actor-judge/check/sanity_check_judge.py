@@ -30,8 +30,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+from judge_encode import encode_batch_for_judge
 from judge_model import JudgeModel
-from prompts import build_judge_prompt
+from prompts import build_judge_prompt_body
 
 
 def _batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -57,14 +58,8 @@ def score_strategy(
     max_length: int,
     model_device: torch.device,
 ) -> Tuple[float, float]:
-    text = build_judge_prompt([], question, strategy)
-    batch = tokenizer(
-        text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
+    body = build_judge_prompt_body([], question, strategy)
+    batch = encode_batch_for_judge(tokenizer, [body], max_length)
     batch = _batch_to_device(batch, model_device)
     with torch.no_grad():
         logit = judge(**batch).float().reshape(-1)[0]
@@ -155,7 +150,7 @@ def main() -> None:
         default="auto",
         help="HF device_map for backbone (e.g. auto, cuda:0, or balanced low-memory settings)",
     )
-    parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument("--max_length", type=int, default=8192)
     parser.add_argument(
         "--cases_json",
         type=str,

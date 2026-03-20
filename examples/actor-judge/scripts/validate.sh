@@ -96,6 +96,10 @@ ds = ActorJudgeDataset(
     fewshot_min=3,
     fewshot_max=5,
     cross_domain_ratio=0.0,
+    max_stage1_prompt_tokens=4000,
+    tokenizer=tokenizer,
+    stage1_chars_per_token=2.5,
+    stage1_reject_log_path="",
 )
 n_total = len(ds)
 correct = 0

@@ -144,6 +144,34 @@ def build_answer_prompt(
 # Judge input
 # ---------------------------------------------------------------------------
 
+def build_judge_prompt_body(
+    fewshot_examples: List[Dict[str, Any]],
+    question: str,
+    strategy: str,
+    version: str = "quality_scalar_v1",
+    context_text_raw: str = "",
+) -> str:
+    """Judge prompt text **without** the trailing ``<|judge|>`` anchor.
+
+    Tokenise this with truncation, then append anchor token ids (see
+    ``judge_encode.encode_batch_for_judge``) so the scalar head always sees
+    the correct last position.
+    """
+    tmpl = load_prompt("judge_evaluation", version)
+    if context_text_raw:
+        examples_text = context_text_raw
+    elif fewshot_examples:
+        examples_text = format_examples(fewshot_examples)
+    else:
+        examples_text = ""
+    user_content = tmpl["user"].format(
+        examples_text=examples_text,
+        question=question,
+        strategy=strategy,
+    )
+    return f"{tmpl['system'].strip()}\n\n{user_content.strip()}"
+
+
 def build_judge_prompt(
     fewshot_examples: List[Dict[str, Any]],
     question: str,
@@ -173,25 +201,7 @@ def build_judge_prompt(
         A single string.  The caller must tokenise this directly
         (NOT via apply_chat_template).
     """
-    tmpl = load_prompt("judge_evaluation", version)
-    if context_text_raw:
-        examples_text = context_text_raw
-    elif fewshot_examples:
-        examples_text = format_examples(fewshot_examples)
-    else:
-        examples_text = ""
-    user_content = tmpl["user"].format(
-        examples_text=examples_text,
-        question=question,
-        strategy=strategy,
-    )
-    # Combine system + user as plain text, then append <|judge|> anchor
-    prompt = (
-        f"{tmpl['system'].strip()}\n\n"
-        f"{user_content.strip()}\n"
-        f"{JUDGE_TOKEN}"
-    )
-    return prompt
+    return f"{build_judge_prompt_body(fewshot_examples, question, strategy, version, context_text_raw)}\n{JUDGE_TOKEN}"
 
 
 # ---------------------------------------------------------------------------

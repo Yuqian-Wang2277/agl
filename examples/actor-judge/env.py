@@ -1,28 +1,51 @@
 """Answer evaluation environment for Actor-Judge Phase II.
 
-evaluate() returns:
-  -1  format completely broken (no </strategy> or no <answer> tag)
-   0  format OK but answer incorrect
-   1  format OK and answer correct
+evaluate() / evaluate_detailed() return:
+  outcome -1  format completely broken (no </strategy> or no <answer> tag)
+  outcome  0  format OK but answer incorrect (v3 hard_correct == 0)
+  outcome  1  format OK and answer correct (v3 hard_correct == 1)
 
 y = -1 samples are stored in the buffer but never enter Judge pairwise training,
 preventing corrupted outputs from "poisoning" the Judge's evaluation standard.
 
-Correctness logic is ported from strategy_extraction/reward/v1.py
-(exact → numeric → F1 cascade).
+After strict XML format checks, correctness uses ``strategy_extraction.reward.v3``
+(``compute_answer_judgement``).  The v3 **soft_score** in [0, 1] is returned for
+WandB / JSON logging only — RL still uses the hard outcome {-1,0,1}.
 """
 
 from __future__ import annotations
 
+import importlib
+import logging
 import re
-from typing import Optional
+import sys
+import types
+from pathlib import Path
+from typing import Optional, Tuple
 
 from prompts import STRATEGY_CLOSE, STRATEGY_OPEN, ANSWER_OPEN, ANSWER_CLOSE
+
+logger = logging.getLogger(__name__)
+
+_EXAMPLES_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXAMPLES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES_ROOT))
+
+# Load v3 without executing ``strategy_extraction/__init__.py`` (that pulls agentlightning).
+if "strategy_extraction" not in sys.modules:
+    _pkg = types.ModuleType("strategy_extraction")
+    _pkg.__path__ = [str(_EXAMPLES_ROOT / "strategy_extraction")]
+    sys.modules["strategy_extraction"] = _pkg
+
+compute_answer_judgement = importlib.import_module(
+    "strategy_extraction.reward.v3"
+).compute_answer_judgement
 
 
 # ---------------------------------------------------------------------------
 # Format validation
 # ---------------------------------------------------------------------------
+
 
 def _strategy_format_valid(strategy_text: str) -> bool:
     """Check that the strategy output contains a properly closed <strategy> tag."""
@@ -35,8 +58,9 @@ def _answer_format_valid(answer_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Answer extraction
+# Answer extraction (first <answer> block — same boundary v3 expects inside tags)
 # ---------------------------------------------------------------------------
+
 
 def extract_answer(output: str) -> Optional[str]:
     """Extract text inside the first <answer>…</answer> block."""
@@ -50,83 +74,50 @@ def extract_answer(output: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Correctness cascade (exact → numeric → F1)
-# ---------------------------------------------------------------------------
-
-def _compute_correctness(
-    answer: str,
-    ground_truth: str,
-    numeric_tolerance: float = 0.02,
-    f1_threshold: float = 0.5,
-) -> int:
-    """Return 1 if answer is correct, 0 otherwise."""
-    if not answer or not ground_truth:
-        return 0
-
-    ans_norm = answer.strip().lower()
-    gt_norm  = ground_truth.strip().lower()
-
-    # Exact match
-    if ans_norm == gt_norm:
-        return 1
-
-    # Numeric match
-    try:
-        a_num = float(ans_norm)
-        g_num = float(gt_norm)
-        denom = abs(g_num) if abs(g_num) > 1e-9 else 1.0
-        if abs(a_num - g_num) / denom < numeric_tolerance:
-            return 1
-    except (ValueError, TypeError):
-        pass
-
-    # Token-level F1 match (count-based, consistent with SQuAD standard)
-    # Using Counter instead of set preserves word frequencies, so repeated
-    # words are counted correctly (e.g. "cat sat cat" vs "cat cat sat").
-    from collections import Counter
-    pred_counter = Counter(ans_norm.split())
-    gold_counter = Counter(gt_norm.split())
-    if pred_counter and gold_counter:
-        # Intersection counts each token min(pred, gold) times
-        common = sum((pred_counter & gold_counter).values())
-        if common > 0:
-            prec = common / sum(pred_counter.values())
-            rec  = common / sum(gold_counter.values())
-            f1   = 2 * prec * rec / (prec + rec)
-            if f1 >= f1_threshold:
-                return 1
-
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
-def evaluate(strategy_text: str, answer_text: str, answer_gold: str) -> int:
-    """Evaluate a (strategy, answer) pair against the gold answer.
 
-    Args:
-        strategy_text: Full text output from Stage-1 (should contain
-                       <strategy>…</strategy>).
-        answer_text:   Full text output from Stage-2 (should contain
-                       <answer>…</answer>).
-        answer_gold:   Ground-truth answer string.
-
-    Returns:
-        -1 if format is broken, 0 if wrong, 1 if correct.
-    """
-    # Format_Check — prevents broken outputs from poisoning Judge training
+def evaluate_detailed(
+    strategy_text: str,
+    answer_text: str,
+    answer_gold: str,
+    task_meta: Optional[dict] = None,
+) -> Tuple[int, float]:
+    """Return (hard_outcome, v3_soft_score).  soft is 0.0 when outcome == -1."""
+    soft = 0.0
     if not _strategy_format_valid(strategy_text):
-        return -1
+        return -1, soft
     if not _answer_format_valid(answer_text):
-        return -1
+        return -1, soft
 
-    answer = extract_answer(answer_text)
-    if answer is None:
-        return 0
+    span = extract_answer(answer_text)
+    if span is None:
+        return 0, soft
 
-    return _compute_correctness(answer, answer_gold)
+    try:
+        detail = compute_answer_judgement(
+            answer=span,
+            ground_truth=answer_gold,
+            task_meta=task_meta,
+        )
+        soft = float(detail.get("soft_score", 0.0))
+        hard = int(detail.get("hard_correct", 0))
+        return (1 if hard else 0), soft
+    except Exception as exc:
+        logger.warning("compute_answer_judgement failed: %s", exc)
+        return 0, 0.0
+
+
+def evaluate(
+    strategy_text: str,
+    answer_text: str,
+    answer_gold: str,
+    task_meta: Optional[dict] = None,
+) -> int:
+    """Hard label only (backward compatible)."""
+    outcome, _ = evaluate_detailed(strategy_text, answer_text, answer_gold, task_meta)
+    return outcome
 
 
 def compute_length_penalty(strategy_text: str, coeff: float, threshold: int) -> float:
@@ -137,7 +128,6 @@ def compute_length_penalty(strategy_text: str, coeff: float, threshold: int) -> 
     """
     if coeff <= 0.0:
         return 0.0
-    # Approximate token count by word-splitting (fast, no tokenizer needed here)
     approx_tokens = len(strategy_text.split())
     excess = max(0, approx_tokens - threshold)
     return -coeff * excess

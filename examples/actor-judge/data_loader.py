@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from torch.utils.data import Dataset
 
+from prompts import apply_chat_template, build_strategy_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -157,6 +159,11 @@ class ActorJudgeDataset(Dataset):
         strategy_dir: str = "",
         load_s_gold: bool = False,
         seed: int = 42,
+        *,
+        max_stage1_prompt_tokens: int = 0,
+        tokenizer: Optional[Any] = None,
+        stage1_chars_per_token: float = 2.5,
+        stage1_reject_log_path: str = "",
     ) -> None:
         random.seed(seed)
         self._domain_map = _load_domain_examples(data_dir)
@@ -172,6 +179,11 @@ class ActorJudgeDataset(Dataset):
         self._cross_domain_ratio = cross_domain_ratio
         self._strategy_dir = strategy_dir
         self._load_s_gold = load_s_gold
+        self._max_stage1 = int(max_stage1_prompt_tokens)
+        self._tokenizer = tokenizer
+        self._stage1_cpt = float(stage1_chars_per_token)
+        self._reject_log_path = (stage1_reject_log_path or "").strip()
+        self._n_rejected_long = 0
 
         # Pre-cache gold strategies to avoid repeated glob scans
         self._s_gold_cache: Dict[str, Optional[str]] = {}
@@ -186,22 +198,89 @@ class ActorJudgeDataset(Dataset):
         n_cross = int(num_samples * self._cross_domain_ratio)
         n_same = num_samples - n_cross
 
-        for _ in range(n_same):
-            s = self._make_sample(cross_domain=False)
-            if s:
-                samples.append(s)
-
-        for _ in range(n_cross):
-            s = self._make_sample(cross_domain=True)
-            if s:
-                samples.append(s)
+        self._fill(samples, n_same, cross_domain=False)
+        self._fill(samples, n_cross, cross_domain=True)
 
         random.shuffle(samples)
         logger.info(
-            "Dataset built: %d samples (%d same-domain, %d cross-domain)",
-            len(samples), n_same, n_cross,
+            "Dataset built: %d samples (%d same-domain target, %d cross-domain target; "
+            "%d rejected for long Stage-1 prompt)",
+            len(samples),
+            n_same,
+            n_cross,
+            self._n_rejected_long,
         )
         return samples
+
+    def _stage1_prompt_token_len(self, sample: RolloutSample) -> float:
+        """Tokens for the Stage-1 chat string (few-shot + template); no strategy yet."""
+        messages = build_strategy_prompt(sample.fewshot_examples)
+        if self._tokenizer is not None:
+            prompt_str = apply_chat_template(self._tokenizer, messages)
+            return float(
+                len(
+                    self._tokenizer.encode(
+                        prompt_str,
+                        add_special_tokens=False,
+                    )
+                )
+            )
+        flat = "\n".join(m.get("content", "") for m in messages)
+        return len(flat) / max(self._stage1_cpt, 1e-6)
+
+    def _reject_long(self, sample: RolloutSample, est_tokens: float, cross_domain: bool) -> None:
+        self._n_rejected_long += 1
+        q_prev = sample.question[:200] + ("…" if len(sample.question) > 200 else "")
+        logger.warning(
+            "Stage-1 length gate: rejected est_tokens=%.1f (threshold=%d) domain=%s "
+            "cross_domain=%s question_preview=%r",
+            est_tokens,
+            self._max_stage1,
+            sample.domain,
+            cross_domain,
+            q_prev,
+        )
+        if self._reject_log_path:
+            Path(self._reject_log_path).parent.mkdir(parents=True, exist_ok=True)
+            rec = {
+                "reason": "stage1_prompt_too_long",
+                "est_tokens": round(est_tokens, 2),
+                "threshold": self._max_stage1,
+                "domain": sample.domain,
+                "cross_domain": cross_domain,
+                "n_fewshot": len(sample.fewshot_examples),
+                "question": sample.question,
+                "answer_gold": sample.answer_gold,
+            }
+            with open(self._reject_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def _fill(self, samples: List[RolloutSample], target: int, cross_domain: bool) -> None:
+        if target <= 0:
+            return
+        added = 0
+        attempts = 0
+        max_attempts = max(target * 200, 10_000)
+        while added < target and attempts < max_attempts:
+            attempts += 1
+            s = self._make_sample(cross_domain=cross_domain)
+            if s is None:
+                continue
+            est = self._stage1_prompt_token_len(s)
+            if self._max_stage1 <= 0 or est <= self._max_stage1:
+                samples.append(s)
+                added += 1
+            else:
+                self._reject_long(s, est, cross_domain)
+        if added < target:
+            logger.warning(
+                "ActorJudgeDataset: got %d/%d %s samples after %d attempts "
+                "(length gate, sparse pools, or cross-domain constraints).",
+                added,
+                target,
+                "cross-domain" if cross_domain else "same-domain",
+                attempts,
+            )
 
     def _make_sample(self, cross_domain: bool) -> Optional[RolloutSample]:
         """Build one RolloutSample.
@@ -277,9 +356,27 @@ class ActorJudgeDataset(Dataset):
 # Convenience factories
 # ---------------------------------------------------------------------------
 
-def load_rollout_dataset(cfg) -> ActorJudgeDataset:
+def load_rollout_dataset(
+    cfg,
+    tokenizer: Optional[Any] = None,
+    *,
+    stage1_reject_log_path: Optional[str] = None,
+    max_stage1_prompt_tokens: Optional[int] = None,
+) -> ActorJudgeDataset:
     """Build the training dataset from an ActorJudgeConfig."""
     train_dir = os.path.join(cfg.data_base_path, cfg.train_subdir)
+    if max_stage1_prompt_tokens is not None:
+        mx = int(max_stage1_prompt_tokens)
+    else:
+        mx = int(getattr(cfg, "max_stage1_prompt_tokens", 0))
+    log_path = ""
+    if mx > 0 and getattr(cfg, "dataset_stage1_reject_log", True):
+        if stage1_reject_log_path:
+            log_path = str(Path(stage1_reject_log_path).expanduser())
+        else:
+            cd = (getattr(cfg, "checkpoint_dir", None) or "").strip()
+            if cd:
+                log_path = str(Path(cd) / "dataset_stage1_rejects.jsonl")
     return ActorJudgeDataset(
         data_dir=train_dir,
         fewshot_min=cfg.fewshot_min,
@@ -288,13 +385,36 @@ def load_rollout_dataset(cfg) -> ActorJudgeDataset:
         cross_domain_ratio=cfg.cross_domain_ratio,
         strategy_dir=cfg.strategy_dir,
         load_s_gold=cfg.judge_warmup,
+        max_stage1_prompt_tokens=mx,
+        tokenizer=tokenizer,
+        stage1_chars_per_token=float(getattr(cfg, "stage1_length_chars_per_token", 2.5)),
+        stage1_reject_log_path=log_path,
     )
 
 
-def load_val_dataset(cfg, subdir: str) -> ActorJudgeDataset:
+def load_val_dataset(
+    cfg,
+    subdir: str,
+    tokenizer: Optional[Any] = None,
+    *,
+    stage1_reject_log_path: Optional[str] = None,
+    max_stage1_prompt_tokens: Optional[int] = None,
+) -> ActorJudgeDataset:
     """Build a validation dataset for one val split."""
     val_dir = os.path.join(cfg.data_base_path, subdir)
     n_val = getattr(cfg, "val_num_samples", 500)
+    if max_stage1_prompt_tokens is not None:
+        mx = int(max_stage1_prompt_tokens)
+    else:
+        mx = int(getattr(cfg, "max_stage1_prompt_tokens", 0))
+    log_path = ""
+    if mx > 0 and getattr(cfg, "dataset_stage1_reject_log", True):
+        if stage1_reject_log_path:
+            log_path = str(Path(stage1_reject_log_path).expanduser())
+        else:
+            cd = (getattr(cfg, "checkpoint_dir", None) or "").strip()
+            if cd:
+                log_path = str(Path(cd) / f"dataset_stage1_rejects_val_{subdir}.jsonl")
     return ActorJudgeDataset(
         data_dir=val_dir,
         fewshot_min=cfg.fewshot_min,
@@ -302,6 +422,10 @@ def load_val_dataset(cfg, subdir: str) -> ActorJudgeDataset:
         num_samples=n_val,
         cross_domain_ratio=0.0,   # val is always same-domain
         load_s_gold=False,
+        max_stage1_prompt_tokens=mx,
+        tokenizer=tokenizer,
+        stage1_chars_per_token=float(getattr(cfg, "stage1_length_chars_per_token", 2.5)),
+        stage1_reject_log_path=log_path,
     )
 
 

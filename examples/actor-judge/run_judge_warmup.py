@@ -22,7 +22,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import ActorJudgeConfig
 from data_loader import load_rollout_dataset
 from judge_model import JudgeModel, warmstart_judge_token_embedding
-from prompts import build_judge_prompt
+from judge_encode import encode_batch_for_judge
+from prompts import build_judge_prompt_body
 
 
 def sample_negative(
@@ -55,6 +56,7 @@ def eval_pairwise_metrics(
     batch_size: int = 16,
     scores_path: Optional[Path] = None,
     step: int = -1,
+    judge_max_length: int = 8192,
 ) -> Tuple[float, float]:
     """Pairwise eval: accuracy via raw logits (monotonic with sigmoid); margin = mean(sigmoid(w)-sigmoid(l)).
 
@@ -74,14 +76,14 @@ def eval_pairwise_metrics(
             qs = [x[0] for x in chunk]
             pos = [x[1] for x in chunk]
             neg = [x[2] for x in chunk]
-            win = [build_judge_prompt([], q, s) for q, s in zip(qs, pos)]
-            lose = [build_judge_prompt([], q, s) for q, s in zip(qs, neg)]
+            win_b = [build_judge_prompt_body([], q, s) for q, s in zip(qs, pos)]
+            lose_b = [build_judge_prompt_body([], q, s) for q, s in zip(qs, neg)]
             in_win = _batch_to_device(
-                tokenizer(win, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+                encode_batch_for_judge(tokenizer, win_b, judge_max_length),
                 device,
             )
             in_lose = _batch_to_device(
-                tokenizer(lose, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+                encode_batch_for_judge(tokenizer, lose_b, judge_max_length),
                 device,
             )
             lw = judge(**in_win).float()
@@ -245,7 +247,11 @@ def main() -> None:
         lr=cfg.judge_warmup_lr if cfg.judge_warmup_lr > 0 else cfg.judge_lr * 0.1,
     )
 
-    ds = load_rollout_dataset(cfg)
+    ds = load_rollout_dataset(
+        cfg,
+        tokenizer=tokenizer,
+        stage1_reject_log_path=str(out_dir / "dataset_stage1_rejects.jsonl"),
+    )
     warmup_samples = [
         s for s in ds if (s.s_gold_by_version and len(s.s_gold_by_version) > 0) or s.s_gold is not None
     ]
@@ -329,14 +335,15 @@ def main() -> None:
                     "negative_strategy": neg,
                 }, ensure_ascii=False) + "\n")
 
-        win_texts = [build_judge_prompt([], q, s) for q, s in zip(questions, s_golds)]
-        lose_texts = [build_judge_prompt([], q, s) for q, s in zip(questions, s_negs)]
+        jmax = int(getattr(cfg, "judge_max_length", 8192))
+        win_bodies = [build_judge_prompt_body([], q, s) for q, s in zip(questions, s_golds)]
+        lose_bodies = [build_judge_prompt_body([], q, s) for q, s in zip(questions, s_negs)]
         inputs_win = _batch_to_device(
-            tokenizer(win_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+            encode_batch_for_judge(tokenizer, win_bodies, jmax),
             model_device,
         )
         inputs_lose = _batch_to_device(
-            tokenizer(lose_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048),
+            encode_batch_for_judge(tokenizer, lose_bodies, jmax),
             model_device,
         )
 
@@ -372,6 +379,7 @@ def main() -> None:
                 batch_size=min(16, cfg.judge_batch_size),
                 scores_path=scores_path,
                 step=step,
+                judge_max_length=cfg.judge_max_length,
             )
             print(
                 f"[warmup] step={step} loss={loss.item():.4f} "

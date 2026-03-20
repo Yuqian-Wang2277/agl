@@ -85,11 +85,13 @@ from data_loader import (
 )
 from judge_model import JudgeModel, warmstart_judge_token_embedding
 from judge_trainer import JudgeTrainer
-from env import evaluate
+from env import evaluate_detailed
+from judge_encode import encode_batch_for_judge
 from prompts import (
     apply_chat_template,
     build_answer_prompt,
     build_judge_prompt,
+    build_judge_prompt_body,
     build_strategy_prompt,
     judge_rollout_context_text,
     STRATEGY_CLOSE,
@@ -225,6 +227,7 @@ def judge_warmup_pairwise_metrics(
     device: torch.device,
     triples: List[Tuple[str, str, str]],
     batch_size: int = 16,
+    judge_max_length: int = 8192,
 ) -> Tuple[float, float]:
     """Return (acc, avg_margin): acc uses logit_win > logit_lose; margin = mean(sigmoid(w)-sigmoid(l))."""
     if not triples:
@@ -240,26 +243,14 @@ def judge_warmup_pairwise_metrics(
             qs = [t[0] for t in chunk]
             pos = [t[1] for t in chunk]
             neg = [t[2] for t in chunk]
-            win_texts = [build_judge_prompt([], q, sp) for q, sp in zip(qs, pos)]
-            lose_texts = [build_judge_prompt([], q, sn) for q, sn in zip(qs, neg)]
+            win_bodies = [build_judge_prompt_body([], q, sp) for q, sp in zip(qs, pos)]
+            lose_bodies = [build_judge_prompt_body([], q, sn) for q, sn in zip(qs, neg)]
             inputs_win = _warmup_batch_to_device(
-                tokenizer(
-                    win_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=2048,
-                ),
+                encode_batch_for_judge(tokenizer, win_bodies, judge_max_length),
                 device,
             )
             inputs_lose = _warmup_batch_to_device(
-                tokenizer(
-                    lose_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=2048,
-                ),
+                encode_batch_for_judge(tokenizer, lose_bodies, judge_max_length),
                 device,
             )
             lw = judge(**inputs_win).float()
@@ -334,6 +325,7 @@ def _attach_judge_scores_to_val_items(
     accelerator: Accelerator,
     batch_size: int,
     freeze_judge: bool,
+    judge_max_length: int,
 ) -> None:
     """In-place: add judge_logit / judge_prob per item.
 
@@ -354,10 +346,11 @@ def _attach_judge_scores_to_val_items(
     judge_u.eval()
     device = accelerator.device
 
+    jmax = int(judge_max_length)
     for i in range(0, len(items), batch_size):
         chunk = items[i : i + batch_size]
-        texts = [
-            build_judge_prompt(
+        bodies = [
+            build_judge_prompt_body(
                 [],
                 it["question"],
                 it["strategy_text"],
@@ -365,10 +358,10 @@ def _attach_judge_scores_to_val_items(
             )
             for it in chunk
         ]
-        enc = tokenizer(
-            texts, return_tensors="pt", padding=True, truncation=True, max_length=2048
-        )
-        enc = {k: v.to(device) for k, v in enc.items() if isinstance(v, torch.Tensor)}
+        enc = {
+            k: v.to(device)
+            for k, v in encode_batch_for_judge(tokenizer, bodies, jmax).items()
+        }
         with torch.no_grad():
             logits = judge_u(**enc).float().reshape(-1)
         probs = torch.sigmoid(logits).cpu().tolist()
@@ -400,6 +393,7 @@ def _log_val_items_wandb_table(pack: Dict[str, Any], key: str, step: int) -> Non
         "outcome",
         "judge_logit",
         "judge_prob",
+        "v3_soft_score",
         "question",
         "strategy_preview",
         "answer_preview",
@@ -415,6 +409,7 @@ def _log_val_items_wandb_table(pack: Dict[str, Any], key: str, step: int) -> Non
                     it.get("outcome"),
                     it.get("judge_logit"),
                     it.get("judge_prob"),
+                    it.get("v3_soft_score"),
                     (it.get("question") or "")[:500],
                     (it.get("strategy_text") or "")[:800],
                     (it.get("answer_text") or "")[:400],
@@ -458,17 +453,18 @@ def _validate_split_pass1_vllm(
     vllm_actor,
     val_dataset: ActorJudgeDataset,
     split_name: str,
-) -> Tuple[float, int, int, List[Dict[str, Any]]]:
+) -> Tuple[float, int, int, List[Dict[str, Any]], float]:
     """Strict Pass@1: denominator = every problem; format errors (-1) count as incorrect.
 
-    Returns (pass1, correct, n, items) where *items* is empty unless cfg.val_save_item_details.
+    Returns (pass1, correct, n, items, mean_v3_soft) where *items* is empty unless
+    cfg.val_save_item_details.  mean_v3_soft is mean v3 soft score over all n rows.
     """
     from vllm import SamplingParams
 
     samples = list(val_dataset)
     n = len(samples)
     if n == 0:
-        return 0.0, 0, 0, []
+        return 0.0, 0, 0, [], 0.0
 
     prompts1 = [
         apply_chat_template(tokenizer, build_strategy_prompt(s.fewshot_examples))
@@ -506,8 +502,12 @@ def _validate_split_pass1_vllm(
 
     items: List[Dict[str, Any]] = []
     correct = 0
+    soft_sum = 0.0
     for i, sample in enumerate(samples):
-        outcome = evaluate(s_texts[i], answers[i], sample.answer_gold)
+        outcome, v3_soft = evaluate_detailed(
+            s_texts[i], answers[i], sample.answer_gold, task_meta=None
+        )
+        soft_sum += v3_soft
         if outcome == 1:
             correct += 1
         if cfg.val_save_item_details:
@@ -525,9 +525,11 @@ def _validate_split_pass1_vllm(
                     "strategy_text": s_texts[i],
                     "answer_text": answers[i],
                     "outcome": int(outcome),
+                    "v3_soft_score": float(v3_soft),
                 }
             )
 
+    mean_v3_soft = soft_sum / max(n, 1)
     pass1 = correct / max(n, 1)
     logger.info(
         "Validation [%s] strict Pass@1 = %.4f (%d/%d)",
@@ -536,7 +538,7 @@ def _validate_split_pass1_vllm(
         correct,
         n,
     )
-    return pass1, correct, n, items
+    return pass1, correct, n, items, mean_v3_soft
 
 
 def run_full_validation_vllm(
@@ -554,6 +556,7 @@ def run_full_validation_vllm(
     pass_vals: List[float] = []
     all_items: List[Dict[str, Any]] = []
     mean_p = 0.0
+    mean_v3_all = 0.0
 
     if accelerator.is_main_process:
         logger.info(
@@ -570,11 +573,16 @@ def run_full_validation_vllm(
         )
         try:
             for subdir in cfg.val_subdirs:
-                val_ds = load_val_dataset(cfg, subdir)
-                p1, c, n, items = _validate_split_pass1_vllm(
+                val_ds = load_val_dataset(cfg, subdir, tokenizer=tokenizer)
+                p1, c, n, items, mean_v3 = _validate_split_pass1_vllm(
                     tokenizer, cfg, vllm_actor, val_ds, subdir
                 )
-                row: Dict[str, Any] = {"pass_at_1": p1, "correct": c, "total": n}
+                row: Dict[str, Any] = {
+                    "pass_at_1": p1,
+                    "correct": c,
+                    "total": n,
+                    "mean_v3_soft": mean_v3,
+                }
                 if items:
                     row["items"] = items
                 split_results[subdir] = row
@@ -584,7 +592,18 @@ def run_full_validation_vllm(
             ray.kill(vllm_actor)
 
         mean_p = sum(pass_vals) / max(len(pass_vals), 1)
-        logger.info("Validation finished: mean strict Pass@1 = %.4f", mean_p)
+        tot_n = sum(int(split_results[s].get("total", 0)) for s in split_results)
+        w_soft = sum(
+            float(split_results[s].get("mean_v3_soft", 0.0))
+            * int(split_results[s].get("total", 0))
+            for s in split_results
+        )
+        mean_v3_all = w_soft / max(tot_n, 1)
+        logger.info(
+            "Validation finished: mean strict Pass@1 = %.4f mean_v3_soft = %.4f",
+            mean_p,
+            mean_v3_all,
+        )
 
     if accelerator.num_processes > 1:
         bundle_in = None
@@ -608,6 +627,7 @@ def run_full_validation_vllm(
             accelerator,
             cfg.val_judge_score_batch_size,
             cfg.freeze_judge,
+            cfg.judge_max_length,
         )
 
     accelerator.wait_for_everyone()
@@ -624,6 +644,7 @@ def run_full_validation_vllm(
         "global_step": global_step,
         "splits": split_results,
         "mean_pass_at_1": mean_p,
+        "mean_v3_soft": mean_v3_all,
         "joa": joa_val,
         "val_strategy_max_tokens": cfg.val_strategy_max_tokens,
         "val_answer_max_tokens": cfg.val_answer_max_tokens,
@@ -652,26 +673,29 @@ def compute_joa(
 
     Returns JOA value in [0, 1], or -1.0 if buffer data is insufficient.
     """
-    from prompts import build_judge_prompt
-
     all_exps = buffer.sample_individual(n_samples)
     if len(all_exps) < 10:
         logger.warning("compute_joa: too few buffer samples (%d), skipping.", len(all_exps))
         return -1.0
 
     device = accelerator.device
-    texts = [
-        build_judge_prompt([], e.question, e.strategy, context_text_raw=e.context_text)
+    jmax = int(getattr(cfg, "judge_max_length", 8192))
+    bodies = [
+        build_judge_prompt_body([], e.question, e.strategy, context_text_raw=e.context_text)
         for e in all_exps
     ]
-    enc = tokenizer(
-        texts, return_tensors="pt", padding=True, truncation=True, max_length=2048
-    ).to(device)
-
     judge_model.eval()
+    scores: List[float] = []
+    bs = 16
     with torch.no_grad():
-        logits = judge_model(**enc)   # use FSDP-wrapped directly (C2-style fix)
-        scores = torch.sigmoid(logits).cpu().tolist()
+        for i in range(0, len(bodies), bs):
+            chunk_b = bodies[i : i + bs]
+            enc = {
+                k: v.to(device)
+                for k, v in encode_batch_for_judge(tokenizer, chunk_b, jmax).items()
+            }
+            logits = judge_model(**enc)
+            scores.extend(torch.sigmoid(logits).float().cpu().tolist())
     judge_model.train()
 
     high_score = [(s, e.outcome) for s, e in zip(scores, all_exps) if s > 0.6]
@@ -846,7 +870,7 @@ def main(cfg: ActorJudgeConfig) -> None:
     ref_model.eval()
 
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
-    train_dataset = load_rollout_dataset(cfg)
+    train_dataset = load_rollout_dataset(cfg, tokenizer=tokenizer)
     train_loader  = DataLoader(
         train_dataset,
         batch_size=cfg.train_batch_size,
@@ -1085,6 +1109,7 @@ def main(cfg: ActorJudgeConfig) -> None:
                             accelerator.device,
                             eval_triples,
                             batch_size=min(16, cfg.judge_batch_size),
+                            judge_max_length=cfg.judge_max_length,
                         )
                         if accelerator.is_main_process:
                             wandb.log(
@@ -1186,11 +1211,17 @@ def main(cfg: ActorJudgeConfig) -> None:
                 json.dump(base_pack, f, indent=2, default=str)
             for sub, row in base_pack["splits"].items():
                 wandb.log(
-                    {f"val_baseline/{sub}/pass@1_strict": row["pass_at_1"]},
+                    {
+                        f"val_baseline/{sub}/pass@1_strict": row["pass_at_1"],
+                        f"val_baseline/{sub}/v3_soft_mean": row.get("mean_v3_soft", 0.0),
+                    },
                     step=0,
                 )
             wandb.log(
-                {"val_baseline/mean_pass@1_strict": base_pack["mean_pass_at_1"]},
+                {
+                    "val_baseline/mean_pass@1_strict": base_pack["mean_pass_at_1"],
+                    "val_baseline/mean_v3_soft": base_pack.get("mean_v3_soft", 0.0),
+                },
                 step=0,
             )
             j_b = base_pack.get("joa")
@@ -1295,18 +1326,25 @@ def main(cfg: ActorJudgeConfig) -> None:
                     "train/buffer_size":       len(buffer),
                     "train/global_step":       global_step,
                 }
+                soft_vals = [e.outcome_soft for e in batch_exps if e.outcome >= 0]
+                if soft_vals:
+                    metrics["train/v3_soft_mean"] = sum(soft_vals) / len(soft_vals)
                 wandb.log(metrics, step=global_step)
 
         # ── End-of-epoch logging ──────────────────────────────────────────
         if accelerator.is_main_process and experience_batches:
             n_batches = len(experience_batches)
             avg_len = avg_strategy_lengths[-1] if avg_strategy_lengths else 0.0
-            wandb.log({
-                "epoch/actor_loss":        epoch_actor_loss / n_batches,
-                "epoch/judge_loss":        epoch_judge_loss / n_batches,
-                "epoch/avg_strategy_len":  avg_len,
-                "epoch/buffer_size":       len(buffer),
-            }, step=global_step)
+            ep_soft = [e.outcome_soft for e in epoch_experiences if e.outcome >= 0]
+            ep_payload = {
+                "epoch/actor_loss": epoch_actor_loss / n_batches,
+                "epoch/judge_loss": epoch_judge_loss / n_batches,
+                "epoch/avg_strategy_len": avg_len,
+                "epoch/buffer_size": len(buffer),
+            }
+            if ep_soft:
+                ep_payload["epoch/v3_soft_mean"] = sum(ep_soft) / len(ep_soft)
+            wandb.log(ep_payload, step=global_step)
 
             # Length Hacking early warning
             win = cfg.length_hack_window
@@ -1351,11 +1389,17 @@ def main(cfg: ActorJudgeConfig) -> None:
                     json.dump(eval_pack, f, indent=2, default=str)
                 for sub, row in eval_pack["splits"].items():
                     wandb.log(
-                        {f"val/{sub}/pass@1_strict": row["pass_at_1"]},
+                        {
+                            f"val/{sub}/pass@1_strict": row["pass_at_1"],
+                            f"val/{sub}/v3_soft_mean": row.get("mean_v3_soft", 0.0),
+                        },
                         step=global_step,
                     )
                 wandb.log(
-                    {"val/mean_pass@1_strict": eval_pack["mean_pass_at_1"]},
+                    {
+                        "val/mean_pass@1_strict": eval_pack["mean_pass_at_1"],
+                        "val/mean_v3_soft": eval_pack.get("mean_v3_soft", 0.0),
+                    },
                     step=global_step,
                 )
                 j_e = eval_pack.get("joa")
@@ -1504,6 +1548,35 @@ if __name__ == "__main__":
         help="Log per-item validation as wandb.Table (sort e.g. by judge_prob in UI)",
     )
     parser.add_argument("--val_judge_score_batch_size", type=int, default=16)
+    parser.add_argument(
+        "--actor_max_length",
+        type=int,
+        default=8192,
+        help="Max tokens for GRPO (Stage-1 chat prompt + strategy); left-truncates if exceeded",
+    )
+    parser.add_argument(
+        "--judge_max_length",
+        type=int,
+        default=8192,
+        help="Max tokens for Judge body + <|judge|> anchor (body truncated, anchor kept)",
+    )
+    parser.add_argument(
+        "--max_stage1_prompt_tokens",
+        type=int,
+        default=4000,
+        help="Drop dataset rows whose Stage-1 prompt (few-shot+template) exceeds this (0=off)",
+    )
+    parser.add_argument(
+        "--no_dataset_stage1_reject_log",
+        action="store_true",
+        help="Do not append dataset_stage1_rejects*.jsonl under checkpoint_dir",
+    )
+    parser.add_argument(
+        "--stage1_length_chars_per_token",
+        type=float,
+        default=2.5,
+        help="Rough token estimate len(text)/x when building dataset without tokenizer (unused in train; tokenizer is passed)",
+    )
     args = parser.parse_args()
 
     run_name = args.run_name.strip() or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1551,6 +1624,11 @@ if __name__ == "__main__":
         val_item_storage=args.val_item_storage,
         val_log_items_wandb_table=args.val_log_items_wandb_table,
         val_judge_score_batch_size=args.val_judge_score_batch_size,
+        actor_max_length=args.actor_max_length,
+        judge_max_length=args.judge_max_length,
+        max_stage1_prompt_tokens=args.max_stage1_prompt_tokens,
+        dataset_stage1_reject_log=not args.no_dataset_stage1_reject_log,
+        stage1_length_chars_per_token=args.stage1_length_chars_per_token,
     )
 
     main(cfg)

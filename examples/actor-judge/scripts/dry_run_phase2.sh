@@ -4,7 +4,8 @@
 #
 # - min_buffer_size=8 so Judge ODVA can run (default 100 would skip on tiny data)
 # - dry_run_val_size=10 so val_before_train + per-epoch val stay small
-# - WANDB_MODE=offline (no project pollution)
+# - WANDB_MODE=offline (no upload; Tables still logged locally under wandb/)
+# - Val: per-item details → eval_*_items.jsonl; wandb.Table for sortable UI
 # - Judge: reuse pre-warmed checkpoint (no long warmup on 10 rows)
 #
 # Usage:
@@ -48,4 +49,4 @@ exec bash "$SCRIPT_DIR/train.sh" \
     --min_buffer_size 8 \
     --dry_run_val_size 10 \
     --run_name "$RUN_TAG" \
-    --extra "--judge_warmup_mode reuse --judge_init_checkpoint $JUDGE_INIT_DIR --no_val_save_item_details --keep_last_k_checkpoints 0 --keep_best_k_checkpoints 0"
+    --extra "--judge_warmup_mode reuse --judge_init_checkpoint $JUDGE_INIT_DIR --val_item_storage jsonl --val_log_items_wandb_table --keep_last_k_checkpoints 0 --keep_best_k_checkpoints 0"

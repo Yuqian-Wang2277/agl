@@ -21,7 +21,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import PreTrainedTokenizer
 
 from buffer import UCBBuffer
-from prompts import build_judge_prompt, JUDGE_TOKEN
+from judge_encode import encode_batch_for_judge
+from prompts import build_judge_prompt_body
 
 logger = logging.getLogger(__name__)
 
@@ -70,30 +71,29 @@ class JudgeTrainer:
             logger.debug("JudgeTrainer step %d: buffer too sparse, skipping.", global_step)
             return 0.0
 
-        # ── Tokenise win and lose inputs ──────────────────────────────────
-        win_texts  = [
-            build_judge_prompt(
-                [], p.exp_win.question,  p.exp_win.strategy,
+        # ── Tokenise win/lose: truncate body only, then append <|judge|> ids ─
+        jmax = int(getattr(self.cfg, "judge_max_length", 8192))
+        win_bodies = [
+            build_judge_prompt_body(
+                [], p.exp_win.question, p.exp_win.strategy,
                 context_text_raw=p.exp_win.context_text,
             )
             for p in pairs
         ]
-        lose_texts = [
-            build_judge_prompt(
+        lose_bodies = [
+            build_judge_prompt_body(
                 [], p.exp_lose.question, p.exp_lose.strategy,
                 context_text_raw=p.exp_lose.context_text,
             )
             for p in pairs
         ]
 
-        inputs_win  = self.tok(
-            win_texts,  return_tensors="pt", padding=True,
-            truncation=True, max_length=2048,
-        ).to(device)
-        inputs_lose = self.tok(
-            lose_texts, return_tensors="pt", padding=True,
-            truncation=True, max_length=2048,
-        ).to(device)
+        inputs_win = {
+            k: v.to(device) for k, v in encode_batch_for_judge(self.tok, win_bodies, jmax).items()
+        }
+        inputs_lose = {
+            k: v.to(device) for k, v in encode_batch_for_judge(self.tok, lose_bodies, jmax).items()
+        }
 
         # ── Forward pass ──────────────────────────────────────────────────
         self.optimizer.zero_grad()
@@ -163,17 +163,22 @@ class JudgeTrainer:
         device = self.accel.device
 
         ctxs = context_texts if context_texts is not None else [""] * len(questions)
-        win_texts  = [
-            build_judge_prompt([], q, s, context_text_raw=ctx)
+        jmax = int(getattr(self.cfg, "judge_max_length", 8192))
+        win_bodies = [
+            build_judge_prompt_body([], q, s, context_text_raw=ctx)
             for q, s, ctx in zip(questions, s_gold_texts, ctxs)
         ]
-        lose_texts = [
-            build_judge_prompt([], q, s, context_text_raw=ctx)
+        lose_bodies = [
+            build_judge_prompt_body([], q, s, context_text_raw=ctx)
             for q, s, ctx in zip(questions, s_neg_texts, ctxs)
         ]
 
-        inputs_win  = self.tok(win_texts,  return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
-        inputs_lose = self.tok(lose_texts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
+        inputs_win = {
+            k: v.to(device) for k, v in encode_batch_for_judge(self.tok, win_bodies, jmax).items()
+        }
+        inputs_lose = {
+            k: v.to(device) for k, v in encode_batch_for_judge(self.tok, lose_bodies, jmax).items()
+        }
 
         self.optimizer.zero_grad()
         self.judge.train()

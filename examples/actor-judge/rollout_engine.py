@@ -40,7 +40,7 @@ from vllm import LLM, SamplingParams
 
 from buffer import Experience, UCBBuffer
 from data_loader import RolloutSample
-from env import evaluate
+from env import evaluate_detailed
 from prompts import (
     STRATEGY_CLOSE,
     STRATEGY_OPEN,
@@ -204,7 +204,9 @@ class RolloutEngine:
                 s_text = stage1_texts[b_idx * K + k_idx]
                 a_text = answer_map.get((b_idx, k_idx), "")
 
-                outcome = evaluate(s_text, a_text, sample.answer_gold)
+                outcome, outcome_soft = evaluate_detailed(
+                    s_text, a_text, sample.answer_gold, task_meta=None
+                )
 
                 exp = UCBBuffer.make_experience(
                     context_text=context_text,
@@ -212,6 +214,7 @@ class RolloutEngine:
                     question=sample.question,
                     strategy=s_text,
                     outcome=outcome,
+                    outcome_soft=outcome_soft,
                     timestamp=global_step,
                 )
                 experiences.append(exp)

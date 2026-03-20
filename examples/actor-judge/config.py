@@ -24,6 +24,13 @@ class ActorJudgeConfig:
     # ── Data paths ────────────────────────────────────────────────────────────
     data_base_path: str = "/home/test/test16/chenlu/projects/LLMReflection/data/"
     train_subdir: str = "train_20k"
+    # Drop samples whose Stage-1 chat prompt (few-shot + template) exceeds this many
+    # tokens (0 = disabled). Prevents rare ultra-long tails from dominating left-truncation.
+    max_stage1_prompt_tokens: int = 4000
+    # When no tokenizer is passed to the dataset, estimate tokens as len(text)/chars_per_token.
+    stage1_length_chars_per_token: float = 2.5
+    # Append one JSON line per rejected sample (path auto-set under checkpoint_dir when empty).
+    dataset_stage1_reject_log: bool = True
     val_subdirs: List[str] = field(
         default_factory=lambda: ["test-id-subtask", "test-ood-task", "test-bbh"]
     )
@@ -39,6 +46,10 @@ class ActorJudgeConfig:
     strategy_max_tokens: int = 16384
     answer_max_tokens: int = 8192
     cross_domain_ratio: float = 0.0    # fraction of cross-domain batches
+    # GRPO log_prob: full Stage-1 chat prompt (includes few-shot) + strategy S.
+    actor_max_length: int = 8192
+    # Judge: body (Context+Q+S) truncated then <|judge|> appended (see judge_encode).
+    judge_max_length: int = 8192
 
     # vLLM engine settings (P3: ≤ 0.75 to leave room for PyTorch CUDA Context)
     # PyTorch CUDA Context pins ~1-1.5 GB/GPU that empty_cache() cannot free;
@@ -177,3 +188,7 @@ class ActorJudgeConfig:
             raise ValueError(
                 f"val_item_storage must be 'inline', 'jsonl', or 'both', got {self.val_item_storage!r}"
             )
+        if self.max_stage1_prompt_tokens < 0:
+            raise ValueError("max_stage1_prompt_tokens must be >= 0 (0 disables the gate).")
+        if self.stage1_length_chars_per_token <= 0:
+            raise ValueError("stage1_length_chars_per_token must be > 0.")

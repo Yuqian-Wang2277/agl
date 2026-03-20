@@ -312,7 +312,13 @@ bash scripts/dry_run_phase2.sh
 
 手动等价参数见 `train.py`：`--min_buffer_size`、`--dry_run_val_size`（会覆盖 `--val_num_samples`）。
 
-**验证阶段 Judge 与训练对齐**：val 明细里会写入与 rollout 相同的 `context_text`（`Q: …  A: …` 拼接 few-shot），Judge 打分使用 `build_judge_prompt(..., context_text_raw=context_text)`，与 ODVA / dense reward 一致（避免与 `format_examples` 版式混用带来的分布偏移）。
+**验证阶段 Judge 与训练对齐**：val 明细里会写入与 rollout 相同的 `context_text`（`Q: …  A: …` 拼接 few-shot），Judge 编码先截断正文再在末尾拼接 `<|judge|>` token（`judge_encode.encode_batch_for_judge`），与 ODVA / dense reward 一致。
+
+**环境判分（v3）**：`env.evaluate` 在格式合法后调用 `strategy_extraction.reward.v3.compute_answer_judgement`；硬标签 `outcome ∈ {-1,0,1}` 仍用于 RL，**v3 soft 分**写入 `Experience.outcome_soft`、验证 JSON/JSONL 字段 `v3_soft_score`，并记录到 WandB（`train/v3_soft_mean`、`epoch/v3_soft_mean`、`val/.../v3_soft_mean`、`mean_v3_soft` 等）。
+
+**长度**：默认 `actor_max_length` / `judge_max_length` = **8192**（`train.py` 可用 `--actor_max_length` / `--judge_max_length` 覆盖）。Actor 左侧截断会打日志并 `wandb.log(train/actor_left_truncation_tokens)`。粗略统计 Stage-1 prompt token：`python scripts/estimate_prompt_lengths.py`。
+
+**Stage-1 长度安检**（`data_loader`）：默认丢弃 Stage-1 chat prompt（few-shot + 模板）**超过 `max_stage1_prompt_tokens`（默认 4000）token** 的样本；训练/验证在传入 tokenizer 时 **精确计数**，否则用 `len(text)/stage1_length_chars_per_token` 粗估。拒绝项写日志，并追加到 `checkpoint_dir/dataset_stage1_rejects.jsonl`（val 各 split：`dataset_stage1_rejects_val_<split>.jsonl`）。关闭：`--max_stage1_prompt_tokens 0`；不写 JSONL：`--no_dataset_stage1_reject_log`。
 
 **大批量 val 明细**：`--val_item_storage jsonl` 将逐行写入 `eval_*_items.jsonl`（主 JSON 里可不含 `items`，见 `val_items_jsonl` 字段）；`--val_item_storage both` 双写。`--val_log_items_wandb_table` 将明细记为可排序的 `wandb.Table`（便于按 `judge_prob` 筛查）。
 
