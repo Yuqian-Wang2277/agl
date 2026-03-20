@@ -296,6 +296,26 @@ bash scripts/train.sh \
     --epochs 5 --K 8
 ```
 
+### Dry run（10 题 × 2 epoch 冒烟）
+
+缩小数据量时容易踩到边界：Judge 经验池达不到 `min_buffer_size` 导致 ODVA 永远不跑、验证集仍按 500/拆跑满 vLLM、WandB 污染、完整 Judge warmup 无意义、崩溃后 Ray/vLLM 占显存。
+
+- **一键脚本**（默认 `WANDB_MODE=offline`、10 训练题、2 epoch、`min_buffer_size=8`、每 split 验证 10 条、复用 `judge_warmup_ckpt/2026-03-20/judge_model.pt`）：
+
+```bash
+export SFT_CHECKPOINT=/path/to/actor_hf
+bash scripts/dry_run_phase2.sh
+# 或: bash scripts/dry_run_phase2.sh /path/to/actor_hf
+```
+
+- **清道夫**（主进程崩后释放显存）：`bash scripts/cleanup_ray_vllm.sh`
+
+手动等价参数见 `train.py`：`--min_buffer_size`、`--dry_run_val_size`（会覆盖 `--val_num_samples`）。
+
+**验证阶段 Judge 与训练对齐**：val 明细里会写入与 rollout 相同的 `context_text`（`Q: …  A: …` 拼接 few-shot），Judge 打分使用 `build_judge_prompt(..., context_text_raw=context_text)`，与 ODVA / dense reward 一致（避免与 `format_examples` 版式混用带来的分布偏移）。
+
+**大批量 val 明细**：`--val_item_storage jsonl` 将逐行写入 `eval_*_items.jsonl`（主 JSON 里可不含 `items`，见 `val_items_jsonl` 字段）；`--val_item_storage both` 双写。`--val_log_items_wandb_table` 将明细记为可排序的 `wandb.Table`（便于按 `judge_prob` 筛查）。
+
 ### Step 3：验证
 
 ```bash

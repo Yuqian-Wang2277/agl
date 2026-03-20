@@ -3,7 +3,8 @@
 # train.sh — Actor-Judge Phase II full training launch
 #
 # Usage:
-#   bash scripts/train.sh [--sft_checkpoint PATH] [--epochs N] [--extra ARGS...]
+#   bash scripts/train.sh [--sft_checkpoint PATH] [--epochs N]
+#       [--num_train_samples N] [--min_buffer_size N] [--dry_run_val_size N] [--extra ARGS...]
 #
 # Examples:
 #   # Start from SFT checkpoint (recommended):
@@ -16,6 +17,10 @@
 #   # Ablation E — disable UCB replay:
 #   bash scripts/train.sh --sft_checkpoint /path/to/actor_hf \
 #       --disable_ucb_replay
+#
+# Val item dumps (train.py; via --extra or extend this script):
+#   --val_item_storage jsonl|both   # sidecar eval_*_items.jsonl
+#   --val_log_items_wandb_table
 #
 # Judge warmup modes (train.py flags via --extra):
 #   --judge_warmup_mode always   # default: run warmup + save to checkpoints/.../judge_warmup_latest
@@ -42,6 +47,8 @@ RUN_NAME=""
 CHECKPOINT_ROOT=""
 RESUME_FROM=""
 NUM_TRAIN_SAMPLES=20000
+MIN_BUFFER_SIZE=""
+DRY_RUN_VAL_SIZE=""
 EXTRA_ARGS=""
 JUDGE_WARMUP_CKPT=""
 
@@ -60,6 +67,8 @@ while [[ $# -gt 0 ]]; do
         --checkpoint_root)  CHECKPOINT_ROOT="$2";           shift 2 ;;
         --resume_from)      RESUME_FROM="$2";               shift 2 ;;
         --num_train_samples) NUM_TRAIN_SAMPLES="$2";        shift 2 ;;
+        --min_buffer_size)   MIN_BUFFER_SIZE="$2";          shift 2 ;;
+        --dry_run_val_size)  DRY_RUN_VAL_SIZE="$2";         shift 2 ;;
         --judge_warmup_ckpt) JUDGE_WARMUP_CKPT="$2";        shift 2 ;;
         --extra)            EXTRA_ARGS="$2";                shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -130,6 +139,9 @@ CMD=(
     --run_name "$RUN_NAME"
     --num_train_samples "$NUM_TRAIN_SAMPLES"
 )
+
+[[ -n "$MIN_BUFFER_SIZE" ]] && CMD+=("--min_buffer_size" "$MIN_BUFFER_SIZE")
+[[ -n "$DRY_RUN_VAL_SIZE" ]] && CMD+=("--dry_run_val_size" "$DRY_RUN_VAL_SIZE")
 
 [[ -n "$RESUME_FROM" ]] && CMD+=("--resume_from_checkpoint" "$RESUME_FROM")
 

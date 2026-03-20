@@ -47,6 +47,7 @@ from prompts import (
     apply_chat_template,
     build_answer_prompt,
     build_strategy_prompt,
+    judge_rollout_context_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,15 +195,7 @@ class RolloutEngine:
         experiences: List[Experience] = []
 
         for b_idx, sample in enumerate(batch):
-            # Build context_text for Judge prompt (simple "Q: A:" format)
-            context_lines: List[str] = []
-            for ex in sample.fewshot_examples:
-                inp = ex.get("input", "")
-                tgt = ex.get("target", "")
-                if isinstance(tgt, list):
-                    tgt = tgt[0] if tgt else ""
-                context_lines.append(f"Q: {inp}  A: {tgt}")
-            context_text = "\n".join(context_lines)
+            context_text = judge_rollout_context_text(sample.fewshot_examples)
 
             # C1 fix: retrieve the exact Stage-1 prompt for this batch item
             stage1_prompt_text = prompt_strs[b_idx]

@@ -18,8 +18,10 @@ Three prompt families, one function each:
                        version="quality_scalar_v1", context_text_raw="")
         → str  (raw text, NOT chat-template messages)
         → Judge input ending with the <|judge|> anchor token
-        → Pass context_text_raw (pre-formatted string from Experience) to skip
-          format_examples; useful in actor_trainer and judge_trainer.
+        → For parity with rollout / ODVA, pass ``context_text_raw=`` output of
+          ``judge_rollout_context_text(fewshot_examples)`` (same as
+          ``Experience.context_text``).  Omitting it falls back to
+          ``format_examples()``, which is a different layout (train–eval skew).
 
 Sentinel tokens (used by rollout_engine and env):
 
@@ -55,6 +57,22 @@ STRATEGY_CLOSE = "</strategy>"
 ANSWER_OPEN    = "<answer>"
 ANSWER_CLOSE   = "</answer>"
 JUDGE_TOKEN    = "<|judge|>"     # registered in tokenizer before first use
+
+
+def judge_rollout_context_text(fewshot_examples: List[Dict[str, Any]]) -> str:
+    """Build the same few-shot prefix string stored in ``Experience.context_text``.
+
+    Must stay byte-for-byte aligned with ``rollout_engine`` so Judge prompts match
+    ODVA / dense-reward training (avoids train–eval skew vs ``format_examples``).
+    """
+    lines: List[str] = []
+    for ex in fewshot_examples or []:
+        inp = ex.get("input", "")
+        tgt = ex.get("target", "")
+        if isinstance(tgt, list):
+            tgt = tgt[0] if tgt else ""
+        lines.append(f"Q: {inp}  A: {tgt}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

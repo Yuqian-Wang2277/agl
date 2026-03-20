@@ -91,6 +91,7 @@ from prompts import (
     build_answer_prompt,
     build_judge_prompt,
     build_strategy_prompt,
+    judge_rollout_context_text,
     STRATEGY_CLOSE,
     STRATEGY_OPEN,
 )
@@ -334,7 +335,12 @@ def _attach_judge_scores_to_val_items(
     batch_size: int,
     freeze_judge: bool,
 ) -> None:
-    """In-place: add judge_logit / judge_prob per item (rank-0 FSDP unwrap)."""
+    """In-place: add judge_logit / judge_prob per item.
+
+    Uses ``context_text`` on each item (same ``Q: …  A: …`` layout as
+    ``Experience.context_text`` / rollout) so validation Judge inputs match ODVA
+    and dense-reward training.
+    """
     if not items:
         return
     if freeze_judge:
@@ -351,7 +357,12 @@ def _attach_judge_scores_to_val_items(
     for i in range(0, len(items), batch_size):
         chunk = items[i : i + batch_size]
         texts = [
-            build_judge_prompt([], it["question"], it["strategy_text"], context_text_raw="")
+            build_judge_prompt(
+                [],
+                it["question"],
+                it["strategy_text"],
+                context_text_raw=it.get("context_text") or "",
+            )
             for it in chunk
         ]
         enc = tokenizer(
@@ -368,6 +379,77 @@ def _attach_judge_scores_to_val_items(
 
     if was_training:
         judge_u.train()
+
+
+def _write_val_items_jsonl(pack: Dict[str, Any], path: Path) -> None:
+    """One JSON object per line (streaming-friendly)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for sub, row in (pack.get("splits") or {}).items():
+            for it in row.get("items") or []:
+                rec = dict(it)
+                rec["split"] = sub
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+
+def _log_val_items_wandb_table(pack: Dict[str, Any], key: str, step: int) -> None:
+    columns = [
+        "split",
+        "index_in_split",
+        "domain",
+        "outcome",
+        "judge_logit",
+        "judge_prob",
+        "question",
+        "strategy_preview",
+        "answer_preview",
+    ]
+    rows: List[List[Any]] = []
+    for sub, row in (pack.get("splits") or {}).items():
+        for it in row.get("items") or []:
+            rows.append(
+                [
+                    sub,
+                    it.get("index_in_split"),
+                    str(it.get("domain", "")),
+                    it.get("outcome"),
+                    it.get("judge_logit"),
+                    it.get("judge_prob"),
+                    (it.get("question") or "")[:500],
+                    (it.get("strategy_text") or "")[:800],
+                    (it.get("answer_text") or "")[:400],
+                ]
+            )
+    if not rows:
+        return
+    wandb.log({key: wandb.Table(columns=columns, data=rows)}, step=step)
+
+
+def _finalize_val_item_storage(
+    cfg: ActorJudgeConfig,
+    pack: Dict[str, Any],
+    items_jsonl_basename: str,
+    wandb_step: int,
+    wandb_table_key: str,
+) -> None:
+    """Optional JSONL sidecar, WandB Table, and strip items from splits (jsonl mode)."""
+    if not cfg.val_save_item_details:
+        return
+    storage = (cfg.val_item_storage or "inline").strip().lower()
+    if storage not in ("inline", "jsonl", "both"):
+        logger.warning("Unknown val_item_storage=%r; using inline", cfg.val_item_storage)
+        storage = "inline"
+    splits = pack.setdefault("splits", {})
+    pack["val_item_storage"] = storage
+    if cfg.val_log_items_wandb_table:
+        _log_val_items_wandb_table(pack, wandb_table_key, wandb_step)
+    if storage in ("jsonl", "both"):
+        out = Path(cfg.checkpoint_dir) / items_jsonl_basename
+        _write_val_items_jsonl(pack, out)
+        pack["val_items_jsonl"] = items_jsonl_basename
+    if storage == "jsonl":
+        for row in splits.values():
+            row.pop("items", None)
 
 
 def _validate_split_pass1_vllm(
@@ -437,6 +519,7 @@ def _validate_split_pass1_vllm(
                     "domain": sample.domain,
                     "question": sample.question,
                     "answer_gold": sample.answer_gold,
+                    "context_text": judge_rollout_context_text(sample.fewshot_examples),
                     "stage1_prompt": prompts1[i],
                     "stage2_prompt": p2,
                     "strategy_text": s_texts[i],
@@ -1092,6 +1175,13 @@ def main(cfg: ActorJudgeConfig) -> None:
             global_step=0,
         )
         if accelerator.is_main_process and base_pack is not None:
+            _finalize_val_item_storage(
+                cfg,
+                base_pack,
+                "eval_baseline_items.jsonl",
+                0,
+                "val_baseline/items_table",
+            )
             with open(Path(cfg.checkpoint_dir) / "eval_baseline.json", "w") as f:
                 json.dump(base_pack, f, indent=2, default=str)
             for sub, row in base_pack["splits"].items():
@@ -1249,6 +1339,13 @@ def main(cfg: ActorJudgeConfig) -> None:
                 global_step=global_step,
             )
             if accelerator.is_main_process and eval_pack is not None:
+                _finalize_val_item_storage(
+                    cfg,
+                    eval_pack,
+                    f"eval_epoch_{epoch:03d}_items.jsonl",
+                    global_step,
+                    "val/items_table",
+                )
                 ep_json = Path(cfg.checkpoint_dir) / f"eval_epoch_{epoch:03d}.json"
                 with open(ep_json, "w") as f:
                     json.dump(eval_pack, f, indent=2, default=str)
@@ -1315,6 +1412,13 @@ if __name__ == "__main__":
                         default="/home/test/test16/chenlu/model/Qwen3-4B")
     parser.add_argument("--total_epochs",          type=int,   default=5)
     parser.add_argument("--num_train_samples",     type=int,   default=20_000)
+    parser.add_argument(
+        "--min_buffer_size",
+        type=int,
+        default=100,
+        help="Judge ODVA starts after buffer has this many entries; set low for dry runs "
+        "(e.g. 8 when num_train_samples*K < 100).",
+    )
     parser.add_argument("--K",                     type=int,   default=8)
     parser.add_argument("--alpha",                 type=float, default=0.3)
     parser.add_argument("--freeze_judge",          action="store_true")
@@ -1374,6 +1478,12 @@ if __name__ == "__main__":
     parser.add_argument("--val_strategy_max_tokens", type=int, default=2048)
     parser.add_argument("--val_answer_max_tokens", type=int, default=512)
     parser.add_argument("--val_num_samples", type=int, default=500)
+    parser.add_argument(
+        "--dry_run_val_size",
+        type=int,
+        default=0,
+        help="If >0, each val split uses only N samples (overrides --val_num_samples).",
+    )
     parser.add_argument("--keep_last_k_checkpoints", type=int, default=2)
     parser.add_argument("--keep_best_k_checkpoints", type=int, default=2)
     parser.add_argument(
@@ -1381,17 +1491,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Omit per-item prompts/generations from eval_*.json (smaller files)",
     )
+    parser.add_argument(
+        "--val_item_storage",
+        type=str,
+        default="inline",
+        choices=["inline", "jsonl", "both"],
+        help="Per-item val rows: nested in eval JSON, JSONL sidecar only, or both",
+    )
+    parser.add_argument(
+        "--val_log_items_wandb_table",
+        action="store_true",
+        help="Log per-item validation as wandb.Table (sort e.g. by judge_prob in UI)",
+    )
     parser.add_argument("--val_judge_score_batch_size", type=int, default=16)
     args = parser.parse_args()
 
     run_name = args.run_name.strip() or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_dir = os.path.join(args.checkpoint_root, run_name)
 
+    val_n = args.val_num_samples
+    if args.dry_run_val_size > 0:
+        val_n = args.dry_run_val_size
+
     cfg = ActorJudgeConfig(
         actor_sft_checkpoint=args.actor_sft_checkpoint,
         actor_model_path=args.actor_model_path,
         total_epochs=args.total_epochs,
         num_train_samples=args.num_train_samples,
+        min_buffer_size=args.min_buffer_size,
         K=args.K,
         alpha=args.alpha,
         dense_reward_alpha=args.dense_reward_alpha,
@@ -1417,10 +1544,12 @@ if __name__ == "__main__":
         val_before_train=not args.no_val_before_train,
         val_strategy_max_tokens=args.val_strategy_max_tokens,
         val_answer_max_tokens=args.val_answer_max_tokens,
-        val_num_samples=args.val_num_samples,
+        val_num_samples=val_n,
         keep_last_k_checkpoints=args.keep_last_k_checkpoints,
         keep_best_k_checkpoints=args.keep_best_k_checkpoints,
         val_save_item_details=not args.no_val_save_item_details,
+        val_item_storage=args.val_item_storage,
+        val_log_items_wandb_table=args.val_log_items_wandb_table,
         val_judge_score_batch_size=args.val_judge_score_batch_size,
     )
 

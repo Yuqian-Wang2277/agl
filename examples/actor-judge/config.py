@@ -50,6 +50,7 @@ class ActorJudgeConfig:
     buffer_max_size: int = 50_000
     # P4 of Round-4: per-Q cap — prevents hard questions from flooding the buffer
     per_q_max: int = 50
+    # Dry-run: set low (e.g. 8) when num_train_samples * K < default, or Judge ODVA never runs.
     min_buffer_size: int = 100         # minimum entries before Judge training starts
 
     # ── UCB coefficients ──────────────────────────────────────────────────────
@@ -96,6 +97,10 @@ class ActorJudgeConfig:
     val_num_samples: int = 500         # per val_subdir split
     # Per-item rows in eval_*.json (prompts, generations, outcome, judge score).
     val_save_item_details: bool = True
+    # inline: items nested in eval JSON | jsonl: sidecar *.jsonl only | both: both
+    val_item_storage: str = "inline"
+    # Log a wandb.Table of per-item val rows (sortable in UI); runs after Judge scores.
+    val_log_items_wandb_table: bool = False
     val_judge_score_batch_size: int = 16
     # L4: total_train_steps for LR scheduler — set automatically in main() if 0
     total_train_steps: int = 0         # 0 = auto-compute from epochs × steps_per_epoch
@@ -167,3 +172,8 @@ class ActorJudgeConfig:
             )
         if self.K < 2:
             raise ValueError("K must be >= 2 for in-group Z-Score to be meaningful.")
+        vis = (self.val_item_storage or "inline").strip().lower()
+        if vis not in ("inline", "jsonl", "both"):
+            raise ValueError(
+                f"val_item_storage must be 'inline', 'jsonl', or 'both', got {self.val_item_storage!r}"
+            )
