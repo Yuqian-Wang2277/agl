@@ -65,8 +65,24 @@ class ActorJudgeConfig:
     actor_lr: float = 1e-6
     judge_lr: float = 1e-5
     judge_batch_size: int = 16         # pairwise pairs per Judge update step
-    judge_warmup: bool = True
-    warmup_steps: int = 100            # Judge BT pre-training steps on S_gold data
+    # Judge warmup vs Phase II: distinguish ``resume`` (full run state) from
+    # ``judge_init_checkpoint`` (weights only, fresh optimizer for co-evolution).
+    judge_warmup: bool = True          # If False, forces judge_warmup_mode="cold"
+    judge_warmup_mode: str = "always"  # "cold" | "always" | "reuse"
+    # Path to judge_model.pt or a directory containing judge_model.pt (reuse mode)
+    judge_init_checkpoint: str = ""
+    # Where to write weights after a successful always-warmup (for later --reuse)
+    judge_warmup_save_dir: str = ""    # empty → {checkpoint_dir}/judge_warmup_latest
+    warmup_steps: int = 100            # max Judge BT pre-training steps (may early-stop)
+    warmup_seed: int = 42              # reproducible warmup sampling / eval negatives
+    # Warmup uses a smaller LR than Phase II to avoid destroying backbone alignment
+    judge_warmup_lr: float = 0.0       # 0 → judge_lr * 0.1
+    # Hold out held-out pairwise eval for accuracy = P(score_win > score_lose)
+    judge_warmup_eval_ratio: float = 0.12
+    judge_warmup_eval_every: int = 5   # run eval every N warmup steps
+    judge_warmup_early_stop_min_acc: float = 0.75   # stop once eval acc >= this (good enough)
+    judge_warmup_overfit_warn_acc: float = 0.95     # warn if eval acc >= this (possible hack)
+    judge_warmup_reset_optimizer_after: bool = True  # fresh AdamW for Phase II after warmup
     val_freq: int = 1                  # validate every N epochs
     # L4: total_train_steps for LR scheduler — set automatically in main() if 0
     total_train_steps: int = 0         # 0 = auto-compute from epochs × steps_per_epoch
@@ -114,6 +130,16 @@ class ActorJudgeConfig:
 
     def validate(self) -> None:
         """Raise ValueError for obviously wrong configurations."""
+        mode = (self.judge_warmup_mode or "always").strip().lower()
+        if mode not in ("cold", "always", "reuse"):
+            raise ValueError(
+                f"judge_warmup_mode must be 'cold', 'always', or 'reuse', got {self.judge_warmup_mode!r}"
+            )
+        if mode == "reuse" and not (self.judge_init_checkpoint or "").strip():
+            raise ValueError(
+                "judge_warmup_mode='reuse' requires judge_init_checkpoint pointing to "
+                "judge_model.pt or a directory that contains it."
+            )
         if self.dense_reward_alpha == 0.0 and not self.freeze_judge:
             raise ValueError(
                 "Ablation B (dense_reward_alpha=0) must also set freeze_judge=True "

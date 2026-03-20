@@ -109,9 +109,21 @@ class JudgeModel(nn.Module):
         # Locate the last *valid* token (= <|judge|> anchor) in each sequence.
         # DO NOT use hidden[:, -1, :] — that would pick the PAD token when
         # sequences have been right-padded.
+        # In device_map / sharded execution, `hidden` may live on a different
+        # device than `attention_mask` (the tensor comes from tokenizer inputs).
+        # Indexing requires them to be on the same device.
         seq_lens  = attention_mask.sum(dim=1) - 1           # [B]
+        seq_lens  = seq_lens.to(device=hidden.device, dtype=torch.long)
         batch_idx = torch.arange(hidden.size(0), device=hidden.device)
         last_hidden = hidden[batch_idx, seq_lens, :]         # [B, hidden_size]
+
+        # In warmup / device_map sharding scenarios, scalar_head might not
+        # share the same dtype/device as the backbone output.
+        if (
+            self.scalar_head.weight.device != last_hidden.device
+            or self.scalar_head.weight.dtype != last_hidden.dtype
+        ):
+            self.scalar_head.to(device=last_hidden.device, dtype=last_hidden.dtype)
 
         logit = self.scalar_head(last_hidden).squeeze(-1)    # [B]
         return logit

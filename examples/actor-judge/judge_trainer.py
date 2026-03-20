@@ -141,10 +141,15 @@ class JudgeTrainer:
         s_neg_texts: List[str],
         questions: List[str],
         global_step: int = 0,
+        *,
+        advance_scheduler: bool = True,
     ) -> float:
         """Pre-train Judge on (S_gold, S_neg) pairs before Phase II starts.
 
         s_neg_texts should be perturbed / shuffled versions of s_gold_texts.
+
+        During Phase II–only warmup, pass ``advance_scheduler=False`` so the
+        cosine schedule (sized for main training) is not consumed by warmup steps.
         """
         assert len(s_gold_texts) == len(s_neg_texts) == len(questions)
         device = self.accel.device
@@ -171,7 +176,24 @@ class JudgeTrainer:
         self.accel.backward(loss)
         self.accel.clip_grad_norm_(self.judge.parameters(), self.max_grad_norm)
         self.optimizer.step()
-        self.scheduler.step()
+
+        if advance_scheduler:
+            self.scheduler.step()
 
         logger.info("JudgeTrainer warmup step %d: loss=%.4f", global_step, loss.item())
         return loss.item()
+
+    def set_optimizer_lr(self, lr: float) -> None:
+        for g in self.optimizer.param_groups:
+            g["lr"] = lr
+
+    def rebuild_optimizer_for_phase2(self) -> None:
+        """Fresh AdamW + cosine schedule for Phase II (do not reuse warmup optimizer state)."""
+        self.optimizer = AdamW(
+            [p for p in self.judge.parameters() if p.requires_grad],
+            lr=self.cfg.judge_lr,
+        )
+        total_steps = getattr(self.cfg, "total_train_steps", 10_000)
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=total_steps, eta_min=self.cfg.judge_lr * 0.1
+        )

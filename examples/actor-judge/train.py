@@ -59,7 +59,7 @@ import random
 import sys
 from collections import deque
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import ray
 import torch
@@ -82,6 +82,7 @@ from data_loader import (
 )
 from judge_model import JudgeModel, warmstart_judge_token_embedding
 from judge_trainer import JudgeTrainer
+from prompts import build_judge_prompt
 from rollout_engine import RolloutEngine, VLLMActor
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,145 @@ def broadcast_object_list_from_rank0(obj, accelerator: Accelerator):
     container = [obj]
     torch.distributed.broadcast_object_list(container, src=0)
     return container[0]
+
+
+# ---------------------------------------------------------------------------
+# Judge warmup: mode (cold / always / reuse), eval, checkpoint I/O
+# ---------------------------------------------------------------------------
+
+
+def effective_judge_warmup_mode(cfg: ActorJudgeConfig) -> str:
+    """``judge_warmup=False`` keeps backward-compat by forcing cold start."""
+    if not cfg.judge_warmup:
+        return "cold"
+    return (cfg.judge_warmup_mode or "always").strip().lower()
+
+
+def resolve_judge_checkpoint_file(path: str) -> Path:
+    """Return path to ``judge_model.pt`` (file or inside a directory)."""
+    p = Path(path).expanduser()
+    if p.is_file() and p.suffix == ".pt":
+        return p
+    if p.is_dir():
+        cand = p / "judge_model.pt"
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError(
+        f"Judge checkpoint not found: expected a .pt file or a directory "
+        f"containing judge_model.pt, got {path!r}"
+    )
+
+
+def load_judge_weights_only(
+    judge: torch.nn.Module, accelerator: Accelerator, ckpt_path: str
+) -> None:
+    """Load Judge parameters only (no optimizer). For reuse / resume distinction."""
+    path = resolve_judge_checkpoint_file(ckpt_path)
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    unwrapped = accelerator.unwrap_model(judge)
+    missing, unexpected = unwrapped.load_state_dict(state, strict=False)
+    logger.info(
+        "Loaded Judge weights from %s (strict=False; missing=%d unexpected=%d)",
+        path,
+        len(missing),
+        len(unexpected),
+    )
+
+
+def judge_warmup_save_dir(cfg: ActorJudgeConfig) -> Path:
+    if (cfg.judge_warmup_save_dir or "").strip():
+        return Path(cfg.judge_warmup_save_dir).expanduser()
+    return Path(cfg.checkpoint_dir) / "judge_warmup_latest"
+
+
+def save_judge_warmup_weights(
+    judge: torch.nn.Module,
+    accelerator: Accelerator,
+    out_dir: Path,
+    meta: Optional[dict] = None,
+) -> None:
+    out_dir = Path(out_dir)
+    if accelerator.is_main_process:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            accelerator.unwrap_model(judge).state_dict(),
+            out_dir / "judge_model.pt",
+        )
+        payload = {"kind": "judge_warmup", "weights_only": True}
+        if meta:
+            payload.update(meta)
+        with open(out_dir / "warmup_meta.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("Saved Judge warmup weights to %s", out_dir / "judge_model.pt")
+    accelerator.wait_for_everyone()
+
+
+def sample_warmup_negative(
+    s,
+    s_gold: str,
+    version: str,
+    domain_to_gold_by_version: Dict[str, Dict[str, str]],
+    rng: random.Random,
+) -> Tuple[str, str, str]:
+    """Return (negative_strategy, negative_domain_label, negative_kind)."""
+    domain_to_gold = domain_to_gold_by_version.get(version, {})
+    others = [d for d in domain_to_gold if d != s.domain]
+    if others:
+        neg_domain = rng.choice(others)
+        return domain_to_gold[neg_domain], neg_domain, "cross_domain"
+    words = s_gold.split()
+    w = words[:]
+    rng.shuffle(w)
+    return " ".join(w), "word_shuffle", "word_shuffle"
+
+
+def judge_warmup_pairwise_accuracy(
+    judge: torch.nn.Module,
+    tokenizer,
+    device: torch.device,
+    triples: List[Tuple[str, str, str]],
+    batch_size: int = 16,
+) -> float:
+    """Fraction of pairs where sigmoid(logit_win) > sigmoid(logit_lose)."""
+    if not triples:
+        return 0.0
+    judge.eval()
+    n_ok = 0
+    n_tot = 0
+
+    with torch.no_grad():
+        for i in range(0, len(triples), batch_size):
+            chunk = triples[i : i + batch_size]
+            qs = [t[0] for t in chunk]
+            pos = [t[1] for t in chunk]
+            neg = [t[2] for t in chunk]
+            win_texts = [build_judge_prompt([], q, sp) for q, sp in zip(qs, pos)]
+            lose_texts = [build_judge_prompt([], q, sn) for q, sn in zip(qs, neg)]
+            inputs_win = tokenizer(
+                win_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048,
+            ).to(device)
+            inputs_lose = tokenizer(
+                lose_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048,
+            ).to(device)
+            lw = judge(**inputs_win)
+            ll = judge(**inputs_lose)
+            sw = torch.sigmoid(lw)
+            sl = torch.sigmoid(ll)
+            n_ok += int((sw > sl).sum().item())
+            n_tot += len(chunk)
+    judge.train()
+    return n_ok / max(n_tot, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -435,14 +575,34 @@ def main(cfg: ActorJudgeConfig) -> None:
         actor, judge, actor_trainer, judge_trainer, cfg, accelerator
     )
 
-    # ── Step 0: Judge Warmup (optional) ──────────────────────────────────────
+    # ── Step 0: Judge Warmup (cold / always / reuse) ───────────────────────────
     # C3 fix: ALL ranks participate — no is_main_process guard.
-    # Previously rank 0 called accel.backward() while ranks 1-7 waited at
-    # wait_for_everyone(), causing a permanent NCCL deadlock.
-    if cfg.judge_warmup:
-        logger.info("=== Judge Warmup (%d steps) ===", cfg.warmup_steps)
+    # ``resume_from_checkpoint`` restores optimizers only; reuse loads Judge weights
+    # from ``judge_init_checkpoint`` with a fresh Phase II optimizer.
+    warm_mode = effective_judge_warmup_mode(cfg)
+    logger.info("Judge warmup mode = %s", warm_mode)
+    if cfg.resume_from_checkpoint and warm_mode == "reuse" and cfg.judge_init_checkpoint:
+        logger.warning(
+            "resume_from_checkpoint is set together with judge_warmup_mode=reuse. "
+            "Optimizer state is restored from resume, then Judge weights are "
+            "overwritten from judge_init_checkpoint — verify this is intended."
+        )
+
+    if warm_mode == "reuse":
+        load_judge_weights_only(judge, accelerator, cfg.judge_init_checkpoint.strip())
+        judge_trainer.rebuild_optimizer_for_phase2()
+        logger.info("Judge reuse: loaded weights, Phase II optimizer reset.")
+
+    elif warm_mode == "cold":
+        logger.info("Judge cold start: no warmup weights loaded.")
+
+    elif warm_mode == "always":
+        warmup_lr = cfg.judge_warmup_lr if cfg.judge_warmup_lr > 0 else cfg.judge_lr * 0.1
+
+        rng = random.Random(cfg.warmup_seed)
         warmup_samples = [
-            s for s in train_dataset
+            s
+            for s in train_dataset
             if (s.s_gold_by_version and len(s.s_gold_by_version) > 0) or s.s_gold is not None
         ]
 
@@ -453,28 +613,63 @@ def main(cfg: ActorJudgeConfig) -> None:
                 warmup_dump_path.unlink()
             logger.info("Judge warmup pairs will be saved to %s", warmup_dump_path)
 
-        if warmup_samples:
-            # Build per-version warmup pools so v1/v2/v3 all get trained.
-            # If a version has any data, we round-robin warmup steps across it.
-            version_to_pool = {"v1": [], "v2": [], "v3": []}
+        if not warmup_samples:
+            logger.warning("No S_gold data found — skipping Judge warmup.")
+        else:
+            judge_trainer.set_optimizer_lr(warmup_lr)
+            logger.info(
+                "=== Judge Warmup (always): up to %d steps, lr=%.2e "
+                "(Phase II judge_lr=%.2e) ===",
+                cfg.warmup_steps,
+                warmup_lr,
+                cfg.judge_lr,
+            )
+            version_to_pool_full = {"v1": [], "v2": [], "v3": []}
             for s in warmup_samples:
                 if s.s_gold_by_version:
                     for v, txt in s.s_gold_by_version.items():
                         if txt:
-                            version_to_pool[v].append((s, txt))
+                            version_to_pool_full[v].append((s, txt))
                 elif s.s_gold:
-                    # Legacy fallback (single-strategy datasets): count as v1.
-                    version_to_pool["v1"].append((s, s.s_gold))
+                    version_to_pool_full["v1"].append((s, s.s_gold))
+
+            flat: List[Tuple[object, str, str]] = []
+            for v in ("v1", "v2", "v3"):
+                for pair in version_to_pool_full[v]:
+                    flat.append((pair[0], pair[1], v))
+
+            rng.shuffle(flat)
+            if len(flat) < 32:
+                eval_flat = []
+                train_flat = flat[:]
+            else:
+                n_eval = int(len(flat) * cfg.judge_warmup_eval_ratio)
+                n_eval = max(16, min(n_eval, len(flat) // 4, 512))
+                if len(flat) - n_eval < cfg.judge_batch_size:
+                    n_eval = min(max(0, len(flat) // 10), max(0, len(flat) - 1))
+                eval_flat = flat[:n_eval] if n_eval > 0 else []
+                train_flat = flat[n_eval:] if n_eval > 0 else flat[:]
+
+            while (
+                eval_flat
+                and len(train_flat) < cfg.judge_batch_size
+                and len(train_flat) < len(flat)
+            ):
+                train_flat.insert(0, eval_flat.pop())
+
+            version_to_pool = {"v1": [], "v2": [], "v3": []}
+            for s, txt, v in train_flat:
+                version_to_pool[v].append((s, txt))
 
             active_versions = [v for v, pool in version_to_pool.items() if pool]
             logger.info(
-                "Judge warmup version coverage: %s",
-                {v: len(version_to_pool[v]) for v in ("v1", "v2", "v3")},
+                "Judge warmup: train_pairs=%d eval_pairs=%d version_counts=%s",
+                len(train_flat),
+                len(eval_flat),
+                {vx: len(version_to_pool[vx]) for vx in ("v1", "v2", "v3")},
             )
 
-            # S6 fix: cross-domain negatives are semantically wrong but fluent.
-            # Maintain one gold strategy per domain per version for negative mining.
-            domain_to_gold_by_version = {"v1": {}, "v2": {}, "v3": {}}
+            domain_to_gold_by_version: Dict[str, Dict[str, str]] = {"v1": {}, "v2": {}, "v3": {}}
             for s in warmup_samples:
                 if s.s_gold_by_version:
                     for v, txt in s.s_gold_by_version.items():
@@ -483,66 +678,138 @@ def main(cfg: ActorJudgeConfig) -> None:
                 elif s.s_gold and s.domain not in domain_to_gold_by_version["v1"]:
                     domain_to_gold_by_version["v1"][s.domain] = s.s_gold
 
-            for step in range(cfg.warmup_steps):
-                if active_versions:
-                    target_version = active_versions[step % len(active_versions)]
-                else:
-                    target_version = "v1"
+            eval_triples: List[Tuple[str, str, str]] = []
+            for s, pos, v in eval_flat:
+                rng_e = random.Random((cfg.warmup_seed ^ hash(s.question) ^ hash(v)) % (2**31))
+                neg, _, _ = sample_warmup_negative(
+                    s, pos, v, domain_to_gold_by_version, rng_e
+                )
+                eval_triples.append((s.question, pos, neg))
 
-                pool = version_to_pool.get(target_version, [])
-                if not pool:
-                    logger.warning(
-                        "Warmup step %d: no samples for %s, skipping.",
-                        step, target_version
-                    )
-                    continue
-
-                batch_pairs = random.sample(pool, min(cfg.judge_batch_size, len(pool)))
-                batch_w = [p[0] for p in batch_pairs]
-                s_golds = [p[1] for p in batch_pairs]
-                questions = [s.question for s in batch_w]
-
-                s_negs: List[str] = []
-                neg_domains: List[str] = []
-                domain_to_gold = domain_to_gold_by_version.get(target_version, {})
-                for s, s_gold in zip(batch_w, s_golds):
-                    other_domains = [d for d in domain_to_gold if d != s.domain]
-                    if other_domains:
-                        # Cross-domain gold strategy, same format version.
-                        neg_domain = random.choice(other_domains)
-                        s_negs.append(domain_to_gold[neg_domain])
-                        neg_domains.append(neg_domain)
+            early_stopped = False
+            last_step = -1
+            if not train_flat:
+                logger.warning(
+                    "Warmup: no training pairs after eval split; skipping warmup updates."
+                )
+            else:
+                for step in range(cfg.warmup_steps):
+                    last_step = step
+                    if active_versions:
+                        target_version = active_versions[step % len(active_versions)]
                     else:
-                        # Fallback: word-shuffle from the selected positive strategy.
-                        words = s_gold.split()
-                        random.shuffle(words)
-                        s_negs.append(" ".join(words))
-                        neg_domains.append("word_shuffle")
+                        target_version = "v1"
 
-                if accelerator.is_main_process:
-                    with open(warmup_dump_path, "a", encoding="utf-8") as f:
-                        for s, q, pos, neg, neg_domain in zip(
-                            batch_w, questions, s_golds, s_negs, neg_domains
-                        ):
-                            f.write(
-                                json.dumps(
-                                    {
-                                        "step": step,
-                                        "version": target_version,
-                                        "domain": s.domain,
-                                        "negative_domain": neg_domain,
-                                        "question": q,
-                                        "positive_strategy": pos,
-                                        "negative_strategy": neg,
-                                    },
-                                    ensure_ascii=False,
+                    pool = version_to_pool.get(target_version, [])
+                    if not pool:
+                        logger.warning(
+                            "Warmup step %d: no samples for %s, skipping.",
+                            step,
+                            target_version,
+                        )
+                        continue
+
+                    batch_pairs = rng.sample(pool, min(cfg.judge_batch_size, len(pool)))
+                    batch_w = [p[0] for p in batch_pairs]
+                    s_golds = [p[1] for p in batch_pairs]
+                    questions = [s.question for s in batch_w]
+
+                    s_negs: List[str] = []
+                    neg_domains: List[str] = []
+                    for s, s_gold in zip(batch_w, s_golds):
+                        neg, neg_domain, _ = sample_warmup_negative(
+                            s, s_gold, target_version, domain_to_gold_by_version, rng
+                        )
+                        s_negs.append(neg)
+                        neg_domains.append(neg_domain)
+
+                    if accelerator.is_main_process:
+                        with open(warmup_dump_path, "a", encoding="utf-8") as f:
+                            for s, q, pos, neg, neg_domain in zip(
+                                batch_w, questions, s_golds, s_negs, neg_domains
+                            ):
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "step": step,
+                                            "version": target_version,
+                                            "domain": s.domain,
+                                            "negative_domain": neg_domain,
+                                            "question": q,
+                                            "positive_strategy": pos,
+                                            "negative_strategy": neg,
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n"
                                 )
-                                + "\n"
-                            )
 
-                judge_trainer.warmup_step(s_golds, s_negs, questions, global_step=step)
-        else:
-            logger.warning("No S_gold data found — skipping Judge warmup.")
+                    judge_trainer.warmup_step(
+                        s_golds,
+                        s_negs,
+                        questions,
+                        global_step=step,
+                        advance_scheduler=False,
+                    )
+
+                    if (
+                        eval_triples
+                        and cfg.judge_warmup_eval_every > 0
+                        and (step + 1) % cfg.judge_warmup_eval_every == 0
+                    ):
+                        acc = judge_warmup_pairwise_accuracy(
+                            judge,
+                            tokenizer,
+                            accelerator.device,
+                            eval_triples,
+                            batch_size=min(16, cfg.judge_batch_size),
+                        )
+                        if accelerator.is_main_process:
+                            wandb.log({"warmup/eval_pairwise_acc": acc}, step=step)
+                        logger.info(
+                            "Warmup eval step %d: pairwise_acc=%.4f (n_eval=%d)",
+                            step,
+                            acc,
+                            len(eval_triples),
+                        )
+                        if acc >= cfg.judge_warmup_overfit_warn_acc:
+                            logger.warning(
+                                "Warmup eval acc %.3f >= overfit_warn %.3f — "
+                                "Judge may be overfitting trivial cues; monitor Phase II.",
+                                acc,
+                                cfg.judge_warmup_overfit_warn_acc,
+                            )
+                        if acc >= cfg.judge_warmup_early_stop_min_acc:
+                            logger.info(
+                                "Warmup early stop: eval acc %.3f >= target %.3f",
+                                acc,
+                                cfg.judge_warmup_early_stop_min_acc,
+                            )
+                            early_stopped = True
+                            break
+
+            out_dir = judge_warmup_save_dir(cfg)
+            save_judge_warmup_weights(
+                judge,
+                accelerator,
+                out_dir,
+                meta={
+                    "warmup_steps_done": 0 if last_step < 0 else last_step + 1,
+                    "early_stopped": early_stopped,
+                    "eval_pairs": len(eval_triples),
+                    "warmup_seed": cfg.warmup_seed,
+                },
+            )
+
+            if cfg.judge_warmup_reset_optimizer_after:
+                judge_trainer.rebuild_optimizer_for_phase2()
+                logger.info("Judge warmup done: Phase II optimizer re-initialised.")
+            else:
+                judge_trainer.set_optimizer_lr(cfg.judge_lr)
+                logger.info(
+                    "Judge warmup done: kept optimizer state; lr reset to %.2e",
+                    cfg.judge_lr,
+                )
 
     accelerator.wait_for_everyone()
 
@@ -733,6 +1000,37 @@ if __name__ == "__main__":
     parser.add_argument("--disable_ucb_replay",    action="store_true")
     parser.add_argument("--wandb_run_name",        type=str, default="phase2_co_evolution")
     parser.add_argument("--resume_from_checkpoint", type=str, default="")
+    parser.add_argument(
+        "--judge_warmup_mode",
+        type=str,
+        default="always",
+        choices=["cold", "always", "reuse"],
+        help="cold=no warmup; always=run warmup (+eval/early-stop) then Phase II; "
+        "reuse=load judge_init_checkpoint weights only, fresh optimizer",
+    )
+    parser.add_argument(
+        "--judge_init_checkpoint",
+        type=str,
+        default="",
+        help="judge_model.pt or directory containing it (required for mode=reuse)",
+    )
+    parser.add_argument("--judge_warmup_save_dir", type=str, default="")
+    parser.add_argument("--warmup_seed", type=int, default=42)
+    parser.add_argument("--judge_warmup_lr", type=float, default=0.0)
+    parser.add_argument("--judge_warmup_eval_ratio", type=float, default=0.12)
+    parser.add_argument("--judge_warmup_eval_every", type=int, default=5)
+    parser.add_argument("--judge_warmup_early_stop_min_acc", type=float, default=0.75)
+    parser.add_argument("--judge_warmup_overfit_warn_acc", type=float, default=0.95)
+    parser.add_argument(
+        "--no_judge_warmup_reset_optimizer",
+        action="store_true",
+        help="Keep Adam state after warmup (default: reset optimizer for Phase II)",
+    )
+    parser.add_argument(
+        "--no_judge_warmup",
+        action="store_true",
+        help="Legacy: set judge_warmup=False (forces cold start regardless of mode)",
+    )
     args = parser.parse_args()
 
     cfg = ActorJudgeConfig(
@@ -747,6 +1045,17 @@ if __name__ == "__main__":
         disable_ucb_replay=args.disable_ucb_replay,
         wandb_run_name=args.wandb_run_name,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        judge_warmup_mode=args.judge_warmup_mode,
+        judge_init_checkpoint=args.judge_init_checkpoint,
+        judge_warmup_save_dir=args.judge_warmup_save_dir,
+        warmup_seed=args.warmup_seed,
+        judge_warmup_lr=args.judge_warmup_lr,
+        judge_warmup_eval_ratio=args.judge_warmup_eval_ratio,
+        judge_warmup_eval_every=args.judge_warmup_eval_every,
+        judge_warmup_early_stop_min_acc=args.judge_warmup_early_stop_min_acc,
+        judge_warmup_overfit_warn_acc=args.judge_warmup_overfit_warn_acc,
+        judge_warmup_reset_optimizer_after=not args.no_judge_warmup_reset_optimizer,
+        judge_warmup=not args.no_judge_warmup,
     )
 
     main(cfg)

@@ -16,6 +16,15 @@
 #   # Ablation E — disable UCB replay:
 #   bash scripts/train.sh --sft_checkpoint /path/to/actor_hf \
 #       --disable_ucb_replay
+#
+# Judge warmup modes (train.py flags via --extra):
+#   --judge_warmup_mode always   # default: run warmup + save to checkpoints/.../judge_warmup_latest
+#   --judge_warmup_mode cold     # skip warmup
+#   --judge_warmup_mode reuse --judge_init_checkpoint /path/to/judge_model.pt
+#
+# Default behavior in this launcher:
+#   if ./judge_warmup_ckpt/judge_model.pt exists, it auto-enables
+#   --judge_warmup_mode reuse --judge_init_checkpoint <that path>
 # =============================================================================
 
 set -euo pipefail
@@ -32,6 +41,7 @@ WANDB_RUN_NAME="phase2_co_evolution_$(date +%Y%m%d_%H%M%S)"
 RESUME_FROM=""
 NUM_TRAIN_SAMPLES=20000
 EXTRA_ARGS=""
+JUDGE_WARMUP_CKPT=""
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -46,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --wandb_run_name)   WANDB_RUN_NAME="$2";            shift 2 ;;
         --resume_from)      RESUME_FROM="$2";               shift 2 ;;
         --num_train_samples) NUM_TRAIN_SAMPLES="$2";        shift 2 ;;
+        --judge_warmup_ckpt) JUDGE_WARMUP_CKPT="$2";        shift 2 ;;
         --extra)            EXTRA_ARGS="$2";                shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -117,6 +128,19 @@ CMD=(
 
 [[ -n "$FREEZE_JUDGE"      ]] && CMD+=("$FREEZE_JUDGE")
 [[ -n "$DISABLE_UCB_REPLAY" ]] && CMD+=("$DISABLE_UCB_REPLAY")
+
+# Prefer a pre-warmed Judge checkpoint by default (if present), unless user
+# explicitly controls warmup mode/init checkpoint through --extra.
+if [[ -z "$JUDGE_WARMUP_CKPT" ]]; then
+    JUDGE_WARMUP_CKPT="$PROJECT_DIR/judge_warmup_ckpt/judge_model.pt"
+fi
+if [[ -f "$JUDGE_WARMUP_CKPT" ]]; then
+    if [[ "$EXTRA_ARGS" != *"--judge_warmup_mode"* && "$EXTRA_ARGS" != *"--judge_init_checkpoint"* ]]; then
+        CMD+=("--judge_warmup_mode" "reuse" "--judge_init_checkpoint" "$JUDGE_WARMUP_CKPT")
+        echo "Using pre-warmed Judge: $JUDGE_WARMUP_CKPT"
+    fi
+fi
+
 [[ -n "$EXTRA_ARGS"        ]] && CMD+=($EXTRA_ARGS)
 
 echo "========================================================"
