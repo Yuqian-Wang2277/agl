@@ -17,6 +17,7 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import PreTrainedTokenizer
 
 from buffer import UCBBuffer
@@ -41,6 +42,13 @@ class JudgeTrainer:
             [p for p in self.judge.parameters() if p.requires_grad],
             lr=cfg.judge_lr,
         )
+        # L4: cosine LR scheduler
+        total_steps = getattr(cfg, 'total_train_steps', 10_000)
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=total_steps, eta_min=cfg.judge_lr * 0.1
+        )
+        # L3: gradient clipping threshold
+        self.max_grad_norm: float = getattr(cfg, 'max_grad_norm', 1.0)
 
     # ------------------------------------------------------------------
 
@@ -105,7 +113,10 @@ class JudgeTrainer:
         loss = bt_loss + l2_penalty
 
         self.accel.backward(loss)
+        # L3: gradient clipping
+        self.accel.clip_grad_norm_(self.judge.parameters(), self.max_grad_norm)
         self.optimizer.step()
+        self.scheduler.step()
 
         # ── Write back Judge scores to buffer (O(1) via traj_id) ──────────
         with torch.no_grad():
@@ -158,7 +169,9 @@ class JudgeTrainer:
         loss = bt_loss + l2_penalty
 
         self.accel.backward(loss)
+        self.accel.clip_grad_norm_(self.judge.parameters(), self.max_grad_norm)
         self.optimizer.step()
+        self.scheduler.step()
 
         logger.info("JudgeTrainer warmup step %d: loss=%.4f", global_step, loss.item())
         return loss.item()

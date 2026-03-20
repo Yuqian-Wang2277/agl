@@ -255,6 +255,7 @@ def load_rollout_dataset(cfg) -> ActorJudgeDataset:
         data_dir=train_dir,
         fewshot_min=cfg.fewshot_min,
         fewshot_max=cfg.fewshot_max,
+        num_samples=getattr(cfg, 'num_train_samples', 20_000),   # L2: configurable
         cross_domain_ratio=cfg.cross_domain_ratio,
         strategy_dir=cfg.strategy_dir,
         load_s_gold=cfg.judge_warmup,

@@ -80,14 +80,18 @@ def _compute_correctness(
     except (ValueError, TypeError):
         pass
 
-    # Token-level F1 match
-    pred_words = set(ans_norm.split())
-    gold_words = set(gt_norm.split())
-    if pred_words and gold_words:
-        inter = pred_words & gold_words
-        if inter:
-            prec = len(inter) / len(pred_words)
-            rec  = len(inter) / len(gold_words)
+    # Token-level F1 match (count-based, consistent with SQuAD standard)
+    # Using Counter instead of set preserves word frequencies, so repeated
+    # words are counted correctly (e.g. "cat sat cat" vs "cat cat sat").
+    from collections import Counter
+    pred_counter = Counter(ans_norm.split())
+    gold_counter = Counter(gt_norm.split())
+    if pred_counter and gold_counter:
+        # Intersection counts each token min(pred, gold) times
+        common = sum((pred_counter & gold_counter).values())
+        if common > 0:
+            prec = common / sum(pred_counter.values())
+            rec  = common / sum(gold_counter.values())
             f1   = 2 * prec * rec / (prec + rec)
             if f1 >= f1_threshold:
                 return 1

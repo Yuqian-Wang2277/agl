@@ -60,6 +60,7 @@ class ActorJudgeConfig:
 
     # ── Training schedule ─────────────────────────────────────────────────────
     total_epochs: int = 5
+    num_train_samples: int = 20_000    # L2: configurable dataset size (was hard-coded)
     train_batch_size: int = 8          # B — questions per rollout batch
     actor_lr: float = 1e-6
     judge_lr: float = 1e-5
@@ -67,6 +68,11 @@ class ActorJudgeConfig:
     judge_warmup: bool = True
     warmup_steps: int = 100            # Judge BT pre-training steps on S_gold data
     val_freq: int = 1                  # validate every N epochs
+    # L4: total_train_steps for LR scheduler — set automatically in main() if 0
+    total_train_steps: int = 0         # 0 = auto-compute from epochs × steps_per_epoch
+
+    # ── Optimisation ──────────────────────────────────────────────────────────
+    max_grad_norm: float = 1.0         # L3: gradient clipping (0 = disabled)
 
     # ── Infrastructure ────────────────────────────────────────────────────────
     checkpoint_dir: str = "./checkpoints_actor_judge"
@@ -74,6 +80,8 @@ class ActorJudgeConfig:
     n_gpus: int = 8
     # Shared memory dir for vLLM ↔ FSDP weight hand-off (avoids NVMe bottleneck)
     weight_sync_tmp_dir: str = "/dev/shm/actor_weight_tmp"
+    # Resume: set to a checkpoint dir to continue training from that point
+    resume_from_checkpoint: str = ""   # L5: e.g. "./checkpoints_actor_judge/epoch_002"
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     wandb_project: str = "ActorJudge"

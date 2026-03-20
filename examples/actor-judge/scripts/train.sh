@@ -29,6 +29,8 @@ DENSE_REWARD_ALPHA=0.3
 FREEZE_JUDGE=""
 DISABLE_UCB_REPLAY=""
 WANDB_RUN_NAME="phase2_co_evolution_$(date +%Y%m%d_%H%M%S)"
+RESUME_FROM=""
+NUM_TRAIN_SAMPLES=20000
 EXTRA_ARGS=""
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -41,8 +43,10 @@ while [[ $# -gt 0 ]]; do
         --dense_reward_alpha) DENSE_REWARD_ALPHA="$2"; shift 2 ;;
         --freeze_judge)     FREEZE_JUDGE="--freeze_judge"; shift ;;
         --disable_ucb_replay) DISABLE_UCB_REPLAY="--disable_ucb_replay"; shift ;;
-        --wandb_run_name)   WANDB_RUN_NAME="$2";       shift 2 ;;
-        --extra)            EXTRA_ARGS="$2";            shift 2 ;;
+        --wandb_run_name)   WANDB_RUN_NAME="$2";            shift 2 ;;
+        --resume_from)      RESUME_FROM="$2";               shift 2 ;;
+        --num_train_samples) NUM_TRAIN_SAMPLES="$2";        shift 2 ;;
+        --extra)            EXTRA_ARGS="$2";                shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -75,7 +79,7 @@ fsdp_config:
   fsdp_sharding_strategy: FULL_SHARD
   fsdp_state_dict_type: FULL_STATE_DICT
   fsdp_sync_module_states: true
-  fsdp_use_orig_params: false
+  fsdp_use_orig_params: true
 machine_rank: 0
 main_training_function: main
 mixed_precision: bf16
@@ -97,7 +101,10 @@ CMD=(
     --alpha "$ALPHA"
     --dense_reward_alpha "$DENSE_REWARD_ALPHA"
     --wandb_run_name "$WANDB_RUN_NAME"
+    --num_train_samples "$NUM_TRAIN_SAMPLES"
 )
+
+[[ -n "$RESUME_FROM" ]] && CMD+=("--resume_from_checkpoint" "$RESUME_FROM")
 
 [[ -n "$FREEZE_JUDGE"      ]] && CMD+=("$FREEZE_JUDGE")
 [[ -n "$DISABLE_UCB_REPLAY" ]] && CMD+=("$DISABLE_UCB_REPLAY")

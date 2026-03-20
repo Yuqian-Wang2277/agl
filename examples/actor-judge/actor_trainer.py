@@ -2,20 +2,38 @@
 
 Key design points:
 
+C1  prompt_text stored in Experience.
+    tokenise_strategy_batch uses exp.prompt_text (the exact chat-template
+    formatted prompt that vLLM used) instead of a simplified reconstruction.
+    This ensures action_mask boundaries and log_prob computations are aligned
+    with the actual generation context.
+
+C2  FSDP-wrapped models used directly for no_grad forward passes.
+    accelerator.unwrap_model() under FSDP ZeRO-3 returns a module with only
+    the local parameter shard — calling forward() on it gives wrong results.
+    Using the FSDP-wrapped model (self.actor, self.ref) ensures the all-gather
+    is triggered and the full parameters are used.
+
 P1  log_prob_old is computed HERE (not fetched from vLLM).
     vLLM only returns text.  Before the first mini-batch update of each step,
     we run a torch.no_grad() forward of the *current* Actor (weights unchanged
     at this point) to get perfectly aligned log_prob_old.
 
 M2  action_mask is THREE-PART: [Prompt=0 | Strategy=1 | Padding=0]
-    - PAD tokens (right-padded) are excluded via (input_ids != pad_token_id)
-    - Prompt tokens are then forced to 0
-    This ensures log_prob and KL only integrate over the generated Strategy tokens.
+    Prompt region is [0, p_len), Strategy region is [p_len, seq_len),
+    Padding region is [seq_len, max_len).
 
-M3  Zero-variance short-circuit:
-    When all K strategies for a question receive identical rewards (std < 1e-4),
-    the normalised advantage would be numerically explosive.  We mask it to 0
-    (skip the gradient update for that group) instead.
+S3  KL penalty is a separate loss term, NOT part of the advantage.
+    reward_for_advantage is computed with detached KL so that the Z-score
+    normalisation and PPO-clip operate on a clean advantage signal.
+
+S4  log_prob uses per-token MEAN (not SUM).
+    SUM penalises longer strategies more, biasing the policy toward short
+    outputs independent of quality.  MEAN removes this length bias.
+
+M3  Zero-variance short-circuit: when all K strategies for a question
+    receive identical rewards (std < 1e-4), the advantage is set to 0
+    (skipping gradient update for that group).
 
 M4  Buffer access is FORBIDDEN here (On-Policy boundary).
     actor_trainer ONLY receives `experiences` from the current rollout.
@@ -23,6 +41,8 @@ M4  Buffer access is FORBIDDEN here (On-Policy boundary).
 
 P5  ref_model must be distributed (accelerator.prepare) before being passed in.
     If each rank holds its own full copy, 8×8GB = 64GB of redundant VRAM is wasted.
+
+L3  Gradient clipping via cfg.max_grad_norm (default 1.0).
 """
 
 from __future__ import annotations
@@ -33,6 +53,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import PreTrainedTokenizer
 
 from buffer import Experience
@@ -51,22 +72,36 @@ def tokenise_strategy_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
     """Tokenise (prompt + strategy) pairs and build three-part action_mask.
 
+    C1 fix: uses exp.prompt_text — the exact chat-template formatted prompt
+    that vLLM used for Stage-1 generation — instead of a simplified
+    "context_text + Question:" reconstruction.  This ensures the prompt token
+    boundary is in the same position as during generation, so action_mask
+    correctly isolates only the strategy tokens.
+
+    S2 / add_special_tokens fix: both prompt and full text are encoded with
+    add_special_tokens=False because apply_chat_template already inserts all
+    special tokens as literal text (e.g. <|im_start|>).  Using True would
+    prepend an extra BOS and shift all token indices by 1.
+
     Returns:
         input_ids:      [B, seq_len]
         attention_mask: [B, seq_len]   (0 = PAD)
         action_mask:    [B, seq_len]   (1 = strategy token, 0 = prompt / PAD)
         prompt_lengths: list of prompt token counts (one per sample in batch)
     """
-    # Separate encode: get prompt length for each sample
-    full_ids_list:        List[List[int]] = []
-    prompt_lengths_calc:  List[int]       = []   # correct p_len per sample
+    full_ids_list:       List[List[int]] = []
+    prompt_lengths_calc: List[int]       = []   # correct p_len per sample
 
     for exp in experiences:
-        prompt_text = exp.context_text + "\n\nQuestion: " + exp.question
-        full_text   = prompt_text + "\n" + exp.strategy
+        # C1 fix: prompt_text is the exact chat-template string stored by rollout_engine.
+        # full_text appends the generated strategy directly (no extra separator needed
+        # since the chat template already ends with the assistant turn opening).
+        prompt_text = exp.prompt_text
+        full_text   = prompt_text + exp.strategy
 
+        # S2 fix: add_special_tokens=False for both — chat template handles all specials.
         p_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-        f_ids = tokenizer.encode(full_text,   add_special_tokens=True)
+        f_ids = tokenizer.encode(full_text,   add_special_tokens=False)
 
         # Truncate from the left if over limit (keep the strategy intact).
         # IMPORTANT: track the *adjusted* prompt length so action_mask is correct
@@ -79,10 +114,11 @@ def tokenise_strategy_batch(
             p_len = len(p_ids)
 
         full_ids_list.append(f_ids)
-        prompt_lengths_calc.append(p_len)   # store now; p_ids is NOT stored
+        prompt_lengths_calc.append(p_len)   # store correct p_len; p_ids NOT stored
 
     # Pad to same length (right padding)
     max_len = max(len(ids) for ids in full_ids_list)
+    pad_id  = tokenizer.pad_token_id or 0
 
     batch_input_ids   = torch.zeros(len(experiences), max_len, dtype=torch.long)
     batch_attn_mask   = torch.zeros(len(experiences), max_len, dtype=torch.long)
@@ -114,7 +150,12 @@ def compute_log_probs(
     attention_mask: torch.Tensor,
     action_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Sum of per-token log-probs over the Strategy segment only.
+    """Mean per-token log-prob over the Strategy segment only.
+
+    S4 fix: returns MEAN (not SUM) of per-token log-probs.
+    SUM would systematically penalise longer strategies (larger negative
+    values) and bias the policy ratio toward shorter outputs regardless of
+    quality.  MEAN normalises for sequence length.
 
     M2: action_mask must be three-part [Prompt=0 | Strategy=1 | Padding=0]
         so that PAD tokens do not pollute the KL or ratio.
@@ -125,7 +166,7 @@ def compute_log_probs(
         action_mask:    [B, seq_len]  — three-part mask
 
     Returns:
-        log_probs: [B]  — scalar per sample
+        log_probs: [B]  — mean per-strategy-token log-prob per sample
     """
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     # [B, seq_len, vocab_size]
@@ -141,34 +182,31 @@ def compute_log_probs(
         index=labels.unsqueeze(-1),
     ).squeeze(-1)                          # [B, seq-1]
 
-    # Sum only over Strategy tokens
-    return (per_token_lp * action_mask.float()).sum(dim=-1)   # [B]
+    # S4 fix: MEAN over strategy tokens (not SUM)
+    n_strategy_tokens = action_mask.float().sum(dim=-1).clamp(min=1)
+    return (per_token_lp * action_mask.float()).sum(dim=-1) / n_strategy_tokens  # [B]
 
 
 # ---------------------------------------------------------------------------
-# Reward computation
+# Reward computation (advantage part only — no KL here)
 # ---------------------------------------------------------------------------
 
-def compute_rewards(
+def compute_advantage_reward(
     outcomes: torch.Tensor,       # [B*K]  int  {-1, 0, 1}
-    v_judge: torch.Tensor,        # [B*K]  float  Judge sigmoid score
+    v_judge: torch.Tensor,        # [B*K]  float  Judge sigmoid score (detached)
     len_penalties: torch.Tensor,  # [B*K]  float  ≤ 0
-    log_prob_actor: torch.Tensor, # [B*K]  with grad
-    log_prob_ref: torch.Tensor,   # [B*K]  no grad
     alpha: float,
-    beta: float,
 ) -> torch.Tensor:
-    """Compute GRPO reward per trajectory.
+    """Compute the reward used for advantage normalisation (no KL term).
 
-    r = (1-α)·y + α·σ(v_judge) + len_penalty − β·KL
+    S3 fix: KL penalty is NOT included here so that Z-score normalisation
+    operates on a clean signal and the advantage is free of gradient.
+    The KL term is added as a separate loss in train_step.
 
-    where KL ≈ log π_θ − log π_ref  (first-order KL approximation).
+    r_adv = (1-α)·y + α·σ(v_judge) + len_penalty
     """
-    # Clamp outcome to [0, 1] for reward (y=-1 treated as 0)
-    y = outcomes.float().clamp(min=0.0)
-    kl = log_prob_actor - log_prob_ref   # [B*K], still has grad via log_prob_actor
-    reward = (1 - alpha) * y + alpha * v_judge + len_penalties - beta * kl
-    return reward   # [B*K]
+    y = outcomes.float().clamp(min=0.0)   # y=-1 (format error) → 0
+    return (1 - alpha) * y + alpha * v_judge + len_penalties   # [B*K]
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +231,13 @@ class ActorTrainer:
         self.optimizer = AdamW(
             [p for p in self.actor.parameters() if p.requires_grad],
             lr=cfg.actor_lr,
+        )
+        # L4: cosine annealing LR scheduler
+        total_steps = getattr(cfg, 'total_train_steps', 10_000)
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=total_steps,
+            eta_min=cfg.actor_lr * 0.1,
         )
 
     # ------------------------------------------------------------------
@@ -239,22 +284,24 @@ class ActorTrainer:
         action_mask = action_mask.to(device)
 
         # ── P1: compute log_prob_old BEFORE any gradient update ──────────
-        # Actor weights are unchanged at this point; use the same tokenizer
-        # → perfectly aligned with the training forward pass.
+        # Actor weights are unchanged at this point.
+        # C2 fix: use self.actor (FSDP-wrapped) directly — NOT unwrap_model().
+        # Under FSDP ZeRO-3, unwrap_model() gives only the local parameter shard.
         self.actor.eval()
         with torch.no_grad():
             log_prob_old = compute_log_probs(
-                self.accel.unwrap_model(self.actor),
+                self.actor,    # C2 fix: FSDP model, not unwrap_model(self.actor)
                 input_ids, attn_mask, action_mask,
-            )   # [BK], no grad, float
+            )   # [BK], no grad
         log_prob_old = log_prob_old.detach()
         self.actor.train()
 
         # ── ref_model forward (KL baseline, also no grad) ────────────────
+        # C2 fix: use self.ref directly (FSDP-wrapped), not unwrap_model().
         # P5: ref_model must be accelerator.prepare()'d before being passed in.
         with torch.no_grad():
             log_prob_ref = compute_log_probs(
-                self.accel.unwrap_model(self.ref),
+                self.ref,      # C2 fix
                 input_ids, attn_mask, action_mask,
             )   # [BK]
         log_prob_ref = log_prob_ref.detach()
@@ -279,53 +326,65 @@ class ActorTrainer:
             device=device,
         )
 
-        # ── GRPO loop (mini-batches) ──────────────────────────────────────
-        total_loss = 0.0
-        n_mini = max(1, BK // max(1, BK))   # single pass for now; split if OOM
-
-        self.optimizer.zero_grad()
-
-        # Actor forward (with grad)
-        log_prob_actor = compute_log_probs(
-            self.actor, input_ids, attn_mask, action_mask
-        )   # [BK], has grad
-
-        # Reward (note: KL computed inside for grad flow)
-        reward_raw = compute_rewards(
-            outcomes.long(), v_judge, len_penalties,
-            log_prob_actor, log_prob_ref,
-            alpha=alpha, beta=self.cfg.kl_penalty_beta,
-        )   # [BK]
+        # ── Advantage (S3 fix: no KL in advantage) ───────────────────────
+        with torch.no_grad():
+            reward_adv = compute_advantage_reward(
+                outcomes.long(), v_judge.detach(), len_penalties, alpha=alpha
+            )   # [BK], no grad
 
         # ── Z-Score normalisation within each group of K ──────────────────
         # M3: short-circuit when std < 1e-4 (all-same rewards → no info)
-        reward_bk = reward_raw.view(n_groups, K)   # [B_eff, K]
+        reward_bk = reward_adv.view(n_groups, K)   # [B_eff, K]
         mean_k    = reward_bk.mean(dim=1, keepdim=True)
         std_k     = reward_bk.std(dim=1, keepdim=True)
 
         mask_valid_std = (std_k > 1e-4).float()
         advantage = ((reward_bk - mean_k) / (std_k + 1e-8)) * mask_valid_std
-        advantage_flat = advantage.view(BK)   # [BK]
+        advantage_flat = advantage.view(BK).detach()   # [BK], no grad
 
-        # ── GRPO Clip ─────────────────────────────────────────────────────
+        # ── Actor forward (with grad) ─────────────────────────────────────
+        self.optimizer.zero_grad()
+
+        log_prob_actor = compute_log_probs(
+            self.actor, input_ids, attn_mask, action_mask
+        )   # [BK], has grad
+
+        # ── GRPO Clip loss ────────────────────────────────────────────────
         ratio         = torch.exp(log_prob_actor - log_prob_old)
         ratio_clipped = ratio.clamp(
             1 - self.cfg.grpo_epsilon, 1 + self.cfg.grpo_epsilon
         )
-        loss = -torch.min(
+        clip_loss = -torch.min(
             ratio * advantage_flat,
             ratio_clipped * advantage_flat,
         ).mean()
 
-        self.accel.backward(loss)
+        # ── S3 fix: KL penalty as a separate loss term ───────────────────
+        # KL = log π_θ − log π_ref.  This term has gradient through log_prob_actor.
+        # Adding it directly to clip_loss (not to advantage) ensures:
+        #   (a) The advantage/Z-score normalisation is unaffected by KL.
+        #   (b) Gradient flows correctly through a single path.
+        kl_per_sample = log_prob_actor - log_prob_ref   # [BK], has grad
+        kl_loss       = self.cfg.kl_penalty_beta * kl_per_sample.mean()
+
+        total_loss = clip_loss + kl_loss
+
+        self.accel.backward(total_loss)
+
+        # L3: gradient clipping
+        self.accel.clip_grad_norm_(
+            self.actor.parameters(),
+            getattr(self.cfg, "max_grad_norm", 1.0),
+        )
+
         self.optimizer.step()
-        total_loss += loss.item()
+        self.scheduler.step()
 
         logger.info(
-            "ActorTrainer step %d: loss=%.4f BK=%d n_groups=%d",
-            global_step, total_loss, BK, n_groups,
+            "ActorTrainer step %d: clip_loss=%.4f kl_loss=%.4f BK=%d n_groups=%d",
+            global_step, clip_loss.item(), kl_loss.item(), BK, n_groups,
         )
-        return total_loss
+        return total_loss.item()
 
     # ------------------------------------------------------------------
 
@@ -336,14 +395,14 @@ class ActorTrainer:
         device: torch.device,
     ) -> torch.Tensor:
         """Run Judge model in no_grad mode to obtain σ(logit) scores."""
-        from prompts import build_judge_prompt, JUDGE_TOKEN
+        from prompts import build_judge_prompt
 
         texts = [
             build_judge_prompt(
                 fewshot_examples=[],
                 question=e.question,
                 strategy=e.strategy,
-                context_text_raw=e.context_text,   # pass pre-formatted context
+                context_text_raw=e.context_text,
             )
             for e in experiences
         ]
@@ -358,7 +417,7 @@ class ActorTrainer:
 
         judge_model.eval()
         with torch.no_grad():
-            logits = judge_model(**enc)   # [BK]
+            logits = judge_model(**enc)   # [BK], using FSDP-wrapped judge
         judge_model.train()
 
         return torch.sigmoid(logits)     # [BK] in (0, 1)

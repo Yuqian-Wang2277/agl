@@ -23,19 +23,24 @@ P3 — gpu_memory_utilization ≤ 0.75:
 M1 — vLLM is launched ONLY on Rank 0 (the main process).
      The generated experiences are broadcast to all ranks afterward.
      See train.py for the broadcast orchestration.
+
+C1 fix — Experience.prompt_text stores the EXACT chat-template formatted prompt
+     that vLLM used for Stage-1 generation.  actor_trainer uses this to
+     reconstruct the exact tokenisation, ensuring action_mask boundaries and
+     log_prob computations are aligned with the generation context.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import ray
 from vllm import LLM, SamplingParams
 
 from buffer import Experience, UCBBuffer
 from data_loader import RolloutSample
-from env import evaluate, compute_length_penalty
+from env import evaluate
 from prompts import (
     STRATEGY_CLOSE,
     STRATEGY_OPEN,
@@ -55,10 +60,11 @@ logger = logging.getLogger(__name__)
 class VLLMActor:
     """vLLM inference server managed as a Ray Actor.
 
-    Lifecycle:
-      - Created by Rank 0 before each rollout epoch.
-      - Killed by Rank 0 after rollout to free GPU memory before FSDP training.
-      - Recreated at the next epoch (startup ~10-15 s, but eliminates all OOM risk).
+    Lifecycle (S1 fix: epoch-level, NOT per-batch):
+      - Created ONCE per epoch by Rank 0 at the start of Phase A (rollout).
+      - Killed ONCE per epoch after all batches in Phase A are done.
+      - This avoids the ~15s startup overhead that would occur if kill/restart
+        happened on every training step (2500 batches × 15s = 10+ hours/epoch).
     """
 
     def __init__(
@@ -113,15 +119,23 @@ class RolloutEngine:
 
         For each of the B questions, K strategy samples are generated.
         Returns up to B*K Experience objects (fewer if some are format-invalid).
+
+        C1 fix: we store the exact Stage-1 prompt string (prompt_text) in each
+        Experience so that actor_trainer can reconstruct the correct tokenisation
+        for action_mask and log_prob computation.
         """
         B = len(batch)
         K = self.cfg.K
 
         # ── Stage 1: Strategy generation ─────────────────────────────────
+        # Build Stage-1 prompts AND save the prompt_str per batch item.
         stage1_prompts: List[str] = []
+        prompt_strs: List[str] = []          # one per batch item (same for all K)
+
         for sample in batch:
-            messages = build_strategy_prompt(sample.fewshot_examples)
+            messages   = build_strategy_prompt(sample.fewshot_examples)
             prompt_str = apply_chat_template(self.tokenizer, messages)
+            prompt_strs.append(prompt_str)
             # Repeat K times so vLLM receives one entry per (question, sample)
             stage1_prompts.extend([prompt_str] * K)
 
@@ -143,7 +157,7 @@ class RolloutEngine:
         # ── Stage 2: Answer generation (only for format-valid strategies) ─
         # Build stage-2 prompts; track which (b, k) pairs are format-valid
         stage2_prompts: List[str] = []
-        stage2_indices: List[tuple[int, int]] = []   # (batch_idx, k_idx)
+        stage2_indices: List[Tuple[int, int]] = []   # (batch_idx, k_idx)
 
         for b_idx in range(B):
             for k_idx in range(K):
@@ -172,7 +186,7 @@ class RolloutEngine:
             stage2_texts = []
 
         # Map back to (b_idx, k_idx) → answer text
-        answer_map: dict[tuple[int, int], str] = {}
+        answer_map: Dict[Tuple[int, int], str] = {}
         for i, (b_idx, k_idx) in enumerate(stage2_indices):
             answer_map[(b_idx, k_idx)] = stage2_texts[i]
 
@@ -180,7 +194,7 @@ class RolloutEngine:
         experiences: List[Experience] = []
 
         for b_idx, sample in enumerate(batch):
-            # Build the context text once for all K strategies of this question
+            # Build context_text for Judge prompt (simple "Q: A:" format)
             context_lines: List[str] = []
             for ex in sample.fewshot_examples:
                 inp = ex.get("input", "")
@@ -190,25 +204,18 @@ class RolloutEngine:
                 context_lines.append(f"Q: {inp}  A: {tgt}")
             context_text = "\n".join(context_lines)
 
+            # C1 fix: retrieve the exact Stage-1 prompt for this batch item
+            stage1_prompt_text = prompt_strs[b_idx]
+
             for k_idx in range(K):
                 s_text = stage1_texts[b_idx * K + k_idx]
                 a_text = answer_map.get((b_idx, k_idx), "")
 
                 outcome = evaluate(s_text, a_text, sample.answer_gold)
 
-                # Optional Length Penalty (only when coeff > 0)
-                len_pen = compute_length_penalty(
-                    s_text,
-                    coeff=self.cfg.length_penalty_coeff,
-                    threshold=self.cfg.length_penalty_threshold,
-                )
-                # len_pen is incorporated into the sparse reward at actor_trainer level
-                # We store it in outcome only as a float adjustment note; the integer
-                # outcome field is kept clean for pairwise Judge training.
-                # (Actor trainer reads raw outcome + len_pen separately.)
-
                 exp = UCBBuffer.make_experience(
                     context_text=context_text,
+                    prompt_text=stage1_prompt_text,   # C1 fix: exact Stage-1 prompt
                     question=sample.question,
                     strategy=s_text,
                     outcome=outcome,
@@ -216,7 +223,7 @@ class RolloutEngine:
                 )
                 experiences.append(exp)
 
-        n_valid = sum(1 for e in experiences if e.outcome >= 0)
+        n_valid   = sum(1 for e in experiences if e.outcome >= 0)
         n_correct = sum(1 for e in experiences if e.outcome == 1)
         logger.info(
             "Rollout step %d: B=%d K=%d → %d experiences "

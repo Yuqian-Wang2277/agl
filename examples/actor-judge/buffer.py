@@ -8,9 +8,16 @@ Design decisions:
   lowest UCB score is evicted.
 - global_sample_steps is the T in the UCB formula; it increments every time
   sample_pairwise() is called — NOT on every add().
-- Experience stores ONLY pure-Python scalars (str/int/float).
+- Experience stores ONLY pure-Python scalars (str/int/float/list-of-dicts).
   No torch.Tensors!  If a Tensor ended up here, broadcast_object_list would
   trigger an NCCL hang with no error message.
+
+Fields added since original design:
+  prompt_text   — full chat-template formatted Stage-1 prompt string.
+                  Used by actor_trainer to compute log_prob over the EXACT
+                  token sequence that vLLM generated against.  Without this,
+                  the prompt reconstructed in actor_trainer would differ from
+                  vLLM's actual input, making action_mask boundaries wrong.
 """
 
 from __future__ import annotations
@@ -20,23 +27,25 @@ import logging
 import math
 import random
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Experience dataclass — all fields MUST be pure Python scalars
+# Experience dataclass — all fields MUST be pure Python (no GPU tensors)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Experience:
-    traj_id: str       # UUID string → O(1) lookup for v_pred write-back
-    context_text: str  # few-shot examples as plain text (no tensors!)
-    question: str      # new question Q'
-    strategy: str      # generated strategy S (full text including tags)
-    outcome: int       # y ∈ {-1, 0, 1}; -1 = format error, not used in pairwise
+    traj_id: str        # UUID string → O(1) lookup for v_pred write-back
+    context_text: str   # few-shot examples as "Q: A:" plain text (for Judge prompt)
+    prompt_text: str    # full chat-template formatted Stage-1 prompt (for actor log_prob)
+    question: str       # new question Q'
+    strategy: str       # generated strategy S (full text including tags)
+    outcome: int        # y ∈ {-1, 0, 1}; -1 = format error, not used in pairwise
     n_sampled: int = 0       # how many times this traj was sampled by Judge
     v_pred: float = 0.5      # Judge's latest predicted score (initialised at 0.5)
     timestamp: int = 0       # global step when this experience was added
@@ -102,9 +111,9 @@ class UCBBuffer:
         if q_hash not in self._data:
             self._data[q_hash] = {}
 
-        # Evict globally if at capacity (FIFO: remove a random entry)
+        # Evict globally if at capacity (oldest-first by timestamp)
         if self._total >= self.max_size:
-            self._evict_one_global()
+            self._evict_oldest_global()
 
         self._data[q_hash][exp.traj_id] = exp
         self._total += 1
@@ -128,15 +137,21 @@ class UCBBuffer:
         Only q_hashes that have at least one y=1 AND one y=0 experience are
         eligible.  y=-1 experiences (format errors) are always excluded.
 
+        Selection is weighted by number of trajectories per q_hash so that
+        questions with more stored trajectories contribute more to training
+        (M6 fix: previously uniform, which under-represented rich q_hashes).
+
         The global_sample_steps counter (T in the UCB formula) is incremented
         once per call — not once per pair — so T tracks "judge update steps".
 
         Returns fewer than batch_size pairs if the buffer is too sparse.
         """
         self.global_sample_steps += 1
+        # M1: use max(T, e) so log is always positive, even at T=1
         T = max(self.global_sample_steps, 1)
 
         eligible: List[str] = []
+        eligible_weights: List[int] = []
         unipolar: int = 0
 
         for q_hash, trajs in self._data.items():
@@ -144,6 +159,7 @@ class UCBBuffer:
             loses = [e for e in trajs.values() if e.outcome == 0]
             if wins and loses:
                 eligible.append(q_hash)
+                eligible_weights.append(len(trajs))   # M6: weight by size
             elif trajs:
                 unipolar += 1
 
@@ -164,7 +180,8 @@ class UCBBuffer:
         for _ in range(batch_size):
             if not eligible:
                 break
-            q_hash = random.choice(eligible)
+            # M6: weighted selection so questions with more trajectories contribute more
+            q_hash = random.choices(eligible, weights=eligible_weights, k=1)[0]
             trajs  = self._data[q_hash]
             wins   = [e for e in trajs.values() if e.outcome == 1]
             loses  = [e for e in trajs.values() if e.outcome == 0]
@@ -173,7 +190,7 @@ class UCBBuffer:
                 win_exp  = random.choice(wins)
                 lose_exp = random.choice(loses)
             else:
-                win_exp  = self._ucb_sample(wins, T)
+                win_exp  = self._ucb_sample(wins,  T)
                 lose_exp = self._ucb_sample(loses, T)
 
             pairs.append(Pair(
@@ -214,9 +231,10 @@ class UCBBuffer:
     # ------------------------------------------------------------------
 
     def _ucb_score(self, exp: Experience, T: int) -> float:
+        # M1: max(T, math.e) ensures log is always positive
         return (
             self.lambda_err * abs(exp.outcome - exp.v_pred)
-            + self.lambda_exp * math.sqrt(math.log(T) / (exp.n_sampled + 1))
+            + self.lambda_exp * math.sqrt(math.log(max(T, math.e)) / (exp.n_sampled + 1))
         )
 
     def _ucb_sample(self, candidates: List[Experience], T: int) -> Experience:
@@ -234,14 +252,29 @@ class UCBBuffer:
         del trajs[worst_id]
         self._total -= 1
 
-    def _evict_one_global(self) -> None:
-        """Remove one random trajectory from a random q_hash (FIFO-ish global eviction)."""
-        q_hash = random.choice(list(self._data.keys()))
-        traj_id = random.choice(list(self._data[q_hash].keys()))
-        del self._data[q_hash][traj_id]
-        self._total -= 1
-        if not self._data[q_hash]:
-            del self._data[q_hash]
+    def _evict_oldest_global(self) -> None:
+        """M5: Remove the globally oldest trajectory (by timestamp), not random.
+
+        This prevents the buffer from accumulating stale experiences from early
+        training when the Actor was weak.  Using random eviction would keep
+        old low-quality experiences alive indefinitely.
+        """
+        oldest_q: Optional[str] = None
+        oldest_tid: Optional[str] = None
+        oldest_ts: int = int(1e18)
+
+        for q_hash, trajs in self._data.items():
+            for tid, exp in trajs.items():
+                if exp.timestamp < oldest_ts:
+                    oldest_ts = exp.timestamp
+                    oldest_q   = q_hash
+                    oldest_tid = tid
+
+        if oldest_q is not None and oldest_tid is not None:
+            del self._data[oldest_q][oldest_tid]
+            self._total -= 1
+            if not self._data[oldest_q]:
+                del self._data[oldest_q]
 
     # ------------------------------------------------------------------
     # Convenience factory
@@ -250,6 +283,7 @@ class UCBBuffer:
     @staticmethod
     def make_experience(
         context_text: str,
+        prompt_text: str,
         question: str,
         strategy: str,
         outcome: int,
@@ -259,6 +293,7 @@ class UCBBuffer:
         return Experience(
             traj_id=str(uuid.uuid4()),
             context_text=context_text,
+            prompt_text=prompt_text,
             question=question,
             strategy=strategy,
             outcome=outcome,
