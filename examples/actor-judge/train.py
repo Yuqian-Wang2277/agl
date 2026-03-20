@@ -441,35 +441,104 @@ def main(cfg: ActorJudgeConfig) -> None:
     # wait_for_everyone(), causing a permanent NCCL deadlock.
     if cfg.judge_warmup:
         logger.info("=== Judge Warmup (%d steps) ===", cfg.warmup_steps)
-        warmup_samples = [s for s in train_dataset if s.s_gold is not None]
+        warmup_samples = [
+            s for s in train_dataset
+            if (s.s_gold_by_version and len(s.s_gold_by_version) > 0) or s.s_gold is not None
+        ]
+
+        warmup_dump_path = Path(cfg.checkpoint_dir) / "judge_warmup_pairs.jsonl"
+        if accelerator.is_main_process:
+            warmup_dump_path.parent.mkdir(parents=True, exist_ok=True)
+            if warmup_dump_path.exists():
+                warmup_dump_path.unlink()
+            logger.info("Judge warmup pairs will be saved to %s", warmup_dump_path)
 
         if warmup_samples:
-            # S6 fix: build cross-domain gold strategy pool for better negatives.
-            # Reversed strings ("txet ygetarts") teach the Judge nothing about
-            # strategy quality.  Cross-domain gold strategies are grammatically
-            # valid but semantically wrong for the question — a much harder and
-            # more informative discrimination task.
-            domain_to_gold = {}
+            # Build per-version warmup pools so v1/v2/v3 all get trained.
+            # If a version has any data, we round-robin warmup steps across it.
+            version_to_pool = {"v1": [], "v2": [], "v3": []}
             for s in warmup_samples:
-                if s.s_gold and s.domain not in domain_to_gold:
-                    domain_to_gold[s.domain] = s.s_gold
+                if s.s_gold_by_version:
+                    for v, txt in s.s_gold_by_version.items():
+                        if txt:
+                            version_to_pool[v].append((s, txt))
+                elif s.s_gold:
+                    # Legacy fallback (single-strategy datasets): count as v1.
+                    version_to_pool["v1"].append((s, s.s_gold))
+
+            active_versions = [v for v, pool in version_to_pool.items() if pool]
+            logger.info(
+                "Judge warmup version coverage: %s",
+                {v: len(version_to_pool[v]) for v in ("v1", "v2", "v3")},
+            )
+
+            # S6 fix: cross-domain negatives are semantically wrong but fluent.
+            # Maintain one gold strategy per domain per version for negative mining.
+            domain_to_gold_by_version = {"v1": {}, "v2": {}, "v3": {}}
+            for s in warmup_samples:
+                if s.s_gold_by_version:
+                    for v, txt in s.s_gold_by_version.items():
+                        if txt and s.domain not in domain_to_gold_by_version[v]:
+                            domain_to_gold_by_version[v][s.domain] = txt
+                elif s.s_gold and s.domain not in domain_to_gold_by_version["v1"]:
+                    domain_to_gold_by_version["v1"][s.domain] = s.s_gold
 
             for step in range(cfg.warmup_steps):
-                batch_w   = random.sample(warmup_samples, min(cfg.judge_batch_size, len(warmup_samples)))
-                s_golds   = [s.s_gold for s in batch_w]
+                if active_versions:
+                    target_version = active_versions[step % len(active_versions)]
+                else:
+                    target_version = "v1"
+
+                pool = version_to_pool.get(target_version, [])
+                if not pool:
+                    logger.warning(
+                        "Warmup step %d: no samples for %s, skipping.",
+                        step, target_version
+                    )
+                    continue
+
+                batch_pairs = random.sample(pool, min(cfg.judge_batch_size, len(pool)))
+                batch_w = [p[0] for p in batch_pairs]
+                s_golds = [p[1] for p in batch_pairs]
                 questions = [s.question for s in batch_w]
 
                 s_negs: List[str] = []
-                for s in batch_w:
+                neg_domains: List[str] = []
+                domain_to_gold = domain_to_gold_by_version.get(target_version, {})
+                for s, s_gold in zip(batch_w, s_golds):
                     other_domains = [d for d in domain_to_gold if d != s.domain]
                     if other_domains:
-                        # Cross-domain gold strategy as negative (semantically wrong domain)
-                        s_negs.append(domain_to_gold[random.choice(other_domains)])
+                        # Cross-domain gold strategy, same format version.
+                        neg_domain = random.choice(other_domains)
+                        s_negs.append(domain_to_gold[neg_domain])
+                        neg_domains.append(neg_domain)
                     else:
-                        # Fallback: word-shuffle (better than string reversal)
-                        words = s.s_gold.split()
+                        # Fallback: word-shuffle from the selected positive strategy.
+                        words = s_gold.split()
                         random.shuffle(words)
                         s_negs.append(" ".join(words))
+                        neg_domains.append("word_shuffle")
+
+                if accelerator.is_main_process:
+                    with open(warmup_dump_path, "a", encoding="utf-8") as f:
+                        for s, q, pos, neg, neg_domain in zip(
+                            batch_w, questions, s_golds, s_negs, neg_domains
+                        ):
+                            f.write(
+                                json.dumps(
+                                    {
+                                        "step": step,
+                                        "version": target_version,
+                                        "domain": s.domain,
+                                        "negative_domain": neg_domain,
+                                        "question": q,
+                                        "positive_strategy": pos,
+                                        "negative_strategy": neg,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
 
                 judge_trainer.warmup_step(s_golds, s_negs, questions, global_step=step)
         else:

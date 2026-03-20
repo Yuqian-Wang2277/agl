@@ -36,12 +36,12 @@ class ActorJudgeConfig:
     fewshot_max: int = 5
     rollout_temperature: float = 0.7   # stage-1 strategy generation
     answer_temperature: float = 0.0    # stage-2 answer generation (greedy)
-    strategy_max_tokens: int = 1024
-    answer_max_tokens: int = 512
-    cross_domain_ratio: float = 0.5    # fraction of cross-domain batches
+    strategy_max_tokens: int = 16384
+    answer_max_tokens: int = 8192
+    cross_domain_ratio: float = 0.0    # fraction of cross-domain batches
 
     # vLLM engine settings (P3: ≤ 0.75 to leave room for PyTorch CUDA Context)
-    gpu_memory_utilization: float = 0.75
+    gpu_memory_utilization: float = 0.80
     tensor_parallel_size: int = 8
 
     # ── Buffer ────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ Provides:
   - RolloutSample: typed dataclass per training item
   - ActorJudgeDataset: PyTorch Dataset wrapping LLMReflection JSON data
   - load_rollout_dataset / load_val_dataset: convenience factory functions
-  - match_s_gold: find gold strategy files from fs/strategy for Judge warmup
+  - match_s_gold / match_s_gold_versions: find gold strategy files for Judge warmup
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ class RolloutSample:
     question: str                       # new question Q' the actor must answer
     answer_gold: str                    # ground-truth answer
     s_gold: Optional[str] = None        # gold strategy (only used for warmup)
+    s_gold_by_version: Optional[Dict[str, str]] = None   # e.g. {"v1": "...", "v2": "..."}
 
 
 # ---------------------------------------------------------------------------
@@ -86,29 +87,46 @@ def _pick_answer(target: Any) -> str:
 # S_gold matching
 # ---------------------------------------------------------------------------
 
-def match_s_gold(domain: str, strategy_dir: str) -> Optional[str]:
-    """Find the best matching gold-strategy file for *domain*.
+def match_s_gold_versions(domain: str, strategy_dir: str) -> Dict[str, str]:
+    """Find gold strategies for all known prompt formats (v1/v2/v3).
 
-    Searches ``{strategy_dir}/train_all/gain_pos/**/strategies_out/size_*/``
-    for a file whose parent path contains a normalised version of *domain*.
-
-    Returns the file content or None if no match is found.
+    Returns a dict like {"v1": "...", "v2": "...", "v3": "..."} with only
+    available keys populated.
     """
     base = Path(strategy_dir) / "train_all" / "gain_pos"
     if not base.exists():
-        return None
+        return {}
 
     domain_norm = _normalise_domain(domain)
-    pattern = str(base / "**" / "strategies_out" / "size_*" / "001.cand1.strategy.txt")
-    candidates = glob.glob(pattern, recursive=True)
+    version_to_text: Dict[str, str] = {}
+    version_to_dir_glob = {
+        "v1": "useful_by_coarse*_v1",  # handles both useful_by_coarse_v1 and typo variants
+        "v2": "useful_by_coarse*_v2",
+        "v3": "useful_by_coarse*_v3",
+    }
 
-    for path in candidates:
-        path_norm = _normalise_domain(path)
-        if domain_norm in path_norm:
-            try:
-                return Path(path).read_text(encoding="utf-8").strip()
-            except OSError:
-                continue
+    for version, version_dir in version_to_dir_glob.items():
+        pattern = str(
+            base / version_dir / "**" / "strategies_out" / "size_*" / "001.cand1.strategy.txt"
+        )
+        candidates = sorted(glob.glob(pattern, recursive=True))
+        for path in candidates:
+            path_norm = _normalise_domain(path)
+            if domain_norm in path_norm:
+                try:
+                    version_to_text[version] = Path(path).read_text(encoding="utf-8").strip()
+                    break
+                except OSError:
+                    continue
+    return version_to_text
+
+
+def match_s_gold(domain: str, strategy_dir: str) -> Optional[str]:
+    """Return one default gold strategy (prefers v1→v2→v3)."""
+    by_version = match_s_gold_versions(domain, strategy_dir)
+    for version in ("v1", "v2", "v3"):
+        if version in by_version:
+            return by_version[version]
     return None
 
 
@@ -157,6 +175,7 @@ class ActorJudgeDataset(Dataset):
 
         # Pre-cache gold strategies to avoid repeated glob scans
         self._s_gold_cache: Dict[str, Optional[str]] = {}
+        self._s_gold_versions_cache: Dict[str, Dict[str, str]] = {}
 
         self._samples: List[RolloutSample] = self._build(num_samples)
 
@@ -216,6 +235,7 @@ class ActorJudgeDataset(Dataset):
             return None
         q_example = random.choice(q_candidates)
 
+        s_gold_by_version = self._get_s_gold_versions(domain_fs) if self._load_s_gold else None
         s_gold = self._get_s_gold(domain_fs) if self._load_s_gold else None
 
         return RolloutSample(
@@ -224,6 +244,7 @@ class ActorJudgeDataset(Dataset):
             question=q_example.get("input", ""),
             answer_gold=_pick_answer(q_example.get("target", "")),
             s_gold=s_gold,
+            s_gold_by_version=s_gold_by_version,
         )
 
     def _get_s_gold(self, domain: str) -> Optional[str]:
@@ -233,6 +254,14 @@ class ActorJudgeDataset(Dataset):
                 if self._strategy_dir else None
             )
         return self._s_gold_cache[domain]
+
+    def _get_s_gold_versions(self, domain: str) -> Dict[str, str]:
+        if domain not in self._s_gold_versions_cache:
+            self._s_gold_versions_cache[domain] = (
+                match_s_gold_versions(domain, self._strategy_dir)
+                if self._strategy_dir else {}
+            )
+        return self._s_gold_versions_cache[domain]
 
     # ------------------------------------------------------------------
     # Dataset interface

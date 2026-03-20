@@ -61,6 +61,15 @@ conda activate agl
 cd "$PROJECT_DIR"
 echo "Working directory: $(pwd)"
 
+# ── Cache / artifact cleanup (optional but recommended) ───────────────
+# - If not resuming, wipe local checkpoints directory to avoid mixing runs.
+# - Always clear the vLLM ↔ FSDP shared-memory weight hand-off directory.
+#   Stale files here can cause confusing model-path / reload behavior.
+if [[ -z "$RESUME_FROM" ]]; then
+    rm -rf "$PROJECT_DIR/checkpoints_actor_judge" 2>/dev/null || true
+fi
+rm -rf "/dev/shm/actor_weight_tmp" 2>/dev/null || true
+
 # ── Accelerate FSDP config ────────────────────────────────────────────────────
 # Expects accelerate_fsdp.yaml in the project root; generate a minimal one
 # if it doesn't exist yet.
