@@ -156,6 +156,20 @@ class VLLMActor:
         self.llm = None
         gc.collect()
 
+    def reload_weights(self, model_path: str) -> None:
+        """Reload model weights from a HuggingFace checkpoint dir (same arch as init).
+
+        Uses vLLM worker ``reload_weights(weights_path=...)`` (layerwise checkpoint
+        reload) to avoid tearing down the engine between validation rounds.
+        """
+        if not (hasattr(self, "llm") and self.llm is not None):
+            raise RuntimeError("reload_weights: LLM not initialised")
+        # vLLM v1: collective RPC to each TP worker's gpu_worker.reload_weights
+        self.llm.collective_rpc(
+            "reload_weights",
+            kwargs={"weights_path": model_path, "is_checkpoint_format": True},
+        )
+
 
 # ---------------------------------------------------------------------------
 # RolloutEngine (stateless, called on Rank 0 only)

@@ -43,7 +43,7 @@ class ActorJudgeConfig:
     fewshot_max: int = 5
     rollout_temperature: float = 0.7   # stage-1 strategy generation
     answer_temperature: float = 0.0    # stage-2 answer generation (greedy)
-    strategy_max_tokens: int = 16384
+    strategy_max_tokens: int = 8192
     answer_max_tokens: int = 8192
     cross_domain_ratio: float = 0.0    # fraction of cross-domain batches
     # GRPO log_prob: full Stage-1 chat prompt (includes few-shot) + strategy S.
@@ -140,6 +140,9 @@ class ActorJudgeConfig:
     n_gpus: int = 8
     # Shared memory dir for vLLM ↔ FSDP weight hand-off (avoids NVMe bottleneck)
     weight_sync_tmp_dir: str = "/dev/shm/actor_weight_tmp"
+    # After first validation, keep the vLLM Ray actor alive and hot-reload weights
+    # from weight_sync_tmp_dir instead of kill + full engine init (~minutes saved).
+    vllm_reuse_validation_actor: bool = True
     # Resume: set to a checkpoint dir to continue training from that point
     resume_from_checkpoint: str = ""   # L5: e.g. "./checkpoints_actor_judge/step_000100"
 

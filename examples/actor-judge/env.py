@@ -66,7 +66,18 @@ def extract_answer(output: str) -> Optional[str]:
     """Extract text inside the first <answer>…</answer> block."""
     if not output:
         return None
-    matches = re.findall(r"<answer>(.*?)</answer>", output, re.DOTALL)
+    matches = re.findall(r"<answer>(.*?)</answer>", output, re.DOTALL | re.IGNORECASE)
+    if not matches:
+        return None
+    content = matches[0].strip()
+    return content if content else None
+
+
+def extract_strategy(output: str) -> Optional[str]:
+    """Extract text inside the first <strategy>…</strategy> block."""
+    if not output:
+        return None
+    matches = re.findall(r"<strategy>(.*?)</strategy>", output, re.DOTALL | re.IGNORECASE)
     if not matches:
         return None
     content = matches[0].strip()

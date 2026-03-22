@@ -86,7 +86,7 @@ from data_loader import (
 )
 from judge_model import JudgeModel, warmstart_judge_token_embedding
 from judge_trainer import JudgeTrainer
-from env import evaluate_detailed
+from env import evaluate_detailed, extract_answer, extract_strategy
 from judge_encode import encode_batch_for_judge
 from prompts import (
     apply_chat_template,
@@ -99,6 +99,9 @@ from prompts import (
     STRATEGY_OPEN,
 )
 from rollout_engine import RolloutEngine, VLLMActor
+
+# Persists across run_full_validation_vllm() calls when cfg.vllm_reuse_validation_actor.
+_validation_vllm_actor_handle: Optional[Any] = None
 
 _old_log_record_factory = logging.getLogRecordFactory()
 
@@ -442,6 +445,11 @@ def _log_val_items_wandb_table(pack: Dict[str, Any], key: str, step: int) -> Non
     rows: List[List[Any]] = []
     for sub, row in (pack.get("splits") or {}).items():
         for it in row.get("items") or []:
+            out = it.get("output") if isinstance(it.get("output"), dict) else {}
+            strat_prev = (out.get("strategy_extracted") or it.get("strategy_text") or "")[
+                :800
+            ]
+            ans_prev = (out.get("answer_extracted") or it.get("answer_text") or "")[:400]
             rows.append(
                 [
                     sub,
@@ -452,8 +460,8 @@ def _log_val_items_wandb_table(pack: Dict[str, Any], key: str, step: int) -> Non
                     it.get("judge_prob"),
                     it.get("v3_soft_score"),
                     (it.get("question") or "")[:500],
-                    (it.get("strategy_text") or "")[:800],
-                    (it.get("answer_text") or "")[:400],
+                    strat_prev,
+                    ans_prev,
                 ]
             )
     if not rows:
@@ -574,6 +582,8 @@ def _validate_split_pass1_vllm(
             correct += 1
         if cfg.val_save_item_details:
             p2 = idx_to_stage2_prompt.get(i, "")
+            strat_raw = s_texts[i]
+            ans_raw = answers[i]
             items.append(
                 {
                     "split": split_name,
@@ -584,8 +594,14 @@ def _validate_split_pass1_vllm(
                     "context_text": judge_rollout_context_text(sample.fewshot_examples),
                     "stage1_prompt": prompts1[i],
                     "stage2_prompt": p2,
-                    "strategy_text": s_texts[i],
-                    "answer_text": answers[i],
+                    "strategy_text": strat_raw,
+                    "answer_text": ans_raw,
+                    "output": {
+                        "strategy_raw": strat_raw,
+                        "strategy_extracted": extract_strategy(strat_raw) or "",
+                        "answer_raw": ans_raw,
+                        "answer_extracted": extract_answer(ans_raw) or "",
+                    },
                     "outcome": int(outcome),
                     "v3_soft_score": float(v3_soft),
                 }
@@ -614,6 +630,8 @@ def run_full_validation_vllm(
     global_step: int,
 ) -> Optional[Dict[str, Any]]:
     """vLLM Pass@1 on rank-0; JOA on all ranks (FSDP). Returns metrics dict on rank-0 only."""
+    global _validation_vllm_actor_handle
+
     split_results: Dict[str, Any] = {}
     pass_vals: List[float] = []
     all_items: List[Dict[str, Any]] = []
@@ -631,29 +649,80 @@ def run_full_validation_vllm(
 
     if accelerator.is_main_process:
         n_splits = len(cfg.val_subdirs)
+        reuse = bool(getattr(cfg, "vllm_reuse_validation_actor", True))
         logger.info(
-            "vLLM validation: TP=%d strat_tok=%d ans_tok=%d samples/split=%d (%d splits)",
+            "vLLM validation: TP=%d strat_tok=%d ans_tok=%d samples/split=%d (%d splits) "
+            "reuse_actor=%s",
             cfg.tensor_parallel_size,
             cfg.val_strategy_max_tokens,
             cfg.val_answer_max_tokens,
             cfg.val_num_samples,
             n_splits,
+            reuse,
         )
-        logger.info(
-            "[progress] Rank0: spawning vLLM Ray actor (TP=%d, model_path=%s). "
-            "GPUs will spike; first generate() loads the engine — long silence is normal.",
-            cfg.tensor_parallel_size,
-            model_path,
-        )
-        _flush_logging()
-        vllm_actor = VLLMActor.remote(
-            model_path,
-            tensor_parallel_size=cfg.tensor_parallel_size,
-            gpu_memory_utilization=cfg.gpu_memory_utilization,
-            enforce_eager=cfg.vllm_enforce_eager,
-        )
-        logger.info("[progress] Rank0: vLLM actor handle ready; running %d splits …", n_splits)
-        _flush_logging()
+
+        if not reuse and _validation_vllm_actor_handle is not None:
+            logger.info(
+                "[progress] Rank0: discarding reusable vLLM actor (reuse disabled) …",
+            )
+            _flush_logging()
+            try:
+                ray.get(_validation_vllm_actor_handle.shutdown.remote(), timeout=60)
+            except Exception:
+                pass
+            ray.kill(_validation_vllm_actor_handle)
+            _validation_vllm_actor_handle = None
+
+        vllm_actor = None
+        if reuse and _validation_vllm_actor_handle is not None:
+            try:
+                logger.info(
+                    "[progress] Rank0: hot-reloading vLLM weights from %s …",
+                    model_path,
+                )
+                _flush_logging()
+                ray.get(
+                    _validation_vllm_actor_handle.reload_weights.remote(model_path),
+                    timeout=7200,
+                )
+                vllm_actor = _validation_vllm_actor_handle
+                logger.info(
+                    "[progress] Rank0: vLLM hot-reload done; running %d splits …",
+                    n_splits,
+                )
+                _flush_logging()
+            except Exception as exc:
+                logger.warning(
+                    "vLLM hot-reload failed (%s); recreating engine.",
+                    exc,
+                    exc_info=True,
+                )
+                try:
+                    ray.get(_validation_vllm_actor_handle.shutdown.remote(), timeout=60)
+                except Exception:
+                    pass
+                ray.kill(_validation_vllm_actor_handle)
+                _validation_vllm_actor_handle = None
+
+        if vllm_actor is None:
+            logger.info(
+                "[progress] Rank0: spawning vLLM Ray actor (TP=%d, model_path=%s). "
+                "GPUs will spike; first generate() loads the engine — long silence is normal.",
+                cfg.tensor_parallel_size,
+                model_path,
+            )
+            _flush_logging()
+            vllm_actor = VLLMActor.remote(
+                model_path,
+                tensor_parallel_size=cfg.tensor_parallel_size,
+                gpu_memory_utilization=cfg.gpu_memory_utilization,
+                enforce_eager=cfg.vllm_enforce_eager,
+            )
+            if reuse:
+                _validation_vllm_actor_handle = vllm_actor
+            logger.info("[progress] Rank0: vLLM actor handle ready; running %d splits …", n_splits)
+            _flush_logging()
+
         try:
             for si, subdir in enumerate(cfg.val_subdirs):
                 logger.info(
@@ -679,13 +748,19 @@ def run_full_validation_vllm(
                 pass_vals.append(p1)
                 all_items.extend(items)
         finally:
-            logger.info("[progress] Rank0: tearing down vLLM validation actor.")
-            _flush_logging()
-            try:
-                ray.get(vllm_actor.shutdown.remote(), timeout=60)
-            except Exception:
-                pass
-            ray.kill(vllm_actor)
+            if reuse:
+                logger.info(
+                    "[progress] Rank0: keeping vLLM validation actor alive for reuse.",
+                )
+                _flush_logging()
+            else:
+                logger.info("[progress] Rank0: tearing down vLLM validation actor.")
+                _flush_logging()
+                try:
+                    ray.get(vllm_actor.shutdown.remote(), timeout=60)
+                except Exception:
+                    pass
+                ray.kill(vllm_actor)
 
         mean_p = sum(pass_vals) / max(len(pass_vals), 1)
         tot_n = sum(int(split_results[s].get("total", 0)) for s in split_results)
@@ -755,6 +830,26 @@ def run_full_validation_vllm(
         "val_save_item_details": cfg.val_save_item_details,
     }
     return pack
+
+
+def _shutdown_persistent_validation_vllm_actor() -> None:
+    """Release GPU memory from the reusable validation vLLM actor (rank 0 only)."""
+    global _validation_vllm_actor_handle
+    if _validation_vllm_actor_handle is None:
+        return
+    if not ray.is_initialized():
+        _validation_vllm_actor_handle = None
+        return
+    h = _validation_vllm_actor_handle
+    _validation_vllm_actor_handle = None
+    try:
+        ray.get(h.shutdown.remote(), timeout=60)
+    except Exception:
+        pass
+    try:
+        ray.kill(h)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1719,6 +1814,7 @@ def main(cfg: ActorJudgeConfig) -> None:
         accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
+        _shutdown_persistent_validation_vllm_actor()
         wandb.finish()
     logger.info("Training complete.")
 
@@ -1819,6 +1915,11 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="If >0, each val split uses only N samples (overrides --val_num_samples).",
+    )
+    parser.add_argument(
+        "--no_vllm_reuse_validation_actor",
+        action="store_true",
+        help="Tear down vLLM after each validation (disable hot-reload / reuse)",
     )
     parser.add_argument("--keep_last_k_checkpoints", type=int, default=2)
     parser.add_argument("--keep_best_k_checkpoints", type=int, default=2)
@@ -1923,6 +2024,7 @@ if __name__ == "__main__":
         max_stage1_prompt_tokens=args.max_stage1_prompt_tokens,
         dataset_stage1_reject_log=not args.no_dataset_stage1_reject_log,
         stage1_length_chars_per_token=args.stage1_length_chars_per_token,
+        vllm_reuse_validation_actor=not args.no_vllm_reuse_validation_actor,
     )
 
     main(cfg)
