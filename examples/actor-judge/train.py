@@ -137,6 +137,39 @@ def _flush_logging() -> None:
             stream.flush()
 
 
+def _safe_vllm_gpu_memory_utilization(cfg: ActorJudgeConfig) -> float:
+    """Cap ``gpu_memory_utilization`` so vLLM can start while FSDP still holds VRAM.
+
+    vLLM v1 checks ``free_mem >= gpu_memory_utilization * total_mem`` per GPU.
+    After Phase B, ``empty_cache()`` may still leave ~55 GiB free vs 59.5 GiB
+    requested at 0.75 — spawning a *new* engine then fails.  We take the
+    minimum free/total ratio across visible devices and cap the config value.
+    """
+    want = float(cfg.gpu_memory_utilization)
+    if not torch.cuda.is_available():
+        return want
+    ratios: List[float] = []
+    for d in range(torch.cuda.device_count()):
+        free_b, total_b = torch.cuda.mem_get_info(d)
+        if total_b > 0:
+            ratios.append(free_b / total_b)
+    if not ratios:
+        return want
+    cap = min(ratios) * 0.97
+    out = min(want, cap)
+    out = max(0.05, out)
+    if out + 1e-5 < want:
+        logger.info(
+            "vLLM gpu_memory_utilization capped %.4f → %.4f "
+            "(min free/total across %d GPUs ≈ %.4f)",
+            want,
+            out,
+            len(ratios),
+            min(ratios),
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Broadcast helper (Rank 0 → all ranks)
 # ---------------------------------------------------------------------------
@@ -712,10 +745,11 @@ def run_full_validation_vllm(
                 model_path,
             )
             _flush_logging()
+            _vllm_gmu = _safe_vllm_gpu_memory_utilization(cfg)
             vllm_actor = VLLMActor.remote(
                 model_path,
                 tensor_parallel_size=cfg.tensor_parallel_size,
-                gpu_memory_utilization=cfg.gpu_memory_utilization,
+                gpu_memory_utilization=_vllm_gmu,
                 enforce_eager=cfg.vllm_enforce_eager,
             )
             if reuse:
@@ -749,9 +783,18 @@ def run_full_validation_vllm(
                 all_items.extend(items)
         finally:
             if reuse:
-                logger.info(
-                    "[progress] Rank0: keeping vLLM validation actor alive for reuse.",
+                _will_judge_or_joa = (cfg.val_save_item_details and all_items) or (
+                    not cfg.freeze_judge and len(buffer) >= cfg.min_buffer_size
                 )
+                if _will_judge_or_joa:
+                    logger.info(
+                        "[progress] Rank0: vLLM splits done; actor will be released "
+                        "after broadcast before Judge/JOA (TP shares GPUs with FSDP).",
+                    )
+                else:
+                    logger.info(
+                        "[progress] Rank0: keeping vLLM validation actor alive for reuse.",
+                    )
                 _flush_logging()
             else:
                 logger.info("[progress] Rank0: tearing down vLLM validation actor.")
@@ -789,6 +832,23 @@ def run_full_validation_vllm(
         split_results = b["split_results"]
         mean_p = b["mean_pass_at_1"]
         all_items = b["all_items"]
+
+    # vLLM TP uses every GPU; FSDP Judge uses the same GPUs. If the reusable
+    # validation Ray actor is still up (~60 GiB/GPU from TP workers), all-rank
+    # Judge forward OOMs (e.g. rank 6: only ~600 MiB free). Release vLLM before
+    # any cross-rank Judge work; next Phase A / validation will spawn or reload.
+    _need_val_judge = bool(cfg.val_save_item_details and all_items)
+    _need_joa = bool(not cfg.freeze_judge and len(buffer) >= cfg.min_buffer_size)
+    if _need_val_judge or _need_joa:
+        if accelerator.is_main_process:
+            logger.info(
+                "[progress] Rank0: shutting down vLLM validation actor before "
+                "Judge/JOA — FSDP shares GPUs with vLLM TP workers …",
+            )
+            _flush_logging()
+            _shutdown_persistent_validation_vllm_actor()
+        accelerator.wait_for_everyone()
+        torch.cuda.empty_cache()
 
     if cfg.val_save_item_details and all_items:
         logger.info(
@@ -1549,12 +1609,48 @@ def main(cfg: ActorJudgeConfig) -> None:
                 n_roll_batches,
             )
             _flush_logging()
-            vllm_actor = VLLMActor.remote(
-                current_model_path,
-                tensor_parallel_size=cfg.tensor_parallel_size,
-                gpu_memory_utilization=cfg.gpu_memory_utilization,
-                enforce_eager=cfg.vllm_enforce_eager,
-            )
+            # If baseline/step validation kept a reusable vLLM actor, Phase A must NOT
+            # spawn a second engine — two TP=8 vLLMs exceed GPU memory (~10 GiB free vs
+            # ~59 GiB desired). Reuse the validation actor and reload weights.
+            global _validation_vllm_actor_handle
+            rollout_reused_validation_actor = False
+            vllm_actor = None
+            if (
+                bool(getattr(cfg, "vllm_reuse_validation_actor", True))
+                and _validation_vllm_actor_handle is not None
+            ):
+                try:
+                    logger.info(
+                        "[progress] Phase A: reusing validation vLLM actor "
+                        "(reload from %s) — avoids a second 8-GPU engine.",
+                        current_model_path,
+                    )
+                    _flush_logging()
+                    ray.get(
+                        _validation_vllm_actor_handle.reload_weights.remote(
+                            current_model_path
+                        ),
+                        timeout=7200,
+                    )
+                    vllm_actor = _validation_vllm_actor_handle
+                    rollout_reused_validation_actor = True
+                except Exception as exc:
+                    logger.warning(
+                        "Phase A: validation vLLM reuse failed (%s); "
+                        "tearing down old actor and spawning a fresh engine.",
+                        exc,
+                        exc_info=True,
+                    )
+                    _shutdown_persistent_validation_vllm_actor()
+                    vllm_actor = None
+            if vllm_actor is None:
+                _vllm_gmu = _safe_vllm_gpu_memory_utilization(cfg)
+                vllm_actor = VLLMActor.remote(
+                    current_model_path,
+                    tensor_parallel_size=cfg.tensor_parallel_size,
+                    gpu_memory_utilization=_vllm_gmu,
+                    enforce_eager=cfg.vllm_enforce_eager,
+                )
             for rollout_step, batch in enumerate(train_loader):
                 logger.info(
                     "[progress] Phase A: rollout batch %d/%d (%d questions) …",
@@ -1575,6 +1671,8 @@ def main(cfg: ActorJudgeConfig) -> None:
             except Exception:
                 pass
             ray.kill(vllm_actor)
+            if rollout_reused_validation_actor:
+                _validation_vllm_actor_handle = None
             del vllm_actor
 
             # Wait for vLLM TP-worker processes to fully exit and release GPU memory.
