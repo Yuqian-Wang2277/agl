@@ -53,6 +53,14 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 
+def _flush_logging() -> None:
+    for h in logging.root.handlers:
+        h.flush()
+        stream = getattr(h, "stream", None)
+        if stream is not None and hasattr(stream, "flush"):
+            stream.flush()
+
+
 # ---------------------------------------------------------------------------
 # Ray Actor (P2: num_gpus=0 — let vLLM own the hardware via tensor_parallel_size)
 # ---------------------------------------------------------------------------
@@ -73,13 +81,40 @@ class VLLMActor:
         model_path: str,
         tensor_parallel_size: int = 8,
         gpu_memory_utilization: float = 0.75,  # P3: ≤0.75
+        enforce_eager: bool = True,
     ) -> None:
+        import os
+        # Clear torchrun/FSDP distributed env vars inherited from rank-0 process.
+        #
+        # CRITICAL: TORCHELASTIC_USE_AGENT_STORE=True (set by torchrun) is the
+        # primary culprit. When True, _torchelastic_use_agent_store() in PyTorch's
+        # rendezvous.py returns True and ALL vLLM TP workers create TCPStore
+        # CLIENTS (is_master=False), including rank 0. Since nobody creates the
+        # server, all 8 workers wait 600 s and time out simultaneously.
+        #   (symptom: "TCP client failed to connect to :37041, try=1, timeout=600s")
+        #
+        # The other vars prevent vLLM's EngineCore from accidentally joining the
+        # FSDP process group (would get rejected → EngineCore crash → same symptom).
+        for _var in (
+            "RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+            "TORCHELASTIC_USE_AGENT_STORE",   # <-- the root cause of this bug
+            "TORCHELASTIC_RESTART_COUNT", "TORCHELASTIC_MAX_RESTARTS",
+            "TORCHELASTIC_RUN_ID",
+        ):
+            os.environ.pop(_var, None)
+
         self.llm = LLM(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             enable_prefix_caching=True,   # M5: few-shot context is shared → big speedup
             trust_remote_code=True,
+            # Disable CUDA Graph capture and torch.compile (level-3 inductor).
+            # Without this, vLLM v0.10+ compiles 67 CUDA graph sizes on first
+            # run, producing no log output for 30-90 minutes (looks like a hang).
+            # enforce_eager=True reduces startup from ~60 min to ~1 min; the
+            # throughput cost is negligible for RL rollout batch sizes.
+            enforce_eager=enforce_eager,
         )
 
     def generate(
@@ -90,6 +125,36 @@ class VLLMActor:
         """Run batched generation and return plain text outputs."""
         outputs = self.llm.generate(prompts, sampling_params)
         return [o.outputs[0].text for o in outputs]
+
+    def shutdown(self) -> None:
+        """Gracefully shut down vLLM and release GPU memory.
+
+        ray.kill() sends SIGKILL to this Ray worker process, which prevents
+        Python's weakref.finalize from running.  That finalizer is the only
+        mechanism that terminates the EngineCore child process and its 8 TP
+        worker daemons.  Without it, those processes survive as orphans and
+        continue to hold ~60 GiB per GPU (gpu_memory_utilization fraction),
+        leaving no room for subsequent FSDP training → OOM.
+
+        Calling this method explicitly before ray.kill() walks the vLLM
+        object graph and calls the EngineCore's own shutdown(), which sends
+        SIGTERM+SIGKILL to each EngineCore process.  The TP worker daemons
+        exit automatically when their EngineCore parent exits.
+        """
+        import gc
+        if not (hasattr(self, 'llm') and self.llm is not None):
+            return
+        try:
+            engine = getattr(self.llm, 'llm_engine', None)
+            if engine is not None:
+                engine_core = getattr(engine, 'engine_core', None)
+                if engine_core is not None and hasattr(engine_core, 'shutdown'):
+                    engine_core.shutdown()
+        except Exception:
+            pass
+        del self.llm
+        self.llm = None
+        gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +213,20 @@ class RolloutEngine:
             # the Actor model inside actor_trainer for perfect token alignment.
         )
 
+        logger.info(
+            "[progress] Rollout step %d: Stage-1 vLLM (%d prompts = B=%d×K=%d, max_tokens=%d) …",
+            global_step,
+            len(stage1_prompts),
+            B,
+            K,
+            self.cfg.strategy_max_tokens,
+        )
+        _flush_logging()
         stage1_texts_raw: List[str] = ray.get(
             vllm_actor.generate.remote(stage1_prompts, sp_strategy)
         )
+        logger.info("[progress] Rollout step %d: Stage-1 done.", global_step)
+        _flush_logging()
 
         # Manually append the stop word (vLLM strips it from the output)
         stage1_texts = [t + STRATEGY_CLOSE for t in stage1_texts_raw]
@@ -179,12 +255,26 @@ class RolloutEngine:
         )
 
         if stage2_prompts:
+            logger.info(
+                "[progress] Rollout step %d: Stage-2 vLLM (%d answer prompts, max_tokens=%d) …",
+                global_step,
+                len(stage2_prompts),
+                self.cfg.answer_max_tokens,
+            )
+            _flush_logging()
             stage2_texts_raw: List[str] = ray.get(
                 vllm_actor.generate.remote(stage2_prompts, sp_answer)
             )
             stage2_texts = [t + "</answer>" for t in stage2_texts_raw]
+            logger.info("[progress] Rollout step %d: Stage-2 done.", global_step)
+            _flush_logging()
         else:
             stage2_texts = []
+            logger.info(
+                "[progress] Rollout step %d: Stage-2 skipped (no format-valid strategies).",
+                global_step,
+            )
+            _flush_logging()
 
         # Map back to (b_idx, k_idx) → answer text
         answer_map: Dict[Tuple[int, int], str] = {}

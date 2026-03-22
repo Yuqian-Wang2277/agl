@@ -76,6 +76,9 @@ class JudgeModel(nn.Module):
         torch.cuda.empty_cache()
 
         judge = cls(backbone, hidden_size)
+        # scalar_head defaults to float32; backbone is torch_dtype (e.g. bf16).
+        # FSDP requires uniform dtype within a flat param group — match the backbone.
+        judge.scalar_head.to(dtype=torch_dtype)
         logger.info(
             "JudgeModel created: hidden_size=%d, scalar_head=%s",
             hidden_size, judge.scalar_head,

@@ -60,6 +60,7 @@ import os
 import random
 import shutil
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -99,11 +100,38 @@ from prompts import (
 )
 from rollout_engine import RolloutEngine, VLLMActor
 
-logger = logging.getLogger(__name__)
+_old_log_record_factory = logging.getLogRecordFactory()
+
+
+def _log_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    record = _old_log_record_factory(*args, **kwargs)
+    rank = os.environ.get("RANK", "")
+    local = os.environ.get("LOCAL_RANK", "")
+    pid = os.getpid()
+    if rank == "" and local == "":
+        record.proc = f"pid={pid}"
+    else:
+        record.proc = f"rank={rank or '?'} local={local or '?'} pid={pid}"
+    return record
+
+
+logging.setLogRecordFactory(_log_record_factory)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(proc)s | %(levelname)s | %(name)s | %(message)s",
+    force=True,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _flush_logging() -> None:
+    """Force stderr flush so progress lines appear immediately under nohup/pipes."""
+    for h in logging.root.handlers:
+        h.flush()
+        stream = getattr(h, "stream", None)
+        if stream is not None and hasattr(stream, "flush"):
+            stream.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -151,17 +179,19 @@ def resolve_judge_checkpoint_file(path: str) -> Path:
     )
 
 
-def load_judge_weights_only(
-    judge: torch.nn.Module, accelerator: Accelerator, ckpt_path: str
-) -> None:
-    """Load Judge parameters only (no optimizer). For reuse / resume distinction."""
+def load_judge_weights_only(judge: torch.nn.Module, ckpt_path: str) -> None:
+    """Load Judge parameters only (no optimizer). For ``judge_warmup_mode=reuse``.
+
+    Must run **before** ``accelerator.prepare(judge)``.  After FSDP, parameters are
+    flattened shards; ``load_state_dict`` with a normal ``judge_model.pt`` then
+    fails with size mismatches on ``embed_tokens`` / ``scalar_head``.
+    """
     path = resolve_judge_checkpoint_file(ckpt_path)
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         state = torch.load(path, map_location="cpu")
-    unwrapped = accelerator.unwrap_model(judge)
-    missing, unexpected = unwrapped.load_state_dict(state, strict=False)
+    missing, unexpected = judge.load_state_dict(state, strict=False)
     logger.info(
         "Loaded Judge weights from %s (strict=False; missing=%d unexpected=%d)",
         path,
@@ -182,13 +212,19 @@ def save_judge_warmup_weights(
     out_dir: Path,
     meta: Optional[dict] = None,
 ) -> None:
+    """Save Judge weights after warmup.
+
+    FSDP fix: state_dict() is a collective all-gather; all ranks must call
+    accelerator.get_state_dict() before rank 0 writes to disk.
+    """
     out_dir = Path(out_dir)
+
+    # All ranks participate in the FSDP all-gather collective.
+    judge_state_dict = accelerator.get_state_dict(judge)
+
     if accelerator.is_main_process:
         out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            accelerator.unwrap_model(judge).state_dict(),
-            out_dir / "judge_model.pt",
-        )
+        torch.save(judge_state_dict, out_dir / "judge_model.pt")
         payload = {"kind": "judge_warmup", "weights_only": True}
         if meta:
             payload.update(meta)
@@ -363,7 +399,12 @@ def _attach_judge_scores_to_val_items(
             for k, v in encode_batch_for_judge(tokenizer, bodies, jmax).items()
         }
         with torch.no_grad():
-            logits = judge_u(**enc).float().reshape(-1)
+            # Must use the FSDP-wrapped `judge`, not the unwrapped `judge_u`.
+            # With FULL_SHARD (ZeRO-3), parameters are stored as 1-D flat tensors.
+            # FSDP's forward hook all-gathers them to their original shapes before
+            # the actual computation. Calling `judge_u` (unwrapped) bypasses this
+            # hook → embed_tokens.weight stays 1-D → "weight must be 2-D" error.
+            logits = judge(**enc).float().reshape(-1)
         probs = torch.sigmoid(logits).cpu().tolist()
         log_list = logits.cpu().tolist()
         for j, it in enumerate(chunk):
@@ -475,8 +516,17 @@ def _validate_split_pass1_vllm(
         max_tokens=cfg.val_strategy_max_tokens,
         stop=[STRATEGY_CLOSE],
     )
+    logger.info(
+        "[progress] val split=%s Stage-1 vLLM: %d strategy prompts (max_tokens=%d) …",
+        split_name,
+        n,
+        cfg.val_strategy_max_tokens,
+    )
+    _flush_logging()
     raw1 = ray.get(vllm_actor.generate.remote(prompts1, sp1))
     s_texts = [t + STRATEGY_CLOSE for t in raw1]
+    logger.info("[progress] val split=%s Stage-1 done.", split_name)
+    _flush_logging()
 
     prompts2: List[str] = []
     idx2: List[int] = []
@@ -495,10 +545,22 @@ def _validate_split_pass1_vllm(
     answers: List[str] = [""] * n
     idx_to_stage2_prompt: Dict[int, str] = {}
     if prompts2:
+        logger.info(
+            "[progress] val split=%s Stage-2 vLLM: %d answer prompts (max_tokens=%d) …",
+            split_name,
+            len(prompts2),
+            cfg.val_answer_max_tokens,
+        )
+        _flush_logging()
         raw2 = ray.get(vllm_actor.generate.remote(prompts2, sp2))
         for j, i in enumerate(idx2):
             answers[i] = raw2[j] + "</answer>"
             idx_to_stage2_prompt[i] = prompts2[j]
+        logger.info("[progress] val split=%s Stage-2 done. Scoring outcomes…", split_name)
+        _flush_logging()
+    else:
+        logger.info("[progress] val split=%s: no valid strategies for Stage-2.", split_name)
+        _flush_logging()
 
     items: List[Dict[str, Any]] = []
     correct = 0
@@ -558,21 +620,49 @@ def run_full_validation_vllm(
     mean_p = 0.0
     mean_v3_all = 0.0
 
-    if accelerator.is_main_process:
+    if not accelerator.is_main_process:
         logger.info(
-            "vLLM validation: TP=%d strat_tok=%d ans_tok=%d samples/split=%d",
+            "[progress] Validation (epoch=%s step=%s): this rank blocked until rank0 "
+            "finishes vLLM — GPU idle here is normal.",
+            epoch,
+            global_step,
+        )
+        _flush_logging()
+
+    if accelerator.is_main_process:
+        n_splits = len(cfg.val_subdirs)
+        logger.info(
+            "vLLM validation: TP=%d strat_tok=%d ans_tok=%d samples/split=%d (%d splits)",
             cfg.tensor_parallel_size,
             cfg.val_strategy_max_tokens,
             cfg.val_answer_max_tokens,
             cfg.val_num_samples,
+            n_splits,
         )
+        logger.info(
+            "[progress] Rank0: spawning vLLM Ray actor (TP=%d, model_path=%s). "
+            "GPUs will spike; first generate() loads the engine — long silence is normal.",
+            cfg.tensor_parallel_size,
+            model_path,
+        )
+        _flush_logging()
         vllm_actor = VLLMActor.remote(
             model_path,
             tensor_parallel_size=cfg.tensor_parallel_size,
             gpu_memory_utilization=cfg.gpu_memory_utilization,
+            enforce_eager=cfg.vllm_enforce_eager,
         )
+        logger.info("[progress] Rank0: vLLM actor handle ready; running %d splits …", n_splits)
+        _flush_logging()
         try:
-            for subdir in cfg.val_subdirs:
+            for si, subdir in enumerate(cfg.val_subdirs):
+                logger.info(
+                    "[progress] Rank0: validation split %d/%d — loading %r …",
+                    si + 1,
+                    n_splits,
+                    subdir,
+                )
+                _flush_logging()
                 val_ds = load_val_dataset(cfg, subdir, tokenizer=tokenizer)
                 p1, c, n, items, mean_v3 = _validate_split_pass1_vllm(
                     tokenizer, cfg, vllm_actor, val_ds, subdir
@@ -589,6 +679,12 @@ def run_full_validation_vllm(
                 pass_vals.append(p1)
                 all_items.extend(items)
         finally:
+            logger.info("[progress] Rank0: tearing down vLLM validation actor.")
+            _flush_logging()
+            try:
+                ray.get(vllm_actor.shutdown.remote(), timeout=60)
+            except Exception:
+                pass
             ray.kill(vllm_actor)
 
         mean_p = sum(pass_vals) / max(len(pass_vals), 1)
@@ -620,6 +716,11 @@ def run_full_validation_vllm(
         all_items = b["all_items"]
 
     if cfg.val_save_item_details and all_items:
+        logger.info(
+            "[progress] All ranks: Judge scoring %d validation items (FSDP forward) …",
+            len(all_items),
+        )
+        _flush_logging()
         _attach_judge_scores_to_val_items(
             all_items,
             judge,
@@ -629,6 +730,8 @@ def run_full_validation_vllm(
             cfg.freeze_judge,
             cfg.judge_max_length,
         )
+        logger.info("[progress] Judge scoring of val items finished.")
+        _flush_logging()
 
     accelerator.wait_for_everyone()
 
@@ -720,14 +823,49 @@ def save_actor_for_vllm(
     """Save the FSDP-wrapped Actor as HuggingFace safetensors for vLLM reload.
 
     S5 fix: also saves the tokenizer (which has <|judge|> added).
+
+    FSDP fix: state_dict() under FSDP ZeRO-3 is a collective all-gather that
+    requires ALL ranks to call it simultaneously.  The previous code called
+    save_pretrained() inside ``if is_main_process:`` which left ranks 1-7 at
+    wait_for_everyone() (Gloo barrier) while rank 0 was stuck in the NCCL
+    all-gather → deadlock.  Fix: call accelerator.get_state_dict() on ALL ranks
+    first (collective), then only rank 0 writes to disk.
     """
+    if accelerator.is_main_process:
+        logger.info(
+            "[progress] Rank0: gathering FSDP Actor shards + writing → %s (can take minutes) …",
+            out_dir,
+        )
+    else:
+        logger.info(
+            "[progress] Rank%s: participating in FSDP all-gather for Actor save → %s",
+            os.environ.get("RANK", "?"),
+            out_dir,
+        )
+    _flush_logging()
+    t0 = time.perf_counter()
+
+    # All ranks must participate in the FSDP all-gather collective.
+    # get_state_dict() returns the full state dict on rank 0, empty on others.
+    state_dict = accelerator.get_state_dict(actor)
+
     if accelerator.is_main_process:
         os.makedirs(out_dir, exist_ok=True)
         accelerator.unwrap_model(actor).save_pretrained(
-            out_dir, safe_serialization=True
+            out_dir,
+            is_main_process=True,
+            save_function=accelerator.save,
+            state_dict=state_dict,
+            safe_serialization=True,
         )
         tokenizer.save_pretrained(out_dir)   # S5 fix: save tokenizer with new vocab
+        logger.info(
+            "[progress] Rank0: Actor+tokenizer on disk in %.1fs — %s",
+            time.perf_counter() - t0,
+            out_dir,
+        )
         logger.info("Saved Actor + tokenizer to %s for vLLM reload.", out_dir)
+    _flush_logging()
     accelerator.wait_for_everyone()
 
 
@@ -748,19 +886,31 @@ def save_checkpoint(
     eval_results: Optional[Dict[str, Any]] = None,
     ckpt_subdir: Optional[str] = None,
 ) -> None:
-    """Save full training state for potential resume."""
+    """Save full training state for potential resume.
+
+    FSDP fix: state_dict() under FSDP ZeRO-3 is a collective all-gather.
+    All ranks must call accelerator.get_state_dict() simultaneously before
+    rank 0 writes anything to disk.
+    """
     sub = ckpt_subdir if ckpt_subdir else f"epoch_{epoch:03d}"
     ckpt_dir = os.path.join(cfg.checkpoint_dir, sub)
+
+    # All ranks participate in the FSDP all-gather collectives.
+    actor_state_dict = accelerator.get_state_dict(actor)
+    judge_state_dict = accelerator.get_state_dict(judge)
+
     if accelerator.is_main_process:
         os.makedirs(ckpt_dir, exist_ok=True)
         # Actor weights
-        accelerator.unwrap_model(actor).save_pretrained(ckpt_dir)
+        accelerator.unwrap_model(actor).save_pretrained(
+            ckpt_dir,
+            is_main_process=True,
+            save_function=accelerator.save,
+            state_dict=actor_state_dict,
+        )
         tokenizer.save_pretrained(ckpt_dir)
         # S5 fix: Judge weights
-        torch.save(
-            accelerator.unwrap_model(judge).state_dict(),
-            os.path.join(ckpt_dir, "judge_model.pt"),
-        )
+        torch.save(judge_state_dict, os.path.join(ckpt_dir, "judge_model.pt"))
         # Optimizer + scheduler states (for resume)
         torch.save(
             actor_trainer.optimizer.state_dict(),
@@ -857,6 +1007,27 @@ def main(cfg: ActorJudgeConfig) -> None:
     judge.transformer.resize_token_embeddings(len(tokenizer))
     warmstart_judge_token_embedding(judge, tokenizer, source_token="<|im_end|>")
 
+    # Reuse: load ``judge_model.pt`` here, not after ``prepare`` — FSDP flattens
+    # weights so ``load_state_dict`` no longer matches logical shapes.
+    if effective_judge_warmup_mode(cfg) == "reuse":
+        load_judge_weights_only(judge, cfg.judge_init_checkpoint.strip())
+        logger.info(
+            "Judge reuse: warmup weights applied before FSDP (from %s).",
+            cfg.judge_init_checkpoint.strip(),
+        )
+
+    # ── Gradient checkpointing (must be before accelerator.prepare / FSDP) ────
+    # Without this, storing activations for all 36 layers at batch=16, seq=8192
+    # costs ~100+ GiB per GPU → OOM.  Gradient checkpointing recomputes activations
+    # layer-by-layer during backward instead of caching them, reducing activation
+    # memory from O(layers) to O(1) at a ~33% FLOPs overhead.
+    # use_reentrant=False is required for FSDP compatibility.
+    _gc_kwargs = {"gradient_checkpointing_kwargs": {"use_reentrant": False}}
+    actor.gradient_checkpointing_enable(**_gc_kwargs)
+    # JudgeModel is a plain nn.Module wrapping a HF transformer backbone; gradient
+    # checkpointing must be enabled on the inner transformer, not the wrapper.
+    judge.transformer.gradient_checkpointing_enable(**_gc_kwargs)
+
     # ── Accelerate FSDP distribution ─────────────────────────────────────────
     # P5: ALL three models must be prepared to avoid per-rank full copies (64 GB waste).
     actor, ref_model, judge = (
@@ -922,9 +1093,8 @@ def main(cfg: ActorJudgeConfig) -> None:
         )
 
     if warm_mode == "reuse":
-        load_judge_weights_only(judge, accelerator, cfg.judge_init_checkpoint.strip())
         judge_trainer.rebuild_optimizer_for_phase2()
-        logger.info("Judge reuse: loaded weights, Phase II optimizer reset.")
+        logger.info("Judge reuse: Phase II optimizer reset (weights loaded pre-FSDP).")
 
     elif warm_mode == "cold":
         logger.info("Judge cold start: no warmup weights loaded.")
@@ -1175,8 +1345,26 @@ def main(cfg: ActorJudgeConfig) -> None:
     accelerator.wait_for_everyone()
 
     # ── Ray init ─────────────────────────────────────────────────────────────
-    if not ray.is_initialized():
+    # IMPORTANT: only rank 0 needs Ray (it is the only one that creates the
+    # VLLMActor).  If every rank called ray.init() we would end up with 8
+    # independent local Ray clusters on the same machine, each occupying
+    # dozens of internal ports.  When vLLM's EngineCore later probes for a
+    # "free" port for its TCPStore coordinator it collides with one of those
+    # Ray-cluster ports → EngineCore cannot bind → TCPStore server never
+    # starts → all 8 TP workers time-out ("TCP client failed to connect to
+    # :52031" / ":44789").  One Ray cluster (rank 0 only) eliminates this.
+    if accelerator.is_main_process and not ray.is_initialized():
+        logger.info("[progress] Initializing Ray on rank 0 only …")
+        _flush_logging()
+        # Prevent Ray from overriding CUDA_VISIBLE_DEVICES when num_gpus=0.
+        os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
         ray.init(ignore_reinit_error=True)
+    if accelerator.is_main_process:
+        logger.info(
+            "[progress] Next: sync FSDP Actor weights to disk → vLLM validation / rollouts. "
+            "Heavy GPU use with sparse console output is expected."
+        )
+        _flush_logging()
 
     current_model_path = cfg.start_model_path
     # M4 fix: bounded deque instead of unbounded list (avoids memory growth over
@@ -1191,6 +1379,9 @@ def main(cfg: ActorJudgeConfig) -> None:
 
     # Baseline strict Pass@1 (+ fail-fast) before any RL epoch
     if cfg.val_before_train and start_epoch == 0:
+        if accelerator.is_main_process:
+            logger.info("[progress] Baseline vLLM validation (before training) starting …")
+            _flush_logging()
         base_pack = run_full_validation_vllm(
             tokenizer,
             cfg,
@@ -1257,13 +1448,26 @@ def main(cfg: ActorJudgeConfig) -> None:
         epoch_experiences: List = []
 
         if accelerator.is_main_process:
-            logger.info("Phase A: starting vLLM rollout ...")
+            n_roll_batches = len(train_loader)
+            logger.info(
+                "Phase A: starting vLLM rollout (%d batches in train_loader) …",
+                n_roll_batches,
+            )
+            _flush_logging()
             vllm_actor = VLLMActor.remote(
                 current_model_path,
                 tensor_parallel_size=cfg.tensor_parallel_size,
                 gpu_memory_utilization=cfg.gpu_memory_utilization,
+                enforce_eager=cfg.vllm_enforce_eager,
             )
             for rollout_step, batch in enumerate(train_loader):
+                logger.info(
+                    "[progress] Phase A: rollout batch %d/%d (%d questions) …",
+                    rollout_step + 1,
+                    n_roll_batches,
+                    len(batch),
+                )
+                _flush_logging()
                 exps = rollout_engine.run(batch, vllm_actor, epoch * steps_per_epoch + rollout_step)
                 epoch_experiences.extend(exps)
 
@@ -1271,8 +1475,41 @@ def main(cfg: ActorJudgeConfig) -> None:
                 "Phase A done: %d experiences collected. Killing vLLM ...",
                 len(epoch_experiences),
             )
+            try:
+                ray.get(vllm_actor.shutdown.remote(), timeout=60)
+            except Exception:
+                pass
             ray.kill(vllm_actor)
             del vllm_actor
+
+            # Wait for vLLM TP-worker processes to fully exit and release GPU memory.
+            # ray.kill() sends SIGKILL to VLLMActor; its child TP-worker processes
+            # detect parent death and begin their own CUDA cleanup asynchronously.
+            # Without this wait, Phase B starts while TP workers still hold ~60 GiB,
+            # leaving only ~3.7 GiB free and causing OOM in actor_trainer.
+            # We poll mem_get_info() on this rank's GPU; once free memory exceeds
+            # 50 GiB we know the TP workers have released the KV-cache allocation.
+            _vllm_free_threshold = 50 * 1024 ** 3   # 50 GiB
+            _vllm_wait_deadline  = time.time() + 120  # max 2 min
+            _cur_dev = torch.cuda.current_device()
+            while time.time() < _vllm_wait_deadline:
+                _free, _ = torch.cuda.mem_get_info(_cur_dev)
+                if _free >= _vllm_free_threshold:
+                    break
+                logger.info(
+                    "[progress] Waiting for vLLM GPU memory release … "
+                    "free=%.1f GiB (need >50 GiB)",
+                    _free / 1024 ** 3,
+                )
+                _flush_logging()
+                time.sleep(3)
+            torch.cuda.empty_cache()
+        else:
+            logger.info(
+                "[progress] Phase A: rank%s idle at barrier while rank0 runs vLLM rollout …",
+                os.environ.get("RANK", "?"),
+            )
+            _flush_logging()
 
         # All ranks sync; wait for vLLM GPU memory to be released
         accelerator.wait_for_everyone()
@@ -1281,6 +1518,9 @@ def main(cfg: ActorJudgeConfig) -> None:
         # ── Broadcast all epoch experiences to non-rank-0 processes ──────────
         # C5 fix: guard with num_processes > 1 (single-GPU debug has no dist)
         if accelerator.num_processes > 1:
+            if not accelerator.is_main_process:
+                logger.info("[progress] Waiting for rollout experience broadcast from rank0 …")
+                _flush_logging()
             epoch_experiences = broadcast_object_list_from_rank0(epoch_experiences, accelerator)
         # else: single-GPU, epoch_experiences already populated on rank 0
 
@@ -1307,9 +1547,24 @@ def main(cfg: ActorJudgeConfig) -> None:
         epoch_actor_loss = 0.0
         epoch_judge_loss = 0.0
 
-        for batch_exps in experience_batches:
+        n_pb = len(experience_batches)
+        for bi, batch_exps in enumerate(experience_batches):
             global_step += 1
             eval_pack_step: Optional[Dict[str, Any]] = None
+            if (
+                n_pb <= 64
+                or global_step % 25 == 0
+                or bi == 0
+                or bi == n_pb - 1
+            ):
+                logger.info(
+                    "[progress] Phase B: global_step=%d (batch %d/%d in epoch, %d experiences)",
+                    global_step,
+                    bi + 1,
+                    n_pb,
+                    len(batch_exps),
+                )
+                _flush_logging()
 
             # Step 2: Judge update (OFF-POLICY, uses buffer history)
             judge_loss = 0.0
@@ -1341,9 +1596,21 @@ def main(cfg: ActorJudgeConfig) -> None:
             # ── Step-level validation + checkpoint (replaces epoch-based val_freq) ──
             if cfg.val_steps > 0 and global_step % cfg.val_steps == 0:
                 if accelerator.is_main_process:
+                    logger.info(
+                        "[progress] Step %d: re-sync weights + full vLLM validation + checkpoint …",
+                        global_step,
+                    )
                     logger.info("[Step %d] Running vLLM validation ...", global_step)
+                    _flush_logging()
                 save_actor_for_vllm(actor, tokenizer, accelerator, cfg.weight_sync_tmp_dir)
                 current_model_path = cfg.weight_sync_tmp_dir
+                # Release PyTorch CUDA allocator cache on ALL ranks before vLLM starts.
+                # During training, PyTorch accumulates ~48 GiB of "reserved but unallocated"
+                # memory in its cache.  The GPU driver sees this as in-use, so the
+                # validation vLLM actor (which needs 59 GiB) fails with "not enough free
+                # memory".  empty_cache() returns the cache to the driver without affecting
+                # any live tensors, restoring ~48 GiB of free GPU memory per rank.
+                torch.cuda.empty_cache()
                 accelerator.wait_for_everyone()
                 eval_pack_step = run_full_validation_vllm(
                     tokenizer,

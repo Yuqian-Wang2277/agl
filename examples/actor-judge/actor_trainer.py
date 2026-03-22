@@ -290,48 +290,15 @@ class ActorTrainer:
         valid_exps = valid_exps[: n_groups * K]
         BK = len(valid_exps)
 
-        # ── Tokenise ─────────────────────────────────────────────────────
-        amax = int(getattr(self.cfg, "actor_max_length", 8192))
-        input_ids, attn_mask, action_mask, _ = tokenise_strategy_batch(
-            valid_exps,
-            self.tok,
-            model_max_length=amax,
-            accel=self.accel,
-        )
-        input_ids   = input_ids.to(device)
-        attn_mask   = attn_mask.to(device)
-        action_mask = action_mask.to(device)
-
-        # ── P1: compute log_prob_old BEFORE any gradient update ──────────
-        # Actor weights are unchanged at this point.
-        # C2 fix: use self.actor (FSDP-wrapped) directly — NOT unwrap_model().
-        # Under FSDP ZeRO-3, unwrap_model() gives only the local parameter shard.
-        self.actor.eval()
-        with torch.no_grad():
-            log_prob_old = compute_log_probs(
-                self.actor,    # C2 fix: FSDP model, not unwrap_model(self.actor)
-                input_ids, attn_mask, action_mask,
-            )   # [BK], no grad
-        log_prob_old = log_prob_old.detach()
-        self.actor.train()
-
-        # ── ref_model forward (KL baseline, also no grad) ────────────────
-        # C2 fix: use self.ref directly (FSDP-wrapped), not unwrap_model().
-        # P5: ref_model must be accelerator.prepare()'d before being passed in.
-        with torch.no_grad():
-            log_prob_ref = compute_log_probs(
-                self.ref,      # C2 fix
-                input_ids, attn_mask, action_mask,
-            )   # [BK]
-        log_prob_ref = log_prob_ref.detach()
-
-        # ── Judge dense reward ────────────────────────────────────────────
-        alpha = self.cfg.dense_reward_alpha
+        # ── Judge dense reward (computed over ALL experiences for correct Z-score) ──
+        # _get_judge_scores returns [BK] scalars — no large logit tensor, no OOM.
+        # All FSDP ranks must call this together (FSDP all-gather is collective).
+        alpha   = self.cfg.dense_reward_alpha
         v_judge = torch.zeros(BK, device=device)
         if alpha > 0.0:
             v_judge = self._get_judge_scores(valid_exps, judge_model, device)
 
-        # ── Outcomes & length penalties ───────────────────────────────────
+        # ── Outcomes & length penalties for ALL experiences ───────────────────────
         outcomes = torch.tensor(
             [e.outcome for e in valid_exps], dtype=torch.float, device=device
         )
@@ -345,30 +312,96 @@ class ActorTrainer:
             device=device,
         )
 
-        # ── Advantage (S3 fix: no KL in advantage) ───────────────────────
+        # ── Advantage (S3 fix: no KL in advantage, Z-score over full batch) ──────
         with torch.no_grad():
             reward_adv = compute_advantage_reward(
                 outcomes.long(), v_judge.detach(), len_penalties, alpha=alpha
             )   # [BK], no grad
 
-        # ── Z-Score normalisation within each group of K ──────────────────
+        # ── Z-Score normalisation within each group of K ──────────────────────────
         # M3: short-circuit when std < 1e-4 (all-same rewards → no info)
-        reward_bk = reward_adv.view(n_groups, K)   # [B_eff, K]
+        reward_bk = reward_adv.view(n_groups, K)   # [n_groups, K]
         mean_k    = reward_bk.mean(dim=1, keepdim=True)
         std_k     = reward_bk.std(dim=1, keepdim=True)
 
-        mask_valid_std = (std_k > 1e-4).float()
-        advantage = ((reward_bk - mean_k) / (std_k + 1e-8)) * mask_valid_std
-        advantage_flat = advantage.view(BK).detach()   # [BK], no grad
+        mask_valid_std   = (std_k > 1e-4).float()
+        advantage        = ((reward_bk - mean_k) / (std_k + 1e-8)) * mask_valid_std
+        advantage_flat_all = advantage.view(BK).detach()   # [BK], no grad
 
-        # ── Actor forward (with grad) ─────────────────────────────────────
+        # ── Rank-based data split ─────────────────────────────────────────────────
+        # Root cause of OOM: without this, every FSDP rank processes all BK
+        # experiences → [BK, seq, vocab=151936] logits in fp32 → ~78 GiB → OOM.
+        #
+        # Fix: split experiences by question-group (multiples of K) so that each
+        # rank processes BK/world_size experiences.  This shrinks the logits tensor
+        # by world_size (e.g. from [64,seq,vocab]→[8,seq,vocab]) and brings fp32
+        # logit memory from ~78 GiB down to ~9.8 GiB per rank.
+        #
+        # Advantage must be computed over ALL BK first (Z-score needs all K per
+        # group), then the per-rank slice is extracted.
+        #
+        # All FSDP ranks still participate in NCCL collectives (FSDP all-gather)
+        # simultaneously — each rank just feeds its own local data slice.
+        # FSDP's gradient all-reduce then correctly averages the per-rank gradients.
+        world_size = self.accel.num_processes
+        rank       = self.accel.process_index
+
+        if n_groups >= world_size:
+            # Normal case: assign contiguous groups to each rank.
+            local_groups = n_groups // world_size
+            r_start = rank * local_groups
+            r_end   = (rank + 1) * local_groups if rank < world_size - 1 else n_groups
+        else:
+            # Fewer question-groups than ranks: round-robin assignment.
+            # Multiple ranks process the same group; FSDP gradient averaging
+            # still yields the correct global mean.
+            r_start = rank % n_groups
+            r_end   = r_start + 1
+
+        local_exps     = valid_exps[r_start * K : r_end * K]
+        advantage_flat = advantage_flat_all[r_start * K : r_end * K]
+
+        # ── Tokenise LOCAL slice only ─────────────────────────────────────────────
+        amax = int(getattr(self.cfg, "actor_max_length", 8192))
+        input_ids, attn_mask, action_mask, _ = tokenise_strategy_batch(
+            local_exps,
+            self.tok,
+            model_max_length=amax,
+            accel=self.accel,
+        )
+        input_ids   = input_ids.to(device)
+        attn_mask   = attn_mask.to(device)
+        action_mask = action_mask.to(device)
+
+        # ── P1: compute log_prob_old on LOCAL slice BEFORE any gradient update ────
+        # C2 fix: use self.actor (FSDP-wrapped) directly — NOT unwrap_model().
+        # Under FSDP ZeRO-3, unwrap_model() gives only the local parameter shard.
+        self.actor.eval()
+        with torch.no_grad():
+            log_prob_old = compute_log_probs(
+                self.actor,
+                input_ids, attn_mask, action_mask,
+            )   # [local_BK], no grad
+        log_prob_old = log_prob_old.detach()
+        self.actor.train()
+
+        # ── ref_model forward on LOCAL slice (KL baseline, also no grad) ─────────
+        # C2 fix: use self.ref directly (FSDP-wrapped), not unwrap_model().
+        with torch.no_grad():
+            log_prob_ref = compute_log_probs(
+                self.ref,
+                input_ids, attn_mask, action_mask,
+            )   # [local_BK]
+        log_prob_ref = log_prob_ref.detach()
+
+        # ── Actor forward (with grad) on LOCAL slice ──────────────────────────────
         self.optimizer.zero_grad()
 
         log_prob_actor = compute_log_probs(
             self.actor, input_ids, attn_mask, action_mask
-        )   # [BK], has grad
+        )   # [local_BK], has grad
 
-        # ── GRPO Clip loss ────────────────────────────────────────────────
+        # ── GRPO Clip loss ────────────────────────────────────────────────────────
         ratio         = torch.exp(log_prob_actor - log_prob_old)
         ratio_clipped = ratio.clamp(
             1 - self.cfg.grpo_epsilon, 1 + self.cfg.grpo_epsilon
@@ -378,12 +411,12 @@ class ActorTrainer:
             ratio_clipped * advantage_flat,
         ).mean()
 
-        # ── S3 fix: KL penalty as a separate loss term ───────────────────
+        # ── S3 fix: KL penalty as a separate loss term ───────────────────────────
         # KL = log π_θ − log π_ref.  This term has gradient through log_prob_actor.
         # Adding it directly to clip_loss (not to advantage) ensures:
         #   (a) The advantage/Z-score normalisation is unaffected by KL.
         #   (b) Gradient flows correctly through a single path.
-        kl_per_sample = log_prob_actor - log_prob_ref   # [BK], has grad
+        kl_per_sample = log_prob_actor - log_prob_ref   # [local_BK], has grad
         kl_loss       = self.cfg.kl_penalty_beta * kl_per_sample.mean()
 
         total_loss = clip_loss + kl_loss
@@ -400,8 +433,8 @@ class ActorTrainer:
         self.scheduler.step()
 
         logger.info(
-            "ActorTrainer step %d: clip_loss=%.4f kl_loss=%.4f BK=%d n_groups=%d",
-            global_step, clip_loss.item(), kl_loss.item(), BK, n_groups,
+            "ActorTrainer step %d: clip_loss=%.4f kl_loss=%.4f BK=%d n_groups=%d local_BK=%d",
+            global_step, clip_loss.item(), kl_loss.item(), BK, n_groups, len(local_exps),
         )
         return total_loss.item()
 

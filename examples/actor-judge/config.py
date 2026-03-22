@@ -56,6 +56,10 @@ class ActorJudgeConfig:
     # 0.80 will OOM the moment vLLM starts on an 80 GB A100.
     gpu_memory_utilization: float = 0.75
     tensor_parallel_size: int = 8
+    # Disable CUDA Graph + torch.compile in vLLM (enforce_eager=True).
+    # Default True: avoids 30-90 min silent JIT compilation on first run.
+    # Set False only after verifying the compiled cache is warm (production).
+    vllm_enforce_eager: bool = True
 
     # ── Buffer ────────────────────────────────────────────────────────────────
     buffer_max_size: int = 50_000
