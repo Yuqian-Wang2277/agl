@@ -81,7 +81,7 @@ def judge_rollout_context_text(fewshot_examples: List[Dict[str, Any]]) -> str:
 
 def build_strategy_prompt(
     fewshot_examples: List[Dict[str, Any]],
-    version: str = "fewshot_extract_v1",
+    version: str = "fewshot_extract_v2",
 ) -> List[Dict[str, str]]:
     """Build chat messages for Actor Stage-1 (strategy generation).
 

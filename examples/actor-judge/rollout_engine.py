@@ -16,9 +16,8 @@ P2 — Ray @ray.remote(num_gpus=0):
      makes it wait forever for N idle cards.  We instead set num_gpus=0 and let
      vLLM's tensor_parallel_size handle the hardware itself.
 
-P3 — gpu_memory_utilization ≤ 0.75:
-     PyTorch's CUDA Context pins ~1-1.5 GB/GPU that empty_cache() cannot free.
-     0.9 / 0.85 will OOM the moment vLLM starts.  0.75 leaves enough headroom.
+P3 — gpu_memory_utilization (~0.68 default) + optional max_num_batched_tokens:
+     FSDP shards share GPUs with vLLM TP; leave VRAM headroom and cap chunked prefill.
 
 M1 — vLLM is launched ONLY on Rank 0 (the main process).
      The generated experiences are broadcast to all ranks afterward.
@@ -53,6 +52,29 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 
+def _generate_chunked(
+    vllm_actor,
+    prompts: List[str],
+    sampling_params: SamplingParams,
+    chunk_size: int,
+) -> List[str]:
+    """Run vLLM.generate in chunks to cap peak KV / batched-token memory."""
+    n = len(prompts)
+    if chunk_size <= 0 or n <= chunk_size:
+        return ray.get(vllm_actor.generate.remote(prompts, sampling_params))
+    parts: List[str] = []
+    for i in range(0, n, chunk_size):
+        parts.extend(
+            ray.get(
+                vllm_actor.generate.remote(
+                    prompts[i : i + chunk_size],
+                    sampling_params,
+                )
+            )
+        )
+    return parts
+
+
 def _flush_logging() -> None:
     for h in logging.root.handlers:
         h.flush()
@@ -82,6 +104,7 @@ class VLLMActor:
         tensor_parallel_size: int = 8,
         gpu_memory_utilization: float = 0.75,  # P3: ≤0.75
         enforce_eager: bool = True,
+        max_num_batched_tokens: int | None = None,
     ) -> None:
         import os
         # Clear torchrun/FSDP distributed env vars inherited from rank-0 process.
@@ -103,7 +126,7 @@ class VLLMActor:
         ):
             os.environ.pop(_var, None)
 
-        self.llm = LLM(
+        _llm_kw: dict = dict(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -116,6 +139,9 @@ class VLLMActor:
             # throughput cost is negligible for RL rollout batch sizes.
             enforce_eager=enforce_eager,
         )
+        if max_num_batched_tokens is not None:
+            _llm_kw["max_num_batched_tokens"] = int(max_num_batched_tokens)
+        self.llm = LLM(**_llm_kw)
 
     def generate(
         self,
@@ -227,17 +253,19 @@ class RolloutEngine:
             # the Actor model inside actor_trainer for perfect token alignment.
         )
 
+        chunk_sz = int(getattr(self.cfg, "vllm_rollout_prompt_chunk_size", 0) or 0)
         logger.info(
-            "[progress] Rollout step %d: Stage-1 vLLM (%d prompts = B=%d×K=%d, max_tokens=%d) …",
+            "[progress] Rollout step %d: Stage-1 vLLM (%d prompts = B=%d×K=%d, max_tokens=%d, chunk=%s) …",
             global_step,
             len(stage1_prompts),
             B,
             K,
             self.cfg.strategy_max_tokens,
+            chunk_sz if chunk_sz > 0 else "all",
         )
         _flush_logging()
-        stage1_texts_raw: List[str] = ray.get(
-            vllm_actor.generate.remote(stage1_prompts, sp_strategy)
+        stage1_texts_raw: List[str] = _generate_chunked(
+            vllm_actor, stage1_prompts, sp_strategy, chunk_sz
         )
         logger.info("[progress] Rollout step %d: Stage-1 done.", global_step)
         _flush_logging()
@@ -270,14 +298,15 @@ class RolloutEngine:
 
         if stage2_prompts:
             logger.info(
-                "[progress] Rollout step %d: Stage-2 vLLM (%d answer prompts, max_tokens=%d) …",
+                "[progress] Rollout step %d: Stage-2 vLLM (%d answer prompts, max_tokens=%d, chunk=%s) …",
                 global_step,
                 len(stage2_prompts),
                 self.cfg.answer_max_tokens,
+                chunk_sz if chunk_sz > 0 else "all",
             )
             _flush_logging()
-            stage2_texts_raw: List[str] = ray.get(
-                vllm_actor.generate.remote(stage2_prompts, sp_answer)
+            stage2_texts_raw: List[str] = _generate_chunked(
+                vllm_actor, stage2_prompts, sp_answer, chunk_sz
             )
             stage2_texts = [t + "</answer>" for t in stage2_texts_raw]
             logger.info("[progress] Rollout step %d: Stage-2 done.", global_step)

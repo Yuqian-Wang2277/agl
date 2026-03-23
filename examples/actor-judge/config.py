@@ -43,19 +43,26 @@ class ActorJudgeConfig:
     fewshot_max: int = 5
     rollout_temperature: float = 0.7   # stage-1 strategy generation
     answer_temperature: float = 0.0    # stage-2 answer generation (greedy)
-    strategy_max_tokens: int = 8192
-    answer_max_tokens: int = 8192
+    # Rollout caps: 8192/8192 with B×K concurrent seqs risks VRAM OOM (FSDP + vLLM share GPUs).
+    # 4096/4096 is a safer default; raise only after confirming headroom.
+    strategy_max_tokens: int = 4096
+    answer_max_tokens: int = 4096
     cross_domain_ratio: float = 0.0    # fraction of cross-domain batches
     # GRPO log_prob: full Stage-1 chat prompt (includes few-shot) + strategy S.
     actor_max_length: int = 8192
     # Judge: body (Context+Q+S) truncated then <|judge|> appended (see judge_encode).
     judge_max_length: int = 8192
 
-    # vLLM engine settings (P3: ≤ 0.75 to leave room for PyTorch CUDA Context)
-    # PyTorch CUDA Context pins ~1-1.5 GB/GPU that empty_cache() cannot free;
-    # 0.80 will OOM the moment vLLM starts on an 80 GB A100.
-    gpu_memory_utilization: float = 0.75
+    # vLLM engine settings (P3: headroom for FSDP shards on the SAME physical GPUs)
+    # PyTorch CUDA Context + FSDP (~1–2 GiB/GPU) + vLLM KV must fit in 80 GiB.
+    # Lower default leaves more KV headroom while FSDP weights stay resident.
+    gpu_memory_utilization: float = 0.60
     tensor_parallel_size: int = 8
+    # Chunked-prefill cap (vLLM default is often 16384; lower = lower peak VRAM during long prompts).
+    vllm_max_num_batched_tokens: int | None = 4096
+    # Split rollout generate() into chunks of at most N prompts (0 = one call, legacy).
+    # Strongly recommended when B×K is large or max_tokens is high.
+    vllm_rollout_prompt_chunk_size: int = 32
     # Disable CUDA Graph + torch.compile in vLLM (enforce_eager=True).
     # Default True: avoids 30-90 min silent JIT compilation on first run.
     # Set False only after verifying the compiled cache is warm (production).
@@ -112,8 +119,8 @@ class ActorJudgeConfig:
     # Greedy Pass@1 before any RL updates (baseline + fail-fast on val pipeline).
     val_before_train: bool = True
     # Validation generation caps (unified with scripts/validate.sh). Rollout uses strategy_max_tokens.
-    val_strategy_max_tokens: int = 2048
-    val_answer_max_tokens: int = 512
+    val_strategy_max_tokens: int = 4096
+    val_answer_max_tokens: int = 4096
     val_num_samples: int = 500         # per val_subdir split
     # Per-item rows in eval_*.json (prompts, generations, outcome, judge score).
     val_save_item_details: bool = True
@@ -207,3 +214,5 @@ class ActorJudgeConfig:
             raise ValueError("val_steps must be >= 0 (0 disables periodic validation).")
         if self.save_steps < 0:
             raise ValueError("save_steps must be >= 0 (0 disables periodic checkpoints).")
+        if self.vllm_rollout_prompt_chunk_size < 0:
+            raise ValueError("vllm_rollout_prompt_chunk_size must be >= 0 (0 disables chunking).")

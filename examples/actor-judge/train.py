@@ -5,13 +5,17 @@ Launch with:
 
 Architecture and all review-round fixes incorporated:
 
-M1  vLLM runs ONLY on Rank 0.  Other ranks block at wait_for_everyone().
-    Generated experiences are broadcast via broadcast_object_list.
+M1  vLLM runs ONLY on Rank 0.  Other ranks must NOT call NCCL collectives while
+    rank 0 runs Phase A (can be hours): wait_for_everyone() would block in NCCL
+    with a ~30 min watchdog timeout.  Non-main ranks instead poll a marker file
+    on CPU until rank 0 finishes rollout, then all ranks do a short barrier +
+    broadcast_object_list.
 
 P2  Ray remote is declared with num_gpus=0 so Ray's scheduler never fights
     PyTorch FSDP for GPU ownership.  vLLM's tensor_parallel_size handles GPUs.
 
-P3  gpu_memory_utilization ≤ 0.75 (PyTorch CUDA Context pins ~1-1.5 GB/GPU).
+P3  gpu_memory_utilization capped (~0.60 default): FSDP + vLLM TP share GPUs; rollout
+    chunks vLLM.generate (vllm_rollout_prompt_chunk_size) and caps batched tokens.
 
 P4  Experience objects carry ONLY pure-Python scalars — no GPU Tensors —
     so pickle/broadcast never triggers an NCCL hang.
@@ -37,6 +41,10 @@ C4  validate_pass_at_1 loads the saved HF checkpoint on rank 0 only.
 
 C5  broadcast_object_list is guarded by num_processes > 1.
     torch.distributed is not initialised in single-GPU runs (debug mode).
+
+C6  Phase A (rank0-only vLLM) can exceed NCCL's default ~30 min watchdog.
+    Non-main ranks wait on a CPU-side marker file, not wait_for_everyone(), until
+    rank0 finishes rollout; then a short barrier + broadcast_object_list.
 
 S5  Both Actor tokenizer and Judge model weights are saved each checkpoint.
     The tokenizer has <|judge|> added; saving it ensures consistent vocab on
@@ -170,6 +178,19 @@ def _safe_vllm_gpu_memory_utilization(cfg: ActorJudgeConfig) -> float:
     return out
 
 
+def _vllm_actor_init_kwargs(cfg: ActorJudgeConfig) -> Dict[str, Any]:
+    """Keyword args for ``VLLMActor`` (Ray remote) — shared by validation + rollout."""
+    kw: Dict[str, Any] = dict(
+        tensor_parallel_size=cfg.tensor_parallel_size,
+        gpu_memory_utilization=_safe_vllm_gpu_memory_utilization(cfg),
+        enforce_eager=cfg.vllm_enforce_eager,
+    )
+    mbt = getattr(cfg, "vllm_max_num_batched_tokens", None)
+    if mbt is not None:
+        kw["max_num_batched_tokens"] = int(mbt)
+    return kw
+
+
 # ---------------------------------------------------------------------------
 # Broadcast helper (Rank 0 → all ranks)
 # ---------------------------------------------------------------------------
@@ -186,6 +207,32 @@ def broadcast_object_list_from_rank0(obj, accelerator: Accelerator):
     container = [obj]
     torch.distributed.broadcast_object_list(container, src=0)
     return container[0]
+
+
+def wait_for_rank0_phase_a_marker(
+    marker_path: Path,
+    *,
+    rank_label: str,
+    poll_s: float = 1.0,
+    log_interval_s: float = 60.0,
+) -> None:
+    """Block on CPU until rank 0 creates ``marker_path`` (Phase A rollout done).
+
+    Phase A can run far longer than PyTorch NCCL's default process-group timeout
+    (~30 min).  Non-main ranks must not sit in ``wait_for_everyone()`` during
+    that window or the NCCL watchdog raises ALLREDUCE timeout and kills training.
+    """
+    t_log = time.perf_counter()
+    while not marker_path.is_file():
+        time.sleep(poll_s)
+        if time.perf_counter() - t_log >= log_interval_s:
+            logger.info(
+                "[progress] Phase A: rank%s still waiting for rollout marker %s …",
+                rank_label,
+                marker_path,
+            )
+            _flush_logging()
+            t_log = time.perf_counter()
 
 
 # ---------------------------------------------------------------------------
@@ -745,12 +792,9 @@ def run_full_validation_vllm(
                 model_path,
             )
             _flush_logging()
-            _vllm_gmu = _safe_vllm_gpu_memory_utilization(cfg)
             vllm_actor = VLLMActor.remote(
                 model_path,
-                tensor_parallel_size=cfg.tensor_parallel_size,
-                gpu_memory_utilization=_vllm_gmu,
-                enforce_eager=cfg.vllm_enforce_eager,
+                **_vllm_actor_init_kwargs(cfg),
             )
             if reuse:
                 _validation_vllm_actor_handle = vllm_actor
@@ -1602,7 +1646,13 @@ def main(cfg: ActorJudgeConfig) -> None:
         # ════════════════════════════════════════════════════════════════════
         epoch_experiences: List = []
 
+        # C6: Non-main ranks must not block in NCCL during Phase A (hours).  See
+        # wait_for_rank0_phase_a_marker docstring and M1 in module docstring.
+        _phase_a_marker = Path(cfg.checkpoint_dir) / f".phase_a_epoch_{epoch}_complete"
+
         if accelerator.is_main_process:
+            Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+            _phase_a_marker.unlink(missing_ok=True)
             n_roll_batches = len(train_loader)
             logger.info(
                 "Phase A: starting vLLM rollout (%d batches in train_loader) …",
@@ -1644,12 +1694,9 @@ def main(cfg: ActorJudgeConfig) -> None:
                     _shutdown_persistent_validation_vllm_actor()
                     vllm_actor = None
             if vllm_actor is None:
-                _vllm_gmu = _safe_vllm_gpu_memory_utilization(cfg)
                 vllm_actor = VLLMActor.remote(
                     current_model_path,
-                    tensor_parallel_size=cfg.tensor_parallel_size,
-                    gpu_memory_utilization=_vllm_gmu,
-                    enforce_eager=cfg.vllm_enforce_eager,
+                    **_vllm_actor_init_kwargs(cfg),
                 )
             for rollout_step, batch in enumerate(train_loader):
                 logger.info(
@@ -1697,14 +1744,22 @@ def main(cfg: ActorJudgeConfig) -> None:
                 _flush_logging()
                 time.sleep(3)
             torch.cuda.empty_cache()
+            _phase_a_marker.write_text("ok\n", encoding="utf-8")
         else:
             logger.info(
-                "[progress] Phase A: rank%s idle at barrier while rank0 runs vLLM rollout …",
+                "[progress] Phase A: rank%s waiting (CPU poll) for rank0 vLLM rollout "
+                "(marker %s) …",
                 os.environ.get("RANK", "?"),
+                _phase_a_marker,
             )
             _flush_logging()
+            wait_for_rank0_phase_a_marker(
+                _phase_a_marker,
+                rank_label=os.environ.get("RANK", "?"),
+            )
 
-        # All ranks sync; wait for vLLM GPU memory to be released
+        # Short NCCL barrier; all ranks arrive here shortly after Phase A marker
+        # (rank 0 just finished; others exited the CPU wait loop).
         accelerator.wait_for_everyone()
         torch.cuda.empty_cache()
 
@@ -2068,6 +2123,36 @@ if __name__ == "__main__":
         default=2.5,
         help="Rough token estimate len(text)/x when building dataset without tokenizer (unused in train; tokenizer is passed)",
     )
+    parser.add_argument(
+        "--vllm_max_num_batched_tokens",
+        type=int,
+        default=4096,
+        help="vLLM chunked-prefill cap (lower = lower peak VRAM). 0 = use vLLM default.",
+    )
+    parser.add_argument(
+        "--strategy_max_tokens",
+        type=int,
+        default=4096,
+        help="Rollout Stage-1 max new tokens per strategy sample",
+    )
+    parser.add_argument(
+        "--answer_max_tokens",
+        type=int,
+        default=4096,
+        help="Rollout Stage-2 max new tokens per answer",
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.60,
+        help="vLLM fraction of GPU memory reserved for weights+KV (lower if OOM)",
+    )
+    parser.add_argument(
+        "--vllm_rollout_prompt_chunk_size",
+        type=int,
+        default=32,
+        help="Max prompts per vLLM call during rollout (0 = single call; use 16–32 if OOM)",
+    )
     args = parser.parse_args()
 
     run_name = args.run_name.strip() or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2123,6 +2208,13 @@ if __name__ == "__main__":
         dataset_stage1_reject_log=not args.no_dataset_stage1_reject_log,
         stage1_length_chars_per_token=args.stage1_length_chars_per_token,
         vllm_reuse_validation_actor=not args.no_vllm_reuse_validation_actor,
+        vllm_max_num_batched_tokens=(
+            None if args.vllm_max_num_batched_tokens == 0 else args.vllm_max_num_batched_tokens
+        ),
+        strategy_max_tokens=args.strategy_max_tokens,
+        answer_max_tokens=args.answer_max_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        vllm_rollout_prompt_chunk_size=args.vllm_rollout_prompt_chunk_size,
     )
 
     main(cfg)

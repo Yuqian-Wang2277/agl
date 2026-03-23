@@ -9,7 +9,7 @@ trivial to iterate on wording without touching any Python code:
     ├── __init__.py                        ← this file (loader utilities)
     ├── strategy_generation/               ← Actor Stage-1: few-shot → <strategy>
     │   ├── fewshot_extract_v1.toml        ← baseline: induce strategy from examples
-    │   └── fewshot_extract_v2.toml        ← copy v1 and modify
+    │   └── fewshot_extract_v2.toml        ← fused structured prompt (see file header)
     ├── answer_generation/                 ← Actor Stage-2: strategy + Q → <answer>
     │   └── strategy_guided_v1.toml        ← baseline: strategy-conditioned answer
     └── judge_evaluation/                  ← Judge: context + Q + S → scalar score

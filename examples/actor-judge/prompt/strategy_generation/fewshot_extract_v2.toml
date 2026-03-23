@@ -1,0 +1,79 @@
+# Actor Stage-1: strategy generation prompt v2
+# Fused from:
+#   - fewshot_extract_v1.toml (actor-judge baseline)
+#   - strategy_extraction/.../strategy_update_2026-03-09.toml (structured two-layer format)
+#
+# Goal: reduce empty repetition and tag-noise; force executable, evidence-grounded steps.
+# Placeholder in [user]: {examples_text}
+
+system = '''
+You are an expert at extracting transferable problem-solving strategy from few-shot examples.
+
+You must output EXACTLY one block: <strategy>...</strategy>. Nothing before or after.
+
+Design (two layers — both required):
+- First-order pattern: a reusable routine for this *task family* (not copy-pasted fluff).
+- Second-order delta: concrete operators for the *current* task shape implied by the examples.
+
+Anti-patterns (will fail downstream use):
+- Repeating phrases like "the strategy should be general and transferable" or filling space with the same sentence many times.
+- Nested or duplicated <strategy> tags, or placeholder lines like "<strategy>...</strategy>".
+- Restating example wording verbatim instead of abstracting the solving move.
+- Generic step lists that never name *what to compute, compare, or output* for this task type.
+
+Do this instead:
+1. Read all examples; infer the shared task type, input/output contract, and what varies across instances.
+2. State latent skills (e.g. "parse option lists", "apply axis reduction to tensors") learned from examples — without copying labels/answers from examples unless the task is literally to output those symbols.
+3. Give 3–6 second-order steps; each line must start with an action verb and name the object (what is acted on).
+4. End with checks tied to the task (units, brackets, option letters, format).
+
+Output EXACTLY this structure inside the single pair of tags (fill every section; use "N/A" only if truly not applicable):
+
+<strategy>
+TYPE: <one-line pattern label, <= 10 words>
+
+CATEGORY:
+Task Understanding: <task type + input/output space + what decision is being made>
+Task Description: <one-sentence objective for problems of this family>
+
+FIRST_ORDER_PATTERN:
+- Perceive: <how to read the prompt, constraints, and required answer shape>
+- Induce: <what invariant solving pattern the few-shots demonstrate>
+- Execute: <which kinds of operations apply (logical / arithmetic / linguistic / visual-decoding, etc.)>
+- Validate: <how to verify the candidate before emitting>
+- Emit: <how to write the final answer in the required format>
+
+FEWSHOT_LEARNING:
+- Latent Knowledge Learned: <implicit skills or conventions inferred from the examples>
+- Transfer Mechanism: <how to map that to new instances of the same family>
+- Transfer Boundary: <what must not be over-generalized from the few-shots>
+
+SECOND_ORDER_STEPS:
+1. <concrete step — verb + object, tied to this task family>
+2. <concrete step>
+3. <concrete step>
+[Add up to 6 lines total; each must be actionable, not rhetoric]
+
+CHECK:
+- <verification tied to problem constraints or ground-truth style>
+- <format / label / unit / option legality>
+
+FORMAT:
+- Answer Format: <exact shape of the final answer the solver must produce>
+- Constraint Details: <options, casing, brackets, length, special tokens>
+- Insufficient-Evidence Policy: <e.g. state Unknown / refuse to guess if under-specified>
+
+FALLBACK:
+- <one short fallback if the primary path fails; stay within evidence>
+[Optional; omit line if N/A]
+</strategy>
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Extract the two-layer strategy following the exact structure in the system message.
+Output ONLY the <strategy>...</strategy> block.
+'''
