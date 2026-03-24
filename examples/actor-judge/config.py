@@ -50,6 +50,9 @@ class ActorJudgeConfig:
     cross_domain_ratio: float = 0.0    # fraction of cross-domain batches
     # GRPO log_prob: full Stage-1 chat prompt (includes few-shot) + strategy S.
     actor_max_length: int = 8192
+    # Split each rank's local GRPO batch into micro-batches (gradient accumulation).
+    # Reduces peak activation memory during compute_log_probs; 0 = one micro-batch (full local slice).
+    actor_microbatch_size: int = 4
     # Judge: body (Context+Q+S) truncated then <|judge|> appended (see judge_encode).
     judge_max_length: int = 8192
 
@@ -84,9 +87,17 @@ class ActorJudgeConfig:
     grpo_epsilon: float = 0.2          # PPO clip ε
 
     # ── Training schedule ─────────────────────────────────────────────────────
-    total_epochs: int = 5
+    total_epochs: int = 50
     num_train_samples: int = 20_000    # L2: configurable dataset size (was hard-coded)
     train_batch_size: int = 8          # B — questions per rollout batch
+    # Max Phase-A rollout batches per epoch (= Phase-B optimizer steps that epoch).
+    # 0 = use full len(train_loader). E.g. 250 with 20k/8≈2500 batches → ~10% data/epoch (dev/tuning).
+    rollout_steps_per_epoch: int = 0
+    # "shuffle": each epoch islice shuffled DataLoader (batches may repeat across epochs).
+    # "stratified": disjoint batch-index partitions by domain; epoch e uses partition e % n_groups.
+    #   Requires rollout_steps_per_epoch > 0 and len(train_loader) % rollout_steps_per_epoch == 0.
+    rollout_partition_mode: str = "shuffle"
+    rollout_partition_seed: int = 42
     actor_lr: float = 1e-6
     judge_lr: float = 1e-5
     judge_batch_size: int = 16         # pairwise pairs per Judge update step
@@ -112,10 +123,10 @@ class ActorJudgeConfig:
     judge_warmup_reset_optimizer_after: bool = True  # fresh AdamW for Phase II after warmup
     # Periodic vLLM validation every N optimizer steps (Phase B); 0 = disabled.
     # RL is non-smooth vs SFT — prefer step cadence over epoch boundaries.
-    val_steps: int = 100
+    val_steps: int = 50
     # Full checkpoints (HF actor + judge + optimizers) every N steps; 0 = off.
     # Align with val_steps to capture peaks when validation runs.
-    save_steps: int = 100
+    save_steps: int = 50
     # Greedy Pass@1 before any RL updates (baseline + fail-fast on val pipeline).
     val_before_train: bool = True
     # Validation generation caps (unified with scripts/validate.sh). Rollout uses strategy_max_tokens.
@@ -130,7 +141,8 @@ class ActorJudgeConfig:
     val_log_items_wandb_table: bool = False
     val_judge_score_batch_size: int = 16
     # L4: total_train_steps for LR scheduler — set automatically in main() if 0
-    total_train_steps: int = 0         # 0 = auto-compute from epochs × steps_per_epoch
+    # 0 = auto: total_epochs × min(rollout_steps_per_epoch, len(train_loader)) (or full loader if rollout_steps_per_epoch=0)
+    total_train_steps: int = 0
 
     # ── Optimisation ──────────────────────────────────────────────────────────
     max_grad_norm: float = 1.0         # L3: gradient clipping (0 = disabled)
@@ -216,3 +228,15 @@ class ActorJudgeConfig:
             raise ValueError("save_steps must be >= 0 (0 disables periodic checkpoints).")
         if self.vllm_rollout_prompt_chunk_size < 0:
             raise ValueError("vllm_rollout_prompt_chunk_size must be >= 0 (0 disables chunking).")
+        if self.rollout_steps_per_epoch < 0:
+            raise ValueError("rollout_steps_per_epoch must be >= 0 (0 = full train_loader per epoch).")
+        pm = (self.rollout_partition_mode or "shuffle").strip().lower()
+        if pm not in ("shuffle", "stratified"):
+            raise ValueError(
+                f"rollout_partition_mode must be 'shuffle' or 'stratified', got {self.rollout_partition_mode!r}"
+            )
+        if pm == "stratified" and self.rollout_steps_per_epoch <= 0:
+            raise ValueError(
+                "rollout_partition_mode='stratified' requires rollout_steps_per_epoch > 0 "
+                "so batches split into equal disjoint groups."
+            )

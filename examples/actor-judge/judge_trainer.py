@@ -16,6 +16,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+from accelerate.utils import broadcast_object_list
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import PreTrainedTokenizer
@@ -66,7 +67,22 @@ class JudgeTrainer:
         device = self.accel.device
 
         # ── Sample pairwise data from buffer (OFF-POLICY) ─────────────────
-        pairs = buffer.sample_pairwise(self.cfg.judge_batch_size)
+        # D1: sample ONLY on rank 0, then broadcast.  Independent RNG per rank
+        # yields different pairs → different token shapes → FSDP collective/OOM
+        # failures (e.g. exit code 1 on one rank mid-train with no traceback on 0).
+        if self.accel.num_processes > 1:
+            if self.accel.is_main_process:
+                pairs = buffer.sample_pairwise(self.cfg.judge_batch_size)
+            else:
+                pairs = None
+            pair_container = [pairs]
+            broadcast_object_list(pair_container, from_process=0)
+            pairs = pair_container[0]
+            tsync = [buffer.global_sample_steps if self.accel.is_main_process else 0]
+            broadcast_object_list(tsync, from_process=0)
+            buffer.global_sample_steps = tsync[0]
+        else:
+            pairs = buffer.sample_pairwise(self.cfg.judge_batch_size)
         if not pairs:
             logger.debug("JudgeTrainer step %d: buffer too sparse, skipping.", global_step)
             return 0.0

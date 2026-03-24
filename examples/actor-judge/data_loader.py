@@ -4,6 +4,7 @@ Provides:
   - RolloutSample: typed dataclass per training item
   - ActorJudgeDataset: PyTorch Dataset wrapping LLMReflection JSON data
   - load_rollout_dataset / load_val_dataset: convenience factory functions
+  - build_stratified_rollout_partitions: domain-stratified disjoint Phase-A batch groups
   - match_s_gold / match_s_gold_versions: find gold strategy files for Judge warmup
 """
 
@@ -15,6 +16,7 @@ import logging
 import os
 import random
 import re
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -355,6 +357,81 @@ class ActorJudgeDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Convenience factories
 # ---------------------------------------------------------------------------
+
+def build_stratified_rollout_partitions(
+    dataset: "ActorJudgeDataset",
+    batch_size: int,
+    rollout_limit: int,
+    seed: int,
+) -> Tuple[int, List[List[int]]]:
+    """Split all rollout batch indices into disjoint groups of size ``rollout_limit``.
+
+    Each batch is labeled by the **first** sample's ``domain``. Batches are shuffled
+    within each domain, then **round-robin merged** across domains (so each chunk is
+    domain-mixed rather than one domain dominating a partition). The merged list is
+    cut into contiguous segments of length ``rollout_limit``.
+
+    The previous implementation split each domain separately across ``n_groups`` buckets;
+    that does **not** guarantee equal bucket totals when domains are imbalanced, which
+    caused ``RuntimeError: group g has != rollout_limit batches``.
+
+    Requires:
+      - ``len(dataset) % batch_size == 0``
+      - ``(len(dataset) // batch_size) % rollout_limit == 0``
+
+    Returns:
+      ``(n_groups, partitions)`` where ``partitions[k]`` lists batch indices for epoch
+      ``k mod n_groups`` — each batch index appears exactly once across all partitions.
+    """
+    n = len(dataset)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    if rollout_limit <= 0:
+        raise ValueError(f"rollout_limit must be > 0 for stratified partitions, got {rollout_limit}")
+    if n % batch_size != 0:
+        raise ValueError(
+            f"Stratified rollout requires len(dataset)={n} divisible by batch_size={batch_size}"
+        )
+    n_batches = n // batch_size
+    if n_batches % rollout_limit != 0:
+        raise ValueError(
+            f"Stratified rollout requires (len(dataset)//batch_size)={n_batches} "
+            f"divisible by rollout_steps_per_epoch={rollout_limit} "
+            f"(full coverage in n_batches/rollout_limit epochs with no duplicate batches)"
+        )
+    n_groups = n_batches // rollout_limit
+    rng = random.Random(seed)
+
+    by_domain: Dict[str, List[int]] = defaultdict(list)
+    for bi in range(n_batches):
+        s0 = dataset[bi * batch_size]
+        by_domain[s0.domain].append(bi)
+
+    for dom in by_domain:
+        rng.shuffle(by_domain[dom])
+
+    # Round-robin across domains so merged order mixes strata; then equal-size chunks.
+    queues: List[deque[int]] = [deque(by_domain[k]) for k in sorted(by_domain.keys())]
+    merged: List[int] = []
+    while any(queues):
+        for q in queues:
+            if q:
+                merged.append(q.popleft())
+
+    if len(merged) != n_batches:
+        raise RuntimeError(f"internal: merged length {len(merged)} != n_batches {n_batches}")
+
+    groups = [
+        merged[i : i + rollout_limit] for i in range(0, n_batches, rollout_limit)
+    ]
+    if len(groups) != n_groups:
+        raise RuntimeError(f"internal: {len(groups)} groups != n_groups {n_groups}")
+
+    for g in groups:
+        rng.shuffle(g)
+
+    return n_groups, groups
+
 
 def load_rollout_dataset(
     cfg,

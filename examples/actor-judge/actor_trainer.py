@@ -175,6 +175,14 @@ def compute_log_probs(
     M2: action_mask must be three-part [Prompt=0 | Strategy=1 | Padding=0]
         so that PAD tokens do not pollute the KL or ratio.
 
+    Memory fix: uses F.cross_entropy (fused log-softmax + gather kernel) instead
+    of materialising the full [B, seq, vocab] log-softmax tensor separately.
+    The previous approach allocated TWO [B, seq, vocab] buffers (logits +
+    log_softmax output) ≈ 2 × 9.5 GiB for B=4, seq=8192, vocab=151936, causing
+    GPU OOM after ~7 training steps when memory becomes fragmented.
+    F.cross_entropy computes the same value in a single fused CUDA kernel with
+    roughly half the peak memory.
+
     Args:
         input_ids:      [B, seq_len]
         attention_mask: [B, seq_len]
@@ -183,19 +191,23 @@ def compute_log_probs(
     Returns:
         log_probs: [B]  — mean per-strategy-token log-prob per sample
     """
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-    # [B, seq_len, vocab_size]
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits  = outputs.logits[:, :-1, :].contiguous()  # [B, seq-1, vocab]
+    del outputs  # release intermediate activation memory ASAP
 
-    # Shift for next-token prediction
-    logits      = logits[:, :-1, :]       # [B, seq-1, vocab]
-    labels      = input_ids[:, 1:]        # [B, seq-1]
-    action_mask = action_mask[:, 1:]      # [B, seq-1]  (shifted with labels)
+    labels      = input_ids[:, 1:].contiguous()   # [B, seq-1]
+    action_mask = action_mask[:, 1:]               # [B, seq-1]  (shifted with labels)
 
-    per_token_lp = torch.gather(
-        F.log_softmax(logits, dim=-1),
-        dim=2,
-        index=labels.unsqueeze(-1),
-    ).squeeze(-1)                          # [B, seq-1]
+    B, L = labels.shape
+    # F.cross_entropy fuses log-softmax + gather in one kernel without allocating
+    # a full [B, L, vocab] intermediate (unlike log_softmax(...) + gather).
+    # cross_entropy returns the POSITIVE NLL, so we negate for log-prob.
+    per_token_lp = -F.cross_entropy(
+        logits.view(B * L, -1),   # [B*(seq-1), vocab]
+        labels.view(-1),          # [B*(seq-1)]
+        reduction="none",
+    ).view(B, L)                  # [B, seq-1]
+    del logits  # free the large vocab tensor immediately
 
     # S4 fix: MEAN over strategy tokens (not SUM)
     n_strategy_tokens = action_mask.float().sum(dim=-1).clamp(min=1)
@@ -361,69 +373,75 @@ class ActorTrainer:
         local_exps     = valid_exps[r_start * K : r_end * K]
         advantage_flat = advantage_flat_all[r_start * K : r_end * K]
 
-        # ── Tokenise LOCAL slice only ─────────────────────────────────────────────
+        # ── D2: micro-batch GRPO forward/backward (gradient accumulation) ─────────
+        # Long (prompt+strategy) sequences can OOM a single rank during logits even
+        # with FSDP — splitting the local slice reduces peak activation memory.
         amax = int(getattr(self.cfg, "actor_max_length", 8192))
-        input_ids, attn_mask, action_mask, _ = tokenise_strategy_batch(
-            local_exps,
-            self.tok,
-            model_max_length=amax,
-            accel=self.accel,
-        )
-        input_ids   = input_ids.to(device)
-        attn_mask   = attn_mask.to(device)
-        action_mask = action_mask.to(device)
+        cfg_mb = int(getattr(self.cfg, "actor_microbatch_size", 0) or 0)
+        local_n = len(local_exps)
+        if cfg_mb <= 0:
+            micro = local_n
+        else:
+            micro = min(cfg_mb, local_n)
 
-        # ── P1: compute log_prob_old on LOCAL slice BEFORE any gradient update ────
-        # C2 fix: use self.actor (FSDP-wrapped) directly — NOT unwrap_model().
-        # Under FSDP ZeRO-3, unwrap_model() gives only the local parameter shard.
-        self.actor.eval()
-        with torch.no_grad():
-            log_prob_old = compute_log_probs(
-                self.actor,
-                input_ids, attn_mask, action_mask,
-            )   # [local_BK], no grad
-        log_prob_old = log_prob_old.detach()
-        self.actor.train()
-
-        # ── ref_model forward on LOCAL slice (KL baseline, also no grad) ─────────
-        # C2 fix: use self.ref directly (FSDP-wrapped), not unwrap_model().
-        with torch.no_grad():
-            log_prob_ref = compute_log_probs(
-                self.ref,
-                input_ids, attn_mask, action_mask,
-            )   # [local_BK]
-        log_prob_ref = log_prob_ref.detach()
-
-        # ── Actor forward (with grad) on LOCAL slice ──────────────────────────────
         self.optimizer.zero_grad()
+        clip_sum_w = 0.0
+        kl_sum_w = 0.0
+        total_loss_scalar = 0.0
 
-        log_prob_actor = compute_log_probs(
-            self.actor, input_ids, attn_mask, action_mask
-        )   # [local_BK], has grad
+        for s in range(0, local_n, micro):
+            t = min(s + micro, local_n)
+            chunk_exps = local_exps[s:t]
+            adv_chunk = advantage_flat[s:t]
 
-        # ── GRPO Clip loss ────────────────────────────────────────────────────────
-        ratio         = torch.exp(log_prob_actor - log_prob_old)
-        ratio_clipped = ratio.clamp(
-            1 - self.cfg.grpo_epsilon, 1 + self.cfg.grpo_epsilon
-        )
-        clip_loss = -torch.min(
-            ratio * advantage_flat,
-            ratio_clipped * advantage_flat,
-        ).mean()
+            input_ids, attn_mask, action_mask, _ = tokenise_strategy_batch(
+                chunk_exps,
+                self.tok,
+                model_max_length=amax,
+                accel=self.accel,
+            )
+            input_ids = input_ids.to(device)
+            attn_mask = attn_mask.to(device)
+            action_mask = action_mask.to(device)
 
-        # ── S3 fix: KL penalty as a separate loss term ───────────────────────────
-        # KL = log π_θ − log π_ref.  This term has gradient through log_prob_actor.
-        # Adding it directly to clip_loss (not to advantage) ensures:
-        #   (a) The advantage/Z-score normalisation is unaffected by KL.
-        #   (b) Gradient flows correctly through a single path.
-        kl_per_sample = log_prob_actor - log_prob_ref   # [local_BK], has grad
-        kl_loss       = self.cfg.kl_penalty_beta * kl_per_sample.mean()
+            # P1: log_prob_old (no grad)
+            self.actor.eval()
+            with torch.no_grad():
+                log_prob_old = compute_log_probs(
+                    self.actor, input_ids, attn_mask, action_mask
+                ).detach()
+            self.actor.train()
 
-        total_loss = clip_loss + kl_loss
+            with torch.no_grad():
+                log_prob_ref = compute_log_probs(
+                    self.ref, input_ids, attn_mask, action_mask
+                ).detach()
 
-        self.accel.backward(total_loss)
+            log_prob_actor = compute_log_probs(
+                self.actor, input_ids, attn_mask, action_mask
+            )
 
-        # L3: gradient clipping
+            ratio = torch.exp(log_prob_actor - log_prob_old)
+            ratio_clipped = ratio.clamp(
+                1 - self.cfg.grpo_epsilon, 1 + self.cfg.grpo_epsilon
+            )
+            clip_loss = -torch.min(
+                ratio * adv_chunk,
+                ratio_clipped * adv_chunk,
+            ).mean()
+
+            kl_per_sample = log_prob_actor - log_prob_ref
+            kl_loss = self.cfg.kl_penalty_beta * kl_per_sample.mean()
+
+            chunk_total = clip_loss + kl_loss
+            w = (t - s) / float(local_n)
+            self.accel.backward(chunk_total * w)
+
+            clip_sum_w += clip_loss.item() * w
+            kl_sum_w += kl_loss.item() * w
+            total_loss_scalar += chunk_total.item() * w
+
+        # L3: gradient clipping (after full local accumulation)
         self.accel.clip_grad_norm_(
             self.actor.parameters(),
             getattr(self.cfg, "max_grad_norm", 1.0),
@@ -433,10 +451,10 @@ class ActorTrainer:
         self.scheduler.step()
 
         logger.info(
-            "ActorTrainer step %d: clip_loss=%.4f kl_loss=%.4f BK=%d n_groups=%d local_BK=%d",
-            global_step, clip_loss.item(), kl_loss.item(), BK, n_groups, len(local_exps),
+            "ActorTrainer step %d: clip_loss=%.4f kl_loss=%.4f BK=%d n_groups=%d local_BK=%d micro=%d",
+            global_step, clip_sum_w, kl_sum_w, BK, n_groups, local_n, micro,
         )
-        return total_loss.item()
+        return total_loss_scalar
 
     # ------------------------------------------------------------------
 
@@ -446,28 +464,45 @@ class ActorTrainer:
         judge_model: torch.nn.Module,
         device: torch.device,
     ) -> torch.Tensor:
-        """Run Judge model in no_grad mode to obtain σ(logit) scores."""
+        """Run Judge model in no_grad mode to obtain σ(logit) scores.
+
+        Chunked to bound peak GPU memory: processing all BK=64 experiences at
+        once with jmax=8192 allocates [64, 8192, hidden] activations per rank,
+        which combined with FSDP all-gather buffers can OOM after several steps.
+        Processing in smaller chunks keeps the peak footprint proportional to
+        chunk_size, not BK.
+
+        All ranks execute the SAME number of judge forward() calls because all
+        ranks receive the identical valid_exps list (broadcast from rank 0 in
+        Phase A), so the chunking is deterministic across ranks — required for
+        FSDP collective correctness.
+        """
         from judge_encode import encode_batch_for_judge
         from prompts import build_judge_prompt_body
 
-        bodies = [
-            build_judge_prompt_body(
-                [],
-                e.question,
-                e.strategy,
-                context_text_raw=e.context_text,
-            )
-            for e in experiences
-        ]
-        jmax = int(getattr(self.cfg, "judge_max_length", 8192))
-        enc = {
-            k: v.to(device)
-            for k, v in encode_batch_for_judge(self.tok, bodies, jmax).items()
-        }
+        jmax       = int(getattr(self.cfg, "judge_max_length", 8192))
+        chunk_size = int(getattr(self.cfg, "judge_score_chunk_size", 16))
 
         judge_model.eval()
+        score_chunks: List[torch.Tensor] = []
         with torch.no_grad():
-            logits = judge_model(**enc)   # [BK], using FSDP-wrapped judge
+            for start in range(0, len(experiences), chunk_size):
+                chunk = experiences[start : start + chunk_size]
+                bodies = [
+                    build_judge_prompt_body(
+                        [],
+                        e.question,
+                        e.strategy,
+                        context_text_raw=e.context_text,
+                    )
+                    for e in chunk
+                ]
+                enc = {
+                    k: v.to(device)
+                    for k, v in encode_batch_for_judge(self.tok, bodies, jmax).items()
+                }
+                chunk_logits = judge_model(**enc)   # [chunk], FSDP collective
+                score_chunks.append(torch.sigmoid(chunk_logits))
         judge_model.train()
 
-        return torch.sigmoid(logits)     # [BK] in (0, 1)
+        return torch.cat(score_chunks)   # [BK] in (0, 1)

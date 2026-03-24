@@ -4,7 +4,12 @@
 #
 # Usage:
 #   bash scripts/train.sh [--sft_checkpoint PATH] [--epochs N]
-#       [--num_train_samples N] [--min_buffer_size N] [--dry_run_val_size N] [--extra ARGS...]
+#       [--num_train_samples N] [--rollout_steps_per_epoch N] [--val_steps N] [--save_steps N]
+#       [--min_buffer_size N]
+#       [--dry_run_val_size N] [--extra ARGS...]
+#   Default: --rollout_steps_per_epoch 250, --rollout_partition_mode stratified,
+#   --val_steps 50, --save_steps 50 (aligns with config.py; train.py default is 100).
+#   (10 epochs × 250 batches = full data coverage once; shuffle = random cap each epoch).
 #
 # Examples:
 #   # Start from SFT checkpoint (recommended):
@@ -36,7 +41,7 @@ set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 SFT_CHECKPOINT=""
-TOTAL_EPOCHS=5
+TOTAL_EPOCHS=250
 K=8
 ALPHA=0.3
 DENSE_REWARD_ALPHA=0.3
@@ -47,6 +52,11 @@ RUN_NAME=""
 CHECKPOINT_ROOT=""
 RESUME_FROM=""
 NUM_TRAIN_SAMPLES=20000
+ROLLOUT_STEPS_PER_EPOCH=50
+ROLLOUT_PARTITION_MODE=stratified
+ROLLOUT_PARTITION_SEED=42
+VAL_STEPS=50
+SAVE_STEPS=50
 MIN_BUFFER_SIZE=""
 DRY_RUN_VAL_SIZE=""
 EXTRA_ARGS=""
@@ -67,6 +77,11 @@ while [[ $# -gt 0 ]]; do
         --checkpoint_root)  CHECKPOINT_ROOT="$2";           shift 2 ;;
         --resume_from)      RESUME_FROM="$2";               shift 2 ;;
         --num_train_samples) NUM_TRAIN_SAMPLES="$2";        shift 2 ;;
+        --rollout_steps_per_epoch) ROLLOUT_STEPS_PER_EPOCH="$2"; shift 2 ;;
+        --rollout_partition_mode) ROLLOUT_PARTITION_MODE="$2"; shift 2 ;;
+        --rollout_partition_seed) ROLLOUT_PARTITION_SEED="$2"; shift 2 ;;
+        --val_steps)          VAL_STEPS="$2";                shift 2 ;;
+        --save_steps)         SAVE_STEPS="$2";               shift 2 ;;
         --min_buffer_size)   MIN_BUFFER_SIZE="$2";          shift 2 ;;
         --dry_run_val_size)  DRY_RUN_VAL_SIZE="$2";         shift 2 ;;
         --judge_warmup_ckpt) JUDGE_WARMUP_CKPT="$2";        shift 2 ;;
@@ -84,6 +99,11 @@ conda activate agl
 
 cd "$PROJECT_DIR"
 echo "Working directory: $(pwd)"
+
+# Write per-rank Python tracebacks to /tmp/torch_elastic_error.json on crash.
+# Without this the distributed launcher only shows "exitcode 1, traceback: N/A".
+export TORCHELASTIC_ERROR_FILE="${TORCHELASTIC_ERROR_FILE:-/tmp/torch_elastic_error_$(date +%Y%m%d_%H%M%S).json}"
+echo "Rank error file: $TORCHELASTIC_ERROR_FILE"
 
 [[ -z "$CHECKPOINT_ROOT" ]] && CHECKPOINT_ROOT="$PROJECT_DIR/checkpoints_actor_judge"
 
@@ -138,6 +158,11 @@ CMD=(
     --checkpoint_root "$CHECKPOINT_ROOT"
     --run_name "$RUN_NAME"
     --num_train_samples "$NUM_TRAIN_SAMPLES"
+    --rollout_steps_per_epoch "$ROLLOUT_STEPS_PER_EPOCH"
+    --rollout_partition_mode "$ROLLOUT_PARTITION_MODE"
+    --rollout_partition_seed "$ROLLOUT_PARTITION_SEED"
+    --val_steps "$VAL_STEPS"
+    --save_steps "$SAVE_STEPS"
 )
 
 [[ -n "$MIN_BUFFER_SIZE" ]] && CMD+=("--min_buffer_size" "$MIN_BUFFER_SIZE")

@@ -26,9 +26,9 @@ P5  ref_model is wrapped with accelerator.prepare() to distribute (shard) it
 M6  <|judge|> embedding is warm-started from <|im_end|> after resize.
 
 S1  Epoch-level vLLM lifecycle:
-    vLLM is created ONCE per epoch for Phase A (all rollout batches), then
-    killed ONCE before Phase B (all training batches).  The previous per-batch
-    kill/restart would cost ~15 s × 2500 batches ≈ 10+ hours/epoch in startup.
+    vLLM is created ONCE per epoch for Phase A (rollout batches, optionally capped
+    by rollout_steps_per_epoch), then killed ONCE before Phase B.  The previous
+    per-batch kill/restart would cost ~15 s × 2500 batches ≈ 10+ hours/epoch in startup.
 
 C3  Judge warmup runs on ALL ranks (not just rank 0).
     Previously guarded by is_main_process, causing a deadlock: rank 0 called
@@ -70,6 +70,7 @@ import shutil
 import sys
 import time
 from collections import deque
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -88,6 +89,7 @@ from buffer import UCBBuffer
 from config import ActorJudgeConfig
 from data_loader import (
     ActorJudgeDataset,
+    build_stratified_rollout_partitions,
     collate_rollout_samples,
     load_rollout_dataset,
     load_val_dataset,
@@ -1252,9 +1254,45 @@ def main(cfg: ActorJudgeConfig) -> None:
 
     # L4: auto-compute total_train_steps for LR schedulers if not set
     steps_per_epoch = len(train_loader)
+    rollout_limit = steps_per_epoch
+    if getattr(cfg, "rollout_steps_per_epoch", 0) and cfg.rollout_steps_per_epoch > 0:
+        rollout_limit = min(int(cfg.rollout_steps_per_epoch), steps_per_epoch)
     if cfg.total_train_steps == 0:
-        cfg.total_train_steps = cfg.total_epochs * steps_per_epoch
+        cfg.total_train_steps = cfg.total_epochs * rollout_limit
         logger.info("auto total_train_steps = %d", cfg.total_train_steps)
+    logger.info(
+        "train_loader batches/epoch=%d, rollout_limit=%d (Phase A & B steps per epoch), "
+        "total_train_steps=%d",
+        steps_per_epoch,
+        rollout_limit,
+        cfg.total_train_steps,
+    )
+
+    rollout_partition_mode = (
+        getattr(cfg, "rollout_partition_mode", "shuffle") or "shuffle"
+    ).strip().lower()
+    n_rollout_partition_groups = 0
+    rollout_partitions: Optional[List[List[int]]] = None
+    if rollout_partition_mode == "stratified":
+        n_rollout_partition_groups, rollout_partitions = build_stratified_rollout_partitions(
+            train_dataset,
+            cfg.train_batch_size,
+            rollout_limit,
+            int(getattr(cfg, "rollout_partition_seed", 42)),
+        )
+        logger.info(
+            "rollout_partition_mode=stratified: %d disjoint groups × %d batches/group "
+            "(epoch e uses group e mod %d; seed=%s)",
+            n_rollout_partition_groups,
+            rollout_limit,
+            n_rollout_partition_groups,
+            getattr(cfg, "rollout_partition_seed", 42),
+        )
+    else:
+        logger.info(
+            "rollout_partition_mode=shuffle: Phase A uses first %d batches from shuffled DataLoader",
+            rollout_limit,
+        )
 
     if accelerator.is_main_process:
         save_config_snapshot(cfg, Path(cfg.checkpoint_dir) / "config.json")
@@ -1653,10 +1691,11 @@ def main(cfg: ActorJudgeConfig) -> None:
         if accelerator.is_main_process:
             Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
             _phase_a_marker.unlink(missing_ok=True)
-            n_roll_batches = len(train_loader)
+            n_roll_batches = rollout_limit
             logger.info(
-                "Phase A: starting vLLM rollout (%d batches in train_loader) …",
+                "Phase A: starting vLLM rollout (%d batches this epoch; full train_loader=%d) …",
                 n_roll_batches,
+                steps_per_epoch,
             )
             _flush_logging()
             # If baseline/step validation kept a reusable vLLM actor, Phase A must NOT
@@ -1698,16 +1737,47 @@ def main(cfg: ActorJudgeConfig) -> None:
                     current_model_path,
                     **_vllm_actor_init_kwargs(cfg),
                 )
-            for rollout_step, batch in enumerate(train_loader):
+            if rollout_partition_mode == "stratified":
+                assert rollout_partitions is not None
+                _pidx = epoch % n_rollout_partition_groups
+                _plan = rollout_partitions[_pidx]
                 logger.info(
-                    "[progress] Phase A: rollout batch %d/%d (%d questions) …",
-                    rollout_step + 1,
-                    n_roll_batches,
-                    len(batch),
+                    "Phase A stratified: epoch %d uses partition %d/%d (%d batch indices) …",
+                    epoch + 1,
+                    _pidx,
+                    n_rollout_partition_groups,
+                    len(_plan),
                 )
                 _flush_logging()
-                exps = rollout_engine.run(batch, vllm_actor, epoch * steps_per_epoch + rollout_step)
-                epoch_experiences.extend(exps)
+                _Bsz = cfg.train_batch_size
+                for rollout_step, bi in enumerate(_plan):
+                    batch = [
+                        train_dataset[bi * _Bsz + j] for j in range(_Bsz)
+                    ]
+                    logger.info(
+                        "[progress] Phase A: rollout batch %d/%d (%d questions) …",
+                        rollout_step + 1,
+                        n_roll_batches,
+                        len(batch),
+                    )
+                    _flush_logging()
+                    exps = rollout_engine.run(
+                        batch, vllm_actor, epoch * rollout_limit + rollout_step
+                    )
+                    epoch_experiences.extend(exps)
+            else:
+                for rollout_step, batch in enumerate(islice(train_loader, rollout_limit)):
+                    logger.info(
+                        "[progress] Phase A: rollout batch %d/%d (%d questions) …",
+                        rollout_step + 1,
+                        n_roll_batches,
+                        len(batch),
+                    )
+                    _flush_logging()
+                    exps = rollout_engine.run(
+                        batch, vllm_actor, epoch * rollout_limit + rollout_step
+                    )
+                    epoch_experiences.extend(exps)
 
             logger.info(
                 "Phase A done: %d experiences collected. Killing vLLM ...",
@@ -1820,6 +1890,9 @@ def main(cfg: ActorJudgeConfig) -> None:
                 judge_loss = judge_trainer.train_step(buffer, global_step)
 
             # Step 3+4: Actor GRPO update (ON-POLICY, uses current rollout batch)
+            # Release Judge peak allocations before Actor forward (same GPUs under FSDP).
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             actor_loss = actor_trainer.train_step(batch_exps, judge, global_step)
 
             epoch_actor_loss += actor_loss
@@ -1986,6 +2059,27 @@ if __name__ == "__main__":
     parser.add_argument("--total_epochs",          type=int,   default=5)
     parser.add_argument("--num_train_samples",     type=int,   default=20_000)
     parser.add_argument(
+        "--rollout_steps_per_epoch",
+        type=int,
+        default=0,
+        help="Cap Phase-A rollout batches per epoch (= Phase-B steps/epoch). "
+        "0 = full len(train_loader). E.g. 250 for ~10%% of 20k/8 batches (dev/tuning).",
+    )
+    parser.add_argument(
+        "--rollout_partition_mode",
+        type=str,
+        default="shuffle",
+        choices=["shuffle", "stratified"],
+        help="shuffle: first N batches from shuffled loader each epoch (may repeat). "
+        "stratified: domain-balanced disjoint partitions; epoch e uses partition e mod n_groups.",
+    )
+    parser.add_argument(
+        "--rollout_partition_seed",
+        type=int,
+        default=42,
+        help="RNG seed for stratified batch partitions (ignored for shuffle mode).",
+    )
+    parser.add_argument(
         "--min_buffer_size",
         type=int,
         default=100,
@@ -2101,6 +2195,12 @@ if __name__ == "__main__":
         help="Max tokens for GRPO (Stage-1 chat prompt + strategy); left-truncates if exceeded",
     )
     parser.add_argument(
+        "--actor_microbatch_size",
+        type=int,
+        default=4,
+        help="GRPO micro-batch size per rank (gradient accumulation); 0 = full local slice",
+    )
+    parser.add_argument(
         "--judge_max_length",
         type=int,
         default=8192,
@@ -2167,6 +2267,9 @@ if __name__ == "__main__":
         actor_model_path=args.actor_model_path,
         total_epochs=args.total_epochs,
         num_train_samples=args.num_train_samples,
+        rollout_steps_per_epoch=args.rollout_steps_per_epoch,
+        rollout_partition_mode=args.rollout_partition_mode,
+        rollout_partition_seed=args.rollout_partition_seed,
         min_buffer_size=args.min_buffer_size,
         K=args.K,
         alpha=args.alpha,
@@ -2203,6 +2306,7 @@ if __name__ == "__main__":
         val_log_items_wandb_table=args.val_log_items_wandb_table,
         val_judge_score_batch_size=args.val_judge_score_batch_size,
         actor_max_length=args.actor_max_length,
+        actor_microbatch_size=args.actor_microbatch_size,
         judge_max_length=args.judge_max_length,
         max_stage1_prompt_tokens=args.max_stage1_prompt_tokens,
         dataset_stage1_reject_log=not args.no_dataset_stage1_reject_log,
