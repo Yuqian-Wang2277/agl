@@ -168,6 +168,9 @@ class ActorJudgeConfig:
     # ── WandB ─────────────────────────────────────────────────────────────────
     wandb_project: str = "ActorJudge"
     wandb_run_name: str = "phase2_co_evolution"
+    # If True and resume_from_checkpoint's training_state.json contains wandb_run_id,
+    # wandb.init(resume) continues the same online run (same curves / step axis).
+    wandb_resume: bool = True
 
     # ── Ablation switches ─────────────────────────────────────────────────────
     # Experiment A: freeze Judge → tests whether co-evolution is necessary

@@ -5,6 +5,7 @@
 # Usage:
 #   bash scripts/train.sh [--sft_checkpoint PATH] [--epochs N]
 #       [--num_train_samples N] [--rollout_steps_per_epoch N] [--val_steps N] [--save_steps N]
+#       [--wandb_project NAME] [--wandb_run_name NAME]
 #       [--min_buffer_size N]
 #       [--dry_run_val_size N] [--extra ARGS...]
 #   Default: --rollout_steps_per_epoch 250, --rollout_partition_mode stratified,
@@ -47,6 +48,7 @@ ALPHA=0.3
 DENSE_REWARD_ALPHA=0.3
 FREEZE_JUDGE=""
 DISABLE_UCB_REPLAY=""
+WANDB_PROJECT=""
 WANDB_RUN_NAME="phase2_co_evolution_$(date +%Y%m%d_%H%M%S)"
 RUN_NAME=""
 CHECKPOINT_ROOT=""
@@ -72,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --dense_reward_alpha) DENSE_REWARD_ALPHA="$2"; shift 2 ;;
         --freeze_judge)     FREEZE_JUDGE="--freeze_judge"; shift ;;
         --disable_ucb_replay) DISABLE_UCB_REPLAY="--disable_ucb_replay"; shift ;;
+        --wandb_project)    WANDB_PROJECT="$2";             shift 2 ;;
         --wandb_run_name)   WANDB_RUN_NAME="$2";            shift 2 ;;
         --run_name)         RUN_NAME="$2";                  shift 2 ;;
         --checkpoint_root)  CHECKPOINT_ROOT="$2";           shift 2 ;;
@@ -96,6 +99,11 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate agl
+
+# Single-machine Phase II: vLLM uses local Ray. A stale RAY_ADDRESS (e.g. from a
+# Slurm/other job pointing at 11.11.x.x:6379) makes ray.init() hang ~10+ min then
+# ConnectionError. Multi-node Ray users: export RAY_ADDRESS before this script.
+unset RAY_ADDRESS RAY_HEAD_IP 2>/dev/null || true
 
 cd "$PROJECT_DIR"
 echo "Working directory: $(pwd)"
@@ -164,6 +172,8 @@ CMD=(
     --val_steps "$VAL_STEPS"
     --save_steps "$SAVE_STEPS"
 )
+
+[[ -n "$WANDB_PROJECT" ]] && CMD+=("--wandb_project" "$WANDB_PROJECT")
 
 [[ -n "$MIN_BUFFER_SIZE" ]] && CMD+=("--min_buffer_size" "$MIN_BUFFER_SIZE")
 [[ -n "$DRY_RUN_VAL_SIZE" ]] && CMD+=("--dry_run_val_size" "$DRY_RUN_VAL_SIZE")

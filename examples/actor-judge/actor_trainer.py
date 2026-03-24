@@ -48,10 +48,9 @@ L3  Gradient clipping via cfg.max_grad_norm (default 1.0).
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
-import wandb
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -72,7 +71,7 @@ def tokenise_strategy_batch(
     model_max_length: int = 8192,
     *,
     accel=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], int]:
     """Tokenise (prompt + strategy) pairs and build three-part action_mask.
 
     C1 fix: uses exp.prompt_text — the exact chat-template formatted prompt
@@ -91,9 +90,11 @@ def tokenise_strategy_batch(
         attention_mask: [B, seq_len]   (0 = PAD)
         action_mask:    [B, seq_len]   (1 = strategy token, 0 = prompt / PAD)
         prompt_lengths: list of prompt token counts (one per sample in batch)
+        left_truncation_tokens: sum of tokens dropped by left-truncation (0 if none)
     """
     full_ids_list:       List[List[int]] = []
     prompt_lengths_calc: List[int]       = []   # correct p_len per sample
+    left_trunc_sum = 0
 
     for exp in experiences:
         # C1 fix: prompt_text is the exact chat-template string stored by rollout_engine.
@@ -111,6 +112,7 @@ def tokenise_strategy_batch(
         # even when the left-truncation eats into the prompt region.
         if len(f_ids) > model_max_length:
             overflow = len(f_ids) - model_max_length
+            left_trunc_sum += overflow
             # Left truncation drops the start of the prompt — few-shot lives there.
             # If this fires often, reduce fewshot_max or raise actor_max_length (config).
             msg = (
@@ -118,11 +120,6 @@ def tokenise_strategy_batch(
                 "Few-shot at the start of the prompt may be damaged."
             )
             logger.warning(msg)
-            if accel is not None and accel.is_main_process:
-                try:
-                    wandb.log({"train/actor_left_truncation_tokens": overflow}, commit=False)
-                except Exception:
-                    pass
             f_ids = f_ids[overflow:]
             p_len = max(0, len(p_ids) - overflow)
         else:
@@ -152,7 +149,7 @@ def tokenise_strategy_batch(
 
         prompt_lengths.append(p_len)
 
-    return batch_input_ids, batch_attn_mask, batch_action_mask, prompt_lengths
+    return batch_input_ids, batch_attn_mask, batch_action_mask, prompt_lengths, left_trunc_sum
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +271,7 @@ class ActorTrainer:
         experiences: List[Experience],
         judge_model: torch.nn.Module,
         global_step: int = 0,
-    ) -> float:
+    ) -> Tuple[float, Dict[str, float]]:
         """One GRPO update step.
 
         Args:
@@ -284,7 +281,7 @@ class ActorTrainer:
             global_step: For logging.
 
         Returns:
-            Scalar loss value (Python float).
+            (scalar loss, metrics dict for WandB — empty if step skipped).
         """
         B = self.cfg.train_batch_size
         K = self.cfg.K
@@ -294,11 +291,23 @@ class ActorTrainer:
         valid_exps = [e for e in experiences if e.outcome >= 0]
         if len(valid_exps) < 2:
             logger.warning("train_step: too few valid experiences (%d), skipping.", len(valid_exps))
-            return 0.0
+            return 0.0, {}
 
-        # Align B*K shape: we may have fewer than B*K valid after filtering
-        # Pad/truncate to a multiple of K for clean reshape
-        n_groups = max(1, len(valid_exps) // K)
+        # Align to full groups of K for GRPO Z-score (view(n_groups, K)).
+        #
+        # BUGFIX: never use max(1, len // K).  When 0 < len(valid_exps) < K,
+        # len // K == 0 but max(1, 0) == 1, so we'd keep 2..K-1 samples and then
+        # reward_adv.view(1, K) crashes (e.g. RuntimeError: shape '[1, 8]' is
+        # invalid for input of size 2).  This happens when a rollout batch has
+        # almost all format errors (y=-1) and <K valid trajectories remain.
+        n_groups = len(valid_exps) // K
+        if n_groups == 0:
+            logger.warning(
+                "train_step: %d valid experiences < K=%d (need a full question-group); skipping.",
+                len(valid_exps),
+                K,
+            )
+            return 0.0, {}
         valid_exps = valid_exps[: n_groups * K]
         BK = len(valid_exps)
 
@@ -339,6 +348,18 @@ class ActorTrainer:
         mask_valid_std   = (std_k > 1e-4).float()
         advantage        = ((reward_bk - mean_k) / (std_k + 1e-8)) * mask_valid_std
         advantage_flat_all = advantage.view(BK).detach()   # [BK], no grad
+
+        # WandB reward / advantage diagnostics (Fig 4 & Fig 3 — logged every N steps in train.py)
+        wb: Dict[str, float] = {}
+        with torch.no_grad():
+            y_hard = outcomes.float().clamp(min=0.0)
+            wb["train/reward_total_mean"] = float(reward_adv.mean().item())
+            wb["train/reward_hard_mean"] = float(y_hard.mean().item())
+            wb["train/reward_dense_mean"] = float(v_judge.mean().item())
+            wb["train/advantage_mean"] = float(advantage_flat_all.mean().item())
+            wb["train/advantage_std"] = (
+                float(advantage_flat_all.std(unbiased=False).item()) if BK > 1 else 0.0
+            )
 
         # ── Rank-based data split ─────────────────────────────────────────────────
         # Root cause of OOM: without this, every FSDP rank processes all BK
@@ -388,18 +409,25 @@ class ActorTrainer:
         clip_sum_w = 0.0
         kl_sum_w = 0.0
         total_loss_scalar = 0.0
+        eps_ppo = float(self.cfg.grpo_epsilon)
+        ratio_clipped_elems = 0
+        ratio_total_elems = 0
+        kl_elem_sum = 0.0
+        kl_elem_count = 0
+        trunc_tokens_step = 0
 
         for s in range(0, local_n, micro):
             t = min(s + micro, local_n)
             chunk_exps = local_exps[s:t]
             adv_chunk = advantage_flat[s:t]
 
-            input_ids, attn_mask, action_mask, _ = tokenise_strategy_batch(
+            input_ids, attn_mask, action_mask, _, left_trunc = tokenise_strategy_batch(
                 chunk_exps,
                 self.tok,
                 model_max_length=amax,
                 accel=self.accel,
             )
+            trunc_tokens_step += left_trunc
             input_ids = input_ids.to(device)
             attn_mask = attn_mask.to(device)
             action_mask = action_mask.to(device)
@@ -423,7 +451,7 @@ class ActorTrainer:
 
             ratio = torch.exp(log_prob_actor - log_prob_old)
             ratio_clipped = ratio.clamp(
-                1 - self.cfg.grpo_epsilon, 1 + self.cfg.grpo_epsilon
+                1 - eps_ppo, 1 + eps_ppo
             )
             clip_loss = -torch.min(
                 ratio * adv_chunk,
@@ -432,6 +460,13 @@ class ActorTrainer:
 
             kl_per_sample = log_prob_actor - log_prob_ref
             kl_loss = self.cfg.kl_penalty_beta * kl_per_sample.mean()
+            # Fig 3: KL (mean per-sample, nats) & clipped ratio fraction
+            kl_elem_sum += float(kl_per_sample.sum().item())
+            kl_elem_count += int(kl_per_sample.numel())
+            ratio_clipped_elems += int(
+                ((ratio < 1.0 - eps_ppo) | (ratio > 1.0 + eps_ppo)).sum().item()
+            )
+            ratio_total_elems += int(ratio.numel())
 
             chunk_total = clip_loss + kl_loss
             w = (t - s) / float(local_n)
@@ -442,7 +477,7 @@ class ActorTrainer:
             total_loss_scalar += chunk_total.item() * w
 
         # L3: gradient clipping (after full local accumulation)
-        self.accel.clip_grad_norm_(
+        actor_grad_norm = self.accel.clip_grad_norm_(
             self.actor.parameters(),
             getattr(self.cfg, "max_grad_norm", 1.0),
         )
@@ -454,7 +489,13 @@ class ActorTrainer:
             "ActorTrainer step %d: clip_loss=%.4f kl_loss=%.4f BK=%d n_groups=%d local_BK=%d micro=%d",
             global_step, clip_sum_w, kl_sum_w, BK, n_groups, local_n, micro,
         )
-        return total_loss_scalar
+        wb["train/kl_divergence"] = kl_elem_sum / max(kl_elem_count, 1)
+        wb["train/ratio_clipped_fraction"] = ratio_clipped_elems / max(ratio_total_elems, 1)
+        wb["train/actor_left_truncation_tokens"] = float(trunc_tokens_step)
+        if actor_grad_norm is not None:
+            gn = actor_grad_norm.detach() if hasattr(actor_grad_norm, "detach") else actor_grad_norm
+            wb["train/actor_grad_norm"] = float(gn.item() if hasattr(gn, "item") else float(gn))
+        return total_loss_scalar, wb
 
     # ------------------------------------------------------------------
 

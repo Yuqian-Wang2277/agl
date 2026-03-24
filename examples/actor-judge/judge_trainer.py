@@ -12,7 +12,7 @@ buffer.sample() is ONLY called here, never in actor_trainer (On-Policy boundary)
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -58,11 +58,11 @@ class JudgeTrainer:
         self,
         buffer: UCBBuffer,
         global_step: int = 0,
-    ) -> float:
+    ) -> Tuple[float, Optional[Dict[str, float]]]:
         """One ODVA update step.
 
         Returns:
-            Scalar loss value (Python float), or 0.0 if buffer is too sparse.
+            (scalar loss, optional WandB metrics dict), or (0.0, None) if skipped.
         """
         device = self.accel.device
 
@@ -85,7 +85,7 @@ class JudgeTrainer:
             pairs = buffer.sample_pairwise(self.cfg.judge_batch_size)
         if not pairs:
             logger.debug("JudgeTrainer step %d: buffer too sparse, skipping.", global_step)
-            return 0.0
+            return 0.0, None
 
         # ── Tokenise win/lose: truncate body only, then append <|judge|> ids ─
         jmax = int(getattr(self.cfg, "judge_max_length", 8192))
@@ -129,8 +129,8 @@ class JudgeTrainer:
         loss = bt_loss + l2_penalty
 
         self.accel.backward(loss)
-        # L3: gradient clipping
-        self.accel.clip_grad_norm_(self.judge.parameters(), self.max_grad_norm)
+        # L3: gradient clipping (return value = total norm before clipping)
+        judge_grad_norm = self.accel.clip_grad_norm_(self.judge.parameters(), self.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
 
@@ -143,11 +143,21 @@ class JudgeTrainer:
             buffer.update_v_pred(pair.q_hash, pair.traj_id_win,  scores_win[i])
             buffer.update_v_pred(pair.q_hash, pair.traj_id_lose, scores_lose[i])
 
+        margin = (torch.sigmoid(logit_win) - torch.sigmoid(logit_lose)).mean().item()
+        judge_wb: Dict[str, float] = {
+            "train/judge_bt_loss": float(bt_loss.item()),
+            "train/judge_l2_penalty": float(l2_penalty.item()),
+            "train/judge_score_margin": float(margin),
+        }
+        if judge_grad_norm is not None:
+            gn = judge_grad_norm.detach() if hasattr(judge_grad_norm, "detach") else judge_grad_norm
+            judge_wb["train/judge_grad_norm"] = float(gn.item() if hasattr(gn, "item") else float(gn))
+
         logger.info(
             "JudgeTrainer step %d: bt_loss=%.4f l2=%.4f total=%.4f n_pairs=%d",
             global_step, bt_loss.item(), l2_penalty.item(), loss.item(), len(pairs),
         )
-        return loss.item()
+        return loss.item(), judge_wb
 
     # ------------------------------------------------------------------
 

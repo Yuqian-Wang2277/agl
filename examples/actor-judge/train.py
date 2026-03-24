@@ -1121,9 +1121,12 @@ def save_checkpoint(
             judge_trainer.optimizer.state_dict(),
             os.path.join(ckpt_dir, "judge_optimizer.pt"),
         )
-        # Training metadata
+        # Training metadata (+ wandb run id for resume / same-curve continuation)
+        train_state: Dict[str, Any] = {"epoch": epoch, "global_step": global_step}
+        if wandb.run is not None:
+            train_state["wandb_run_id"] = wandb.run.id
         with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
-            json.dump({"epoch": epoch, "global_step": global_step}, f)
+            json.dump(train_state, f)
         if eval_results is not None:
             with open(os.path.join(ckpt_dir, "eval_results.json"), "w") as f:
                 json.dump(eval_results, f, indent=2, default=str)
@@ -1161,6 +1164,47 @@ def try_resume(
     return start_epoch, global_step
 
 
+def _read_wandb_run_id_from_checkpoint(resume_dir: str) -> Optional[str]:
+    """Return wandb run id stored in training_state.json, or None."""
+    if not resume_dir or not os.path.isdir(resume_dir):
+        return None
+    state_path = os.path.join(resume_dir, "training_state.json")
+    if not os.path.isfile(state_path):
+        return None
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    rid = state.get("wandb_run_id")
+    return rid if isinstance(rid, str) and rid.strip() else None
+
+
+def _wandb_init(cfg: ActorJudgeConfig) -> None:
+    """Main process only. Resumes the same W&B run when checkpoint stores wandb_run_id."""
+    resume_id: Optional[str] = None
+    if cfg.wandb_resume and (cfg.resume_from_checkpoint or "").strip():
+        resume_id = _read_wandb_run_id_from_checkpoint(cfg.resume_from_checkpoint.strip())
+
+    if resume_id:
+        wandb.init(
+            project=cfg.wandb_project,
+            name=cfg.wandb_run_name,
+            config=cfg.__dict__,
+            id=resume_id,
+            resume="allow",
+        )
+        logger.info("WandB: resuming run id=%s (same project / entity as original)", resume_id)
+    else:
+        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=cfg.__dict__)
+        if (cfg.resume_from_checkpoint or "").strip() and cfg.wandb_resume:
+            logger.info(
+                "WandB: starting a new run (no wandb_run_id in %s/training_state.json — "
+                "save a checkpoint after upgrading, or use an older run without id).",
+                cfg.resume_from_checkpoint.strip(),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1175,7 +1219,7 @@ def main(cfg: ActorJudgeConfig) -> None:
 
     # ── WandB (main process only) ────────────────────────────────────────────
     if accelerator.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=cfg.__dict__)
+        _wandb_init(cfg)
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(cfg.start_model_path, trust_remote_code=True)
@@ -1593,9 +1637,24 @@ def main(cfg: ActorJudgeConfig) -> None:
     if accelerator.is_main_process and not ray.is_initialized():
         logger.info("[progress] Initializing Ray on rank 0 only …")
         _flush_logging()
+        # Stale RAY_ADDRESS (e.g. from Slurm / another node's IP in ~/.bashrc) makes
+        # Ray try to join a remote cluster and hang until timeout. Single-machine
+        # Phase II must always start a local Ray — ignore inherited cluster address.
+        for _ray_addr_key in (
+            "RAY_ADDRESS",
+            "RAY_HEAD_IP",
+            "RAY_ADDRESS_IP",
+            "RAY_GCS_SERVER_ADDRESS",
+        ):
+            if _ray_addr_key in os.environ:
+                logger.info(
+                    "[progress] Clearing %s so vLLM uses local Ray (was %r).",
+                    _ray_addr_key,
+                    os.environ.pop(_ray_addr_key),
+                )
         # Prevent Ray from overriding CUDA_VISIBLE_DEVICES when num_gpus=0.
         os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-        ray.init(ignore_reinit_error=True)
+        ray.init(ignore_reinit_error=True, address="local")
     if accelerator.is_main_process:
         logger.info(
             "[progress] Next: sync FSDP Actor weights to disk → vLLM validation / rollouts. "
@@ -1886,32 +1945,48 @@ def main(cfg: ActorJudgeConfig) -> None:
 
             # Step 2: Judge update (OFF-POLICY, uses buffer history)
             judge_loss = 0.0
+            judge_metrics = None
             if not cfg.freeze_judge and len(buffer) >= cfg.min_buffer_size:
-                judge_loss = judge_trainer.train_step(buffer, global_step)
+                judge_loss, judge_metrics = judge_trainer.train_step(buffer, global_step)
 
             # Step 3+4: Actor GRPO update (ON-POLICY, uses current rollout batch)
             # Release Judge peak allocations before Actor forward (same GPUs under FSDP).
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            actor_loss = actor_trainer.train_step(batch_exps, judge, global_step)
+            actor_loss, actor_metrics = actor_trainer.train_step(batch_exps, judge, global_step)
 
             epoch_actor_loss += actor_loss
             epoch_judge_loss += judge_loss
 
-            # ── Per-step logging ──────────────────────────────────────────
-            if accelerator.is_main_process and global_step % 50 == 0:
+            # ── Training metrics: every Phase-B step (frequency decoupled from val_steps) ──
+            if accelerator.is_main_process:
                 n_correct = sum(1 for e in batch_exps if e.outcome == 1)
                 n_valid   = sum(1 for e in batch_exps if e.outcome >= 0)
+                n_batch   = len(batch_exps)
+                n_fmt     = sum(1 for e in batch_exps if e.outcome == -1)
+                tok_lens = [
+                    len(tokenizer.encode(e.strategy, add_special_tokens=False))
+                    for e in batch_exps
+                ]
                 metrics = {
                     "train/actor_loss":        actor_loss,
                     "train/judge_loss":        judge_loss,
                     "train/pass_rate":         n_correct / max(n_valid, 1),
                     "train/buffer_size":       len(buffer),
                     "train/global_step":       global_step,
+                    "train/actor_lr":          actor_trainer.optimizer.param_groups[0]["lr"],
+                    "train/judge_lr":          judge_trainer.optimizer.param_groups[0]["lr"],
+                    "train/format_error_rate": n_fmt / max(n_batch, 1),
+                    "train/average_strategy_length": (
+                        sum(tok_lens) / max(len(tok_lens), 1) if tok_lens else 0.0
+                    ),
                 }
                 soft_vals = [e.outcome_soft for e in batch_exps if e.outcome >= 0]
                 if soft_vals:
                     metrics["train/v3_soft_mean"] = sum(soft_vals) / len(soft_vals)
+                if judge_metrics:
+                    metrics.update(judge_metrics)
+                metrics.update(actor_metrics)
                 wandb.log(metrics, step=global_step)
 
             # ── Step-level validation + checkpoint (replaces epoch-based val_freq) ──
@@ -2091,7 +2166,18 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_judge",          action="store_true")
     parser.add_argument("--dense_reward_alpha",    type=float, default=0.3)
     parser.add_argument("--disable_ucb_replay",    action="store_true")
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="ActorJudge",
+        help="Weights & Biases project name (override for ablations / separate dashboards)",
+    )
     parser.add_argument("--wandb_run_name",        type=str, default="phase2_co_evolution")
+    parser.add_argument(
+        "--no_wandb_resume",
+        action="store_true",
+        help="Ignore wandb_run_id in checkpoint: always start a new W&B run (fork experiment)",
+    )
     parser.add_argument("--resume_from_checkpoint", type=str, default="")
     parser.add_argument(
         "--judge_warmup_mode",
@@ -2276,7 +2362,9 @@ if __name__ == "__main__":
         dense_reward_alpha=args.dense_reward_alpha,
         freeze_judge=args.freeze_judge,
         disable_ucb_replay=args.disable_ucb_replay,
+        wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        wandb_resume=not args.no_wandb_resume,
         resume_from_checkpoint=args.resume_from_checkpoint,
         judge_warmup_mode=args.judge_warmup_mode,
         judge_init_checkpoint=args.judge_init_checkpoint,
