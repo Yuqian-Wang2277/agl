@@ -63,6 +63,13 @@ class ActorJudgeConfig:
     tensor_parallel_size: int = 8
     # Chunked-prefill cap (vLLM default is often 16384; lower = lower peak VRAM during long prompts).
     vllm_max_num_batched_tokens: int | None = 4096
+    # Cap vLLM context length. If unset (None), HF max_position_embeddings is used (often 40960)
+    # and allocates a huge KV pool — risky when FSDP shares the same GPUs for long Phase-A runs.
+    # 16384 comfortably covers max_stage1_prompt_tokens (4096) + strategy/answer max_tokens (4096+4096).
+    vllm_max_model_len: int | None = 16384
+    # Prefix caching speeds up shared few-shot prompts but can grow memory over long rollouts
+    # on the same engine; default False when FSDP + vLLM share GPUs.
+    vllm_enable_prefix_caching: bool = False
     # Split rollout generate() into chunks of at most N prompts (0 = one call, legacy).
     # Strongly recommended when B×K is large or max_tokens is high.
     vllm_rollout_prompt_chunk_size: int = 32
@@ -101,6 +108,9 @@ class ActorJudgeConfig:
     actor_lr: float = 1e-6
     judge_lr: float = 1e-5
     judge_batch_size: int = 16         # pairwise pairs per Judge update step
+    # Forward/backward chunks within one Judge step (reduces activation VRAM vs full batch).
+    # Must be >=1 and <= judge_batch_size; lower if Judge backward OOMs after Phase A.
+    judge_microbatch_pairs: int = 4
     # Judge warmup vs Phase II: distinguish ``resume`` (full run state) from
     # ``judge_init_checkpoint`` (weights only, fresh optimizer for co-evolution).
     judge_warmup: bool = True          # If False, forces judge_warmup_mode="cold"

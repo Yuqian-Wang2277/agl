@@ -165,7 +165,9 @@ def _safe_vllm_gpu_memory_utilization(cfg: ActorJudgeConfig) -> float:
             ratios.append(free_b / total_b)
     if not ratios:
         return want
-    cap = min(ratios) * 0.97
+    # Slightly conservative: vLLM KV + activations can grow during long Phase-A
+    # sessions (same engine, many chunks); leave slack beyond instantaneous free/total.
+    cap = min(ratios) * 0.90
     out = min(want, cap)
     out = max(0.05, out)
     if out + 1e-5 < want:
@@ -190,6 +192,10 @@ def _vllm_actor_init_kwargs(cfg: ActorJudgeConfig) -> Dict[str, Any]:
     mbt = getattr(cfg, "vllm_max_num_batched_tokens", None)
     if mbt is not None:
         kw["max_num_batched_tokens"] = int(mbt)
+    kw["enable_prefix_caching"] = bool(getattr(cfg, "vllm_enable_prefix_caching", False))
+    mml = getattr(cfg, "vllm_max_model_len", None)
+    if mml is not None:
+        kw["max_model_len"] = int(mml)
     return kw
 
 
@@ -1947,6 +1953,8 @@ def main(cfg: ActorJudgeConfig) -> None:
             judge_loss = 0.0
             judge_metrics = None
             if not cfg.freeze_judge and len(buffer) >= cfg.min_buffer_size:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 judge_loss, judge_metrics = judge_trainer.train_step(buffer, global_step)
 
             # Step 3+4: Actor GRPO update (ON-POLICY, uses current rollout batch)
@@ -2293,6 +2301,12 @@ if __name__ == "__main__":
         help="Max tokens for Judge body + <|judge|> anchor (body truncated, anchor kept)",
     )
     parser.add_argument(
+        "--judge_microbatch_pairs",
+        type=int,
+        default=4,
+        help="Judge ODVA: pairwise pairs per forward/backward chunk (lower = less VRAM).",
+    )
+    parser.add_argument(
         "--max_stage1_prompt_tokens",
         type=int,
         default=4000,
@@ -2314,6 +2328,18 @@ if __name__ == "__main__":
         type=int,
         default=4096,
         help="vLLM chunked-prefill cap (lower = lower peak VRAM). 0 = use vLLM default.",
+    )
+    parser.add_argument(
+        "--vllm_max_model_len",
+        type=int,
+        default=16384,
+        help="vLLM max_model_len (caps KV pool). 0 = use HF max (often 40960; very large KV).",
+    )
+    parser.add_argument(
+        "--vllm_prefix_caching",
+        action="store_true",
+        default=False,
+        help="Enable vLLM prefix caching (faster; can increase RAM over long Phase-A).",
     )
     parser.add_argument(
         "--strategy_max_tokens",
@@ -2396,6 +2422,7 @@ if __name__ == "__main__":
         actor_max_length=args.actor_max_length,
         actor_microbatch_size=args.actor_microbatch_size,
         judge_max_length=args.judge_max_length,
+        judge_microbatch_pairs=args.judge_microbatch_pairs,
         max_stage1_prompt_tokens=args.max_stage1_prompt_tokens,
         dataset_stage1_reject_log=not args.no_dataset_stage1_reject_log,
         stage1_length_chars_per_token=args.stage1_length_chars_per_token,
@@ -2403,6 +2430,8 @@ if __name__ == "__main__":
         vllm_max_num_batched_tokens=(
             None if args.vllm_max_num_batched_tokens == 0 else args.vllm_max_num_batched_tokens
         ),
+        vllm_max_model_len=(None if args.vllm_max_model_len == 0 else args.vllm_max_model_len),
+        vllm_enable_prefix_caching=args.vllm_prefix_caching,
         strategy_max_tokens=args.strategy_max_tokens,
         answer_max_tokens=args.answer_max_tokens,
         gpu_memory_utilization=args.gpu_memory_utilization,

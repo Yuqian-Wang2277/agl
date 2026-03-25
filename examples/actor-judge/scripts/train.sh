@@ -63,6 +63,8 @@ MIN_BUFFER_SIZE=""
 DRY_RUN_VAL_SIZE=""
 EXTRA_ARGS=""
 JUDGE_WARMUP_CKPT=""
+# Passed to train.py --vllm_max_num_batched_tokens (empty = train.py default, usually 4096).
+VLLM_MAX_NUM_BATCHED_TOKENS=""
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -88,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --min_buffer_size)   MIN_BUFFER_SIZE="$2";          shift 2 ;;
         --dry_run_val_size)  DRY_RUN_VAL_SIZE="$2";         shift 2 ;;
         --judge_warmup_ckpt) JUDGE_WARMUP_CKPT="$2";        shift 2 ;;
+        --vllm_max_num_batched_tokens) VLLM_MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
         --extra)            EXTRA_ARGS="$2";                shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -112,6 +115,8 @@ echo "Working directory: $(pwd)"
 # Without this the distributed launcher only shows "exitcode 1, traceback: N/A".
 export TORCHELASTIC_ERROR_FILE="${TORCHELASTIC_ERROR_FILE:-/tmp/torch_elastic_error_$(date +%Y%m%d_%H%M%S).json}"
 echo "Rank error file: $TORCHELASTIC_ERROR_FILE"
+# Reduces allocator fragmentation during long FSDP + Judge backward (PyTorch 2.x).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 [[ -z "$CHECKPOINT_ROOT" ]] && CHECKPOINT_ROOT="$PROJECT_DIR/checkpoints_actor_judge"
 
@@ -179,6 +184,8 @@ CMD=(
 [[ -n "$DRY_RUN_VAL_SIZE" ]] && CMD+=("--dry_run_val_size" "$DRY_RUN_VAL_SIZE")
 
 [[ -n "$RESUME_FROM" ]] && CMD+=("--resume_from_checkpoint" "$RESUME_FROM")
+
+[[ -n "$VLLM_MAX_NUM_BATCHED_TOKENS" ]] && CMD+=("--vllm_max_num_batched_tokens" "$VLLM_MAX_NUM_BATCHED_TOKENS")
 
 [[ -n "$FREEZE_JUDGE"      ]] && CMD+=("$FREEZE_JUDGE")
 [[ -n "$DISABLE_UCB_REPLAY" ]] && CMD+=("$DISABLE_UCB_REPLAY")

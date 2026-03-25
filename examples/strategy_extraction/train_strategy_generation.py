@@ -262,6 +262,8 @@ def _create_strategy_generation_dataset_per_subtask(
                         "problem": problem_text,
                         "ground_truth": ground_truth,
                         "ground_truths": [ground_truth],
+                        # Used by VERL daemon for val/{data_source}/* WandB metrics (per validation split).
+                        "data_source": split_name,
                         "task_meta": {
                             "problem_type": problem_type,
                             "subtask": subtask_name,
@@ -536,6 +538,7 @@ def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
 def train(
     *,
     data_base_path: str,
+    val_data_base_path: str,
     train_subdir: str,
     val_subdir: str,
     val_subdirs: list[str] | None = None,
@@ -622,9 +625,12 @@ def train(
         os.environ["AGL_SERVER_PORT"] = str(free_port)
         logger.info(f"Using port: {free_port}")
 
-    # Data paths
+    # Data paths — training and validation roots may differ (e.g. custom train corpus + standard eval).
     train_dir = os.path.join(data_base_path, train_subdir)
+    val_root = (val_data_base_path or "").strip() or data_base_path
     validation_subdirs = val_subdirs if val_subdirs else [val_subdir]
+    logger.info(f"Train data directory: {train_dir}")
+    logger.info(f"Validation data root: {val_root}")
     logger.info(f"Validation sets: {validation_subdirs}")
     if val_sampling_mode == "per_subtask_fixed" and val_samples_per_subtask <= 0:
         raise ValueError("val_samples_per_subtask must be > 0 in per_subtask_fixed mode")
@@ -683,6 +689,7 @@ def train(
                         "timestamp": datetime.now().isoformat(),
                         "training_mode": "strategy_generation",
                         "data_base_path": data_base_path,
+                        "val_data_base_path": val_root,
                         "train_subdir": train_subdir,
                         "val_subdirs": validation_subdirs,
                         "model_path": model_path,
@@ -753,7 +760,7 @@ def train(
 
     val_datasets = []
     for i, vs in enumerate(validation_subdirs):
-        vd = os.path.join(data_base_path, vs)
+        vd = os.path.join(val_root, vs)
         logger.info(f"Loading val set {i + 1}/{len(validation_subdirs)}: {vs}")
         if val_sampling_mode == "per_subtask_fixed":
             vds = _create_strategy_generation_dataset_per_subtask(
@@ -973,6 +980,13 @@ def main() -> None:
 
     # Data
     parser.add_argument("--data-base-path", type=str, default=StrategyConfig.data_base_path)
+    parser.add_argument(
+        "--val-data-base-path",
+        type=str,
+        default="",
+        help="Root directory containing val-subdirs (test-id-subtask, etc.). "
+        "If empty, defaults to --data-base-path.",
+    )
     parser.add_argument("--train-subdir", type=str, default=StrategyConfig.train_subdir)
     parser.add_argument(
         "--train-dataset-json",
@@ -1176,6 +1190,7 @@ def main() -> None:
 
     train(
         data_base_path=args.data_base_path,
+        val_data_base_path=args.val_data_base_path,
         train_subdir=args.train_subdir,
         train_dataset_json=args.train_dataset_json,
         val_subdir=args.val_subdir,

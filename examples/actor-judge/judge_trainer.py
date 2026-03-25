@@ -87,66 +87,88 @@ class JudgeTrainer:
             logger.debug("JudgeTrainer step %d: buffer too sparse, skipping.", global_step)
             return 0.0, None
 
+        n_pairs_total = len(pairs)
+        mb = int(getattr(self.cfg, "judge_microbatch_pairs", 16))
+        mb = max(1, min(mb, n_pairs_total))
+
         # ── Tokenise win/lose: truncate body only, then append <|judge|> ids ─
         jmax = int(getattr(self.cfg, "judge_max_length", 8192))
-        win_bodies = [
-            build_judge_prompt_body(
-                [], p.exp_win.question, p.exp_win.strategy,
-                context_text_raw=p.exp_win.context_text,
-            )
-            for p in pairs
-        ]
-        lose_bodies = [
-            build_judge_prompt_body(
-                [], p.exp_lose.question, p.exp_lose.strategy,
-                context_text_raw=p.exp_lose.context_text,
-            )
-            for p in pairs
-        ]
 
-        inputs_win = {
-            k: v.to(device) for k, v in encode_batch_for_judge(self.tok, win_bodies, jmax).items()
-        }
-        inputs_lose = {
-            k: v.to(device) for k, v in encode_batch_for_judge(self.tok, lose_bodies, jmax).items()
-        }
-
-        # ── Forward pass ──────────────────────────────────────────────────
+        # Micro-batched forward/backward: full judge_batch_size pairs would run two
+        # long-sequence forwards at once; backward peak VRAM can OOM on 80 GiB when
+        # Actor+Ref+Judge FSDP already fill most of the device.
         self.optimizer.zero_grad()
         self.judge.train()
 
-        logit_win  = self.judge(**inputs_win)    # [batch]
-        logit_lose = self.judge(**inputs_lose)   # [batch]
+        total_bt = 0.0
+        total_l2 = 0.0
+        scores_win: List[float] = []
+        scores_lose: List[float] = []
+        sum_margin = 0.0
 
-        # ── Bradley-Terry loss ────────────────────────────────────────────
-        bt_loss = -F.logsigmoid(logit_win - logit_lose).mean()
+        for start in range(0, n_pairs_total, mb):
+            chunk = pairs[start : start + mb]
+            win_bodies = [
+                build_judge_prompt_body(
+                    [], p.exp_win.question, p.exp_win.strategy,
+                    context_text_raw=p.exp_win.context_text,
+                )
+                for p in chunk
+            ]
+            lose_bodies = [
+                build_judge_prompt_body(
+                    [], p.exp_lose.question, p.exp_lose.strategy,
+                    context_text_raw=p.exp_lose.context_text,
+                )
+                for p in chunk
+            ]
 
-        # L2 logit regularisation — prevents logits drifting to ±∞ (saturation)
-        # Without this, BT loss only constrains the *difference*, not the scale.
-        # Logits at ±100 make sigmoid gradients vanish → Judge stops learning.
-        l2_penalty = 0.001 * (logit_win ** 2 + logit_lose ** 2).mean()
+            inputs_win = {
+                k: v.to(device) for k, v in encode_batch_for_judge(self.tok, win_bodies, jmax).items()
+            }
+            inputs_lose = {
+                k: v.to(device) for k, v in encode_batch_for_judge(self.tok, lose_bodies, jmax).items()
+            }
 
-        loss = bt_loss + l2_penalty
+            logit_win = self.judge(**inputs_win)
+            logit_lose = self.judge(**inputs_lose)
 
-        self.accel.backward(loss)
-        # L3: gradient clipping (return value = total norm before clipping)
+            bt_loss = -F.logsigmoid(logit_win - logit_lose).mean()
+            l2_penalty = 0.001 * (logit_win ** 2 + logit_lose ** 2).mean()
+            loss = bt_loss + l2_penalty
+            # Gradient accumulation: scale so the sum of microbatch gradients equals
+            # the gradient of the mean loss over all n_pairs_total pairs.
+            loss = loss * (len(chunk) / n_pairs_total)
+
+            self.accel.backward(loss)
+
+            with torch.no_grad():
+                sw = torch.sigmoid(logit_win)
+                sl = torch.sigmoid(logit_lose)
+                scores_win.extend(sw.cpu().tolist())
+                scores_lose.extend(sl.cpu().tolist())
+                sum_margin += (sw - sl).sum().item()
+
+            total_bt += bt_loss.item() * len(chunk)
+            total_l2 += l2_penalty.item() * len(chunk)
+
+            del inputs_win, inputs_lose, logit_win, logit_lose, loss, bt_loss, l2_penalty
+
+        avg_bt = total_bt / n_pairs_total
+        avg_l2 = total_l2 / n_pairs_total
+        margin = sum_margin / n_pairs_total
+
         judge_grad_norm = self.accel.clip_grad_norm_(self.judge.parameters(), self.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
-
-        # ── Write back Judge scores to buffer (O(1) via traj_id) ──────────
-        with torch.no_grad():
-            scores_win  = torch.sigmoid(logit_win).cpu().tolist()
-            scores_lose = torch.sigmoid(logit_lose).cpu().tolist()
 
         for i, pair in enumerate(pairs):
             buffer.update_v_pred(pair.q_hash, pair.traj_id_win,  scores_win[i])
             buffer.update_v_pred(pair.q_hash, pair.traj_id_lose, scores_lose[i])
 
-        margin = (torch.sigmoid(logit_win) - torch.sigmoid(logit_lose)).mean().item()
         judge_wb: Dict[str, float] = {
-            "train/judge_bt_loss": float(bt_loss.item()),
-            "train/judge_l2_penalty": float(l2_penalty.item()),
+            "train/judge_bt_loss": float(avg_bt),
+            "train/judge_l2_penalty": float(avg_l2),
             "train/judge_score_margin": float(margin),
         }
         if judge_grad_norm is not None:
@@ -154,10 +176,15 @@ class JudgeTrainer:
             judge_wb["train/judge_grad_norm"] = float(gn.item() if hasattr(gn, "item") else float(gn))
 
         logger.info(
-            "JudgeTrainer step %d: bt_loss=%.4f l2=%.4f total=%.4f n_pairs=%d",
-            global_step, bt_loss.item(), l2_penalty.item(), loss.item(), len(pairs),
+            "JudgeTrainer step %d: bt_loss=%.4f l2=%.4f total=%.4f n_pairs=%d (microbatch=%d)",
+            global_step,
+            avg_bt,
+            avg_l2,
+            avg_bt + avg_l2,
+            n_pairs_total,
+            mb,
         )
-        return loss.item(), judge_wb
+        return avg_bt + avg_l2, judge_wb
 
     # ------------------------------------------------------------------
 

@@ -99,7 +99,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             # - Prompts > max_prompt_length: truncated and DROPPED from training (no gradient update)
             # - Responses > max_response_length: truncated but KEPT in training
             # - Must satisfy: max_prompt_length + max_response_length < max_model_len
-            "max_prompt_length": 8192,  # Conservative limit for few-shot prompts
+            "max_prompt_length": 16384,  # Conservative limit for few-shot prompts
             "max_response_length": 16384,   # Target ~500 tokens, with buffer for variation
             "filter_overlong_prompts": True,  # Enable prompt filtering
         },

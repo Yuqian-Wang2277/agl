@@ -105,6 +105,8 @@ class VLLMActor:
         gpu_memory_utilization: float = 0.75,  # P3: ≤0.75
         enforce_eager: bool = True,
         max_num_batched_tokens: int | None = None,
+        enable_prefix_caching: bool = True,
+        max_model_len: int | None = None,
     ) -> None:
         import os
         # Clear torchrun/FSDP distributed env vars inherited from rank-0 process.
@@ -130,7 +132,7 @@ class VLLMActor:
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
-            enable_prefix_caching=True,   # M5: few-shot context is shared → big speedup
+            enable_prefix_caching=enable_prefix_caching,
             trust_remote_code=True,
             # Disable CUDA Graph capture and torch.compile (level-3 inductor).
             # Without this, vLLM v0.10+ compiles 67 CUDA graph sizes on first
@@ -141,6 +143,8 @@ class VLLMActor:
         )
         if max_num_batched_tokens is not None:
             _llm_kw["max_num_batched_tokens"] = int(max_num_batched_tokens)
+        if max_model_len is not None:
+            _llm_kw["max_model_len"] = int(max_model_len)
         self.llm = LLM(**_llm_kw)
 
     def generate(

@@ -21,6 +21,7 @@ from verl import DataProto
 
 from agentlightning import LLM, AgentLightningServer, NamedResources, RolloutLegacy
 from agentlightning.adapter.triplet import TracerTraceToTriplet, TraceToTripletBase
+from agentlightning.emitter.reward import get_rewards_from_span
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.store.base import LightningStore
 from agentlightning.types import EnqueueRolloutRequest, Rollout, RolloutConfig, Task
@@ -30,6 +31,15 @@ __all__ = [
     "get_left_padded_ids_and_attention_mask",
     "get_right_padded_ids_and_attention_mask",
 ]
+
+
+def _reward_dimensions_from_spans(spans: List[Any]) -> Dict[str, float]:
+    """Parse the latest multi-dimensional reward annotation from rollout spans."""
+    for span in reversed(spans):
+        rewards = get_rewards_from_span(span)
+        if rewards:
+            return {str(r.name): float(r.value) for r in rewards}
+    return {}
 
 
 def ids_startswith(
@@ -770,6 +780,9 @@ class AgentModeDaemon:
 
         result_metadata = dict(rollout.metadata or {})
         result_metadata["rollout_status"] = rollout.status
+        rdim = _reward_dimensions_from_spans(spans)
+        if rdim:
+            result_metadata["reward_dimensions"] = rdim
 
         # Create the Rollout object (without trace and logs as per user's note)
         result_rollout = RolloutLegacy(
@@ -847,6 +860,7 @@ class AgentModeDaemon:
         for rollout_id, rollout in self._completed_rollouts_v0.items():
             final_reward_raw: Optional[float] = rollout.final_reward
             final_reward = self._fillna_reward(rollout)
+            rd_meta = (rollout.metadata or {}).get("reward_dimensions") or {}
             if not rollout.triplets:
                 rollout_status = (
                     rollout.metadata.get("rollout_status", "unknown")
@@ -857,7 +871,13 @@ class AgentModeDaemon:
                     f"Warning: No triplets found for test rollout {rollout.rollout_id} "
                     f"(rollout_status={rollout_status})."
                 )
-                sample_stat_list.append({"reward": final_reward, "has_reward": final_reward_raw is not None})
+                sample_stat_list.append(
+                    {
+                        "reward": final_reward,
+                        "has_reward": final_reward_raw is not None,
+                        "reward_dimensions": rd_meta,
+                    }
+                )
                 continue
             response_length_list = [len(triplet.response.get("token_ids", [])) for triplet in rollout.triplets]
 
@@ -872,6 +892,7 @@ class AgentModeDaemon:
                         "turn_count": len(rollout.triplets),
                         "reward": final_reward,
                         "has_reward": final_reward_raw is not None,
+                        "reward_dimensions": rd_meta,
                     }
                 )
             sample_stat_list.append(
@@ -881,9 +902,15 @@ class AgentModeDaemon:
                     "turn_count": len(rollout.triplets),
                     "reward": final_reward,
                     "has_reward": final_reward_raw is not None,
+                    "reward_dimensions": rd_meta,
                 }
             )
         metric_dict: Dict[str, Any] = {}
+        _RD_METRIC_KEYS = {
+            "format": "reward_format",
+            "answer_soft": "reward_answer_soft",
+            "answer_hard": "reward_answer_hard",
+        }
 
         stats_w_trace = [stat for stat in sample_stat_list if "sum_response_length" in stat]
         stats_w_trace_by_source = {
@@ -912,6 +939,14 @@ class AgentModeDaemon:
                     ),
                 }
             )
+            for dim_key, wandb_name in _RD_METRIC_KEYS.items():
+                vals_ds = [
+                    float(stat["reward_dimensions"][dim_key])
+                    for stat in sample_stats
+                    if stat.get("reward_dimensions") and dim_key in stat["reward_dimensions"]
+                ]
+                if vals_ds:
+                    metric_dict[f"val/{data_source}/{wandb_name}"] = float(np.mean(vals_ds))
         metric_dict.update(
             {
                 "val/n_rollouts": len(sample_stat_list),
@@ -925,6 +960,15 @@ class AgentModeDaemon:
                 "val/turn_count": np.mean([stat["turn_count"] for stat in stats_w_trace]),
             }
         )
+        # Multi-dimensional reward breakdown (e.g. strategy_generation_agent emit_reward dict).
+        for dim_key, wandb_name in _RD_METRIC_KEYS.items():
+            vals = [
+                float(stat["reward_dimensions"][dim_key])
+                for stat in sample_stat_list
+                if stat.get("reward_dimensions") and dim_key in stat["reward_dimensions"]
+            ]
+            if vals:
+                metric_dict[f"val/{wandb_name}"] = float(np.mean(vals))
         return metric_dict
 
     def get_train_data_batch(
@@ -1247,6 +1291,19 @@ class AgentModeDaemon:
                 else {}
             ),
         }
+        _RD_METRIC_KEYS = {
+            "format": "reward_format",
+            "answer_soft": "reward_answer_soft",
+            "answer_hard": "reward_answer_hard",
+        }
+        for dim_key, wandb_name in _RD_METRIC_KEYS.items():
+            vals: List[float] = []
+            for _rid, rollout in self._completed_rollouts_v0.items():
+                rd = (rollout.metadata or {}).get("reward_dimensions") or {}
+                if dim_key in rd:
+                    vals.append(float(rd[dim_key]))
+            if vals:
+                data_metrics[f"training/{wandb_name}"] = float(np.mean(vals))
 
         # Add non-tensor data for advantage calculation and logging
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)  # type: ignore

@@ -823,10 +823,26 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         self.correctness_weight,
                     )
 
+            # Always log v3 soft / hard for WandB (independent of use_hard_correctness_metric on the scalar `correctness`).
+            answer_soft_metric = 0.0
+            hard_correct_log = 0
+            if extracted_answer:
+                _jd_log = compute_answer_judgement(
+                    answer=extracted_answer,
+                    ground_truth=task["ground_truth"],
+                    numeric_tolerance=self.numeric_tolerance,
+                    f1_threshold=self.f1_threshold,
+                    task_meta=task.get("task_meta", {}),
+                )
+                answer_soft_metric = float(_jd_log.get("soft_score", 0.0))
+                hard_correct_log = int(_jd_log.get("hard_correct", 0))
+
             reward_details: Dict[str, Any] = {
                 "format": format_reward,
                 "scorer": scorer_reward,
                 "correctness": correctness,
+                "answer_soft": answer_soft_metric,
+                "answer_hard": float(hard_correct_log),
                 "hard_correct": hard_correct,
                 "hard_correct_mean": hard_correct_mean,
                 "hard_correct_list": hard_correct_list,
@@ -975,7 +991,15 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 final_reward=float(final_reward),
             )
 
-            agl.emit_reward(final_reward)
+            agl.emit_reward(
+                {
+                    "final": float(final_reward),
+                    "format": float(format_reward),
+                    "answer_soft": float(answer_soft_metric),
+                    "answer_hard": float(hard_correct_log),
+                },
+                primary_key="final",
+            )
             return float(final_reward)
 
         except Exception as e:
@@ -984,7 +1008,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 exc_info=True,
             )
             try:
-                agl.emit_reward(0.0)
+                agl.emit_reward(
+                    {"final": 0.0, "format": 0.0, "answer_soft": 0.0, "answer_hard": 0.0},
+                    primary_key="final",
+                )
             except Exception as reward_err:
                 logger.warning(f"Failed to emit reward: {reward_err}")
             return 0.0
