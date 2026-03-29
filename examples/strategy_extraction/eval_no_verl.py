@@ -41,8 +41,9 @@ class _DummyLLM:
         model: str,
         base_url: str,
         api_key: str = "dummy-key",
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         max_tokens: int = 16384,
+        seed: Optional[int] = None,
     ) -> None:
         self.model = model
         self._base_url = base_url
@@ -51,6 +52,8 @@ class _DummyLLM:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if seed is not None:
+            self.sampling_parameters["seed"] = int(seed)
 
     def get_base_url(self, rollout_id: str, attempt_id: str) -> str:  # noqa: D401
         """Return fixed base URL for all rollouts."""
@@ -231,6 +234,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Optional hard cap on number of validation samples (for quick smoke tests).",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for both strategy and answer generation (0.0 = greedy/deterministic).",
+    )
+    parser.add_argument(
+        "--llm-seed",
+        type=int,
+        default=None,
+        help="Optional OpenAI-style request seed forwarded to vLLM for strategy and answer "
+        "/chat/completions calls (per-request; not a server startup flag).",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=1,
@@ -360,6 +376,8 @@ async def _run_eval(args: argparse.Namespace) -> None:
         main_llm = _DummyLLM(
             model=strategy_model_name,
             base_url=strategy_base_url,
+            temperature=args.temperature,
+            seed=args.llm_seed,
         )
         resources: agl.NamedResources = {"main_llm": main_llm}
         return agent, resources

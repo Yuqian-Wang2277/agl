@@ -143,7 +143,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
         },
         "trainer": {
             "n_gpus_per_node": n_gpus,
-            "val_before_train": True,  # Enable validation before training starts
+            "val_before_train": False,  # Enable validation before training starts
             "critic_warmup": 0,
             # Enable WandB logging for tracking training metrics
             # Use ["console"] to disable WandB if connection issues occur

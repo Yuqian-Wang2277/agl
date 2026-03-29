@@ -589,8 +589,10 @@ def train(
     use_strategy_for_answer: bool,
     skip_strategy_generation: bool,
     answer_temperature: float | None,
+    val_answer_temperature: float | None,
     use_hard_correctness_metric: bool,
     answer_no_think: bool,
+    answer_max_tokens: int | None,
     train_dataset_json: str,
     val_only: bool,
 ) -> None:
@@ -722,6 +724,7 @@ def train(
                         "answer_model_path": answer_model_path,
                         "answer_model_base_url": answer_model_base_url,
                         "answer_model_name": answer_model_name,
+                        "answer_max_tokens": answer_max_tokens,
                         "skip_strategy_generation": skip_strategy_generation,
                         "answer_temperature": answer_temperature,
                         "use_hard_correctness_metric": use_hard_correctness_metric,
@@ -874,8 +877,10 @@ def train(
         use_strategy_for_answer=use_strategy_for_answer,
         skip_strategy_generation=skip_strategy_generation,
         answer_temperature=answer_temperature,
+        val_answer_temperature=val_answer_temperature,
         use_hard_correctness_metric=use_hard_correctness_metric,
         answer_no_think=answer_no_think,
+        answer_max_tokens=answer_max_tokens,
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
@@ -1149,7 +1154,14 @@ def main() -> None:
         "--answer-temperature",
         type=float,
         default=None,
-        help="Override answer decoding temperature. If unset, uses rollout sampling temperature.",
+        help="Override answer decoding temperature for training rollouts. If unset, uses rollout sampling temperature.",
+    )
+    parser.add_argument(
+        "--val-answer-temperature",
+        type=float,
+        default=0.0,
+        help="Answer decoding temperature used during validation (default: 0.0 = greedy/deterministic). "
+             "Set to None to inherit from rollout sampling temperature.",
     )
     parser.add_argument(
         "--use-hard-correctness-metric",
@@ -1160,6 +1172,12 @@ def main() -> None:
         "--answer-no-think",
         action="store_true",
         help="Disable think mode for the answer model (sets enable_thinking=False in chat_template_kwargs).",
+    )
+    parser.add_argument(
+        "--answer-max-tokens",
+        type=int,
+        default=None,
+        help="Override max_tokens for answer-model /chat/completions only (default: rollout LLM max_tokens or 16384).",
     )
     parser.add_argument(
         "--strict-no-strategy-baseline",
@@ -1242,8 +1260,10 @@ def main() -> None:
         use_strategy_for_answer=args.use_strategy_for_answer,
         skip_strategy_generation=args.skip_strategy_generation,
         answer_temperature=args.answer_temperature,
+        val_answer_temperature=args.val_answer_temperature,
         use_hard_correctness_metric=args.use_hard_correctness_metric,
         answer_no_think=args.answer_no_think,
+        answer_max_tokens=args.answer_max_tokens,
         val_only=args.val_only,
     )
 

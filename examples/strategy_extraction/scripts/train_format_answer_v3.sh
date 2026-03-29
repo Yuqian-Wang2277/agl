@@ -14,10 +14,14 @@
 #
 #    CUDA_VISIBLE_DEVICES=7 python -m vllm.entrypoints.openai.api_server \
 #        --model /path/to/answer/model \
-#        --served-model-name Qwen3-4B \
+#        --served-model-name Qwen3-8B \
 #        --port 8200 \
 #        --gpu-memory-utilization 0.90 \
 #        --max-model-len 32768
+#
+#  Qwen3 “thinking” off (OpenAI-compatible): clients send
+#    "chat_template_kwargs": {"enable_thinking": false}
+#  in the JSON body. This script passes that when you use --answer-no-think below.
 #
 #  Override URLs/names with ANSWER_MODEL_BASE_URL / ANSWER_MODEL_NAME below.
 #
@@ -81,14 +85,17 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --n-gpus 8 \
     --reward-version v3 \
     --reward-mode scorer_only \
-    --format-weight 0.3 \
-    --correctness-weight 0.7 \
+    --format-weight 0.2 \
+    --correctness-weight 0.8 \
     --grounded-proxy-k 1 \
     --answer-model-path "${ANSWER_MODEL_PATH}" \
     --answer-model-base-url "${ANSWER_MODEL_BASE_URL}" \
     --answer-model-name "${ANSWER_MODEL_NAME}" \
+    --answer-no-think \
+    ${ANSWER_MAX_TOKENS:+--answer-max-tokens "${ANSWER_MAX_TOKENS}"} \
     --strategy-prompt-version strategy_update_2026-03-09 \
     --answer-prompt-version v1 \
+    --val-answer-temperature 0.0 \
     --wandb-project StrategyGeneration \
     --wandb-experiment strategy_format_answer_v3 \
     "$@"

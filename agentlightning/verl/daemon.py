@@ -34,12 +34,28 @@ __all__ = [
 
 
 def _reward_dimensions_from_spans(spans: List[Any]) -> Dict[str, float]:
-    """Parse the latest multi-dimensional reward annotation from rollout spans."""
-    for span in reversed(spans):
+    """Parse reward dimensions from rollout spans.
+
+    Multiple reward spans can exist (e.g. agent emits a multi-dim dict, then the
+    runner appends a scalar span when the rollout returns a float). Prefer the
+    richest breakdown (most keys; tie-break on presence of known sub-metrics).
+    """
+    candidates: List[Dict[str, float]] = []
+    for span in spans:
         rewards = get_rewards_from_span(span)
         if rewards:
-            return {str(r.name): float(r.value) for r in rewards}
-    return {}
+            candidates.append({str(r.name): float(r.value) for r in rewards})
+    if not candidates:
+        return {}
+
+    def _richness(d: Dict[str, float]) -> tuple[int, int, int]:
+        return (
+            len(d),
+            int("format" in d),
+            int("answer_soft" in d or "answer_hard" in d),
+        )
+
+    return max(candidates, key=_richness)
 
 
 def ids_startswith(

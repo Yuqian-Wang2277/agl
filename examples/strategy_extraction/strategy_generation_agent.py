@@ -108,8 +108,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         use_strategy_for_answer: bool = True,
         skip_strategy_generation: bool = False,
         answer_temperature: Optional[float] = None,
+        val_answer_temperature: Optional[float] = None,
         use_hard_correctness_metric: bool = False,
         answer_no_think: bool = False,
+        answer_max_tokens: Optional[int] = None,
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
@@ -144,8 +146,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self.use_strategy_for_answer = use_strategy_for_answer
         self.skip_strategy_generation = skip_strategy_generation
         self.answer_temperature = answer_temperature
+        self.val_answer_temperature = val_answer_temperature
         self.use_hard_correctness_metric = use_hard_correctness_metric
         self.answer_no_think = answer_no_think
+        self.answer_max_tokens = answer_max_tokens
 
         # Load TOML prompts and reward config
         self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
@@ -318,6 +322,12 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             logger.error(f"Failed to write merged validation file: {e}")
             return None
 
+    def _answer_max_tokens_for_llm(self, llm: Any) -> int:
+        """Max tokens for the frozen answer API; optional override vs rollout LLM sampling."""
+        if self.answer_max_tokens is not None:
+            return int(self.answer_max_tokens)
+        return int(llm.sampling_parameters.get("max_tokens", 16384))
+
     # ------------------------------------------------------------------ #
     #  Un-traced answer generation (raw httpx, bypasses OpenTelemetry)
     # ------------------------------------------------------------------ #
@@ -331,6 +341,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         problem: str,
         temperature: float,
         max_tokens: int,
+        seed: Optional[int] = None,
     ) -> str:
         """Generate an answer using raw httpx — NOT captured by AGL tracing.
 
@@ -340,7 +351,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         Prompts are sourced from ``self.answer_prompt`` (TOML).
         """
         url = f"{base_url}/chat/completions"
-        payload = {
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": [
                 {"role": "system", "content": self.answer_prompt["system"]},
@@ -349,6 +360,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if seed is not None:
+            payload["seed"] = seed
         if self.answer_no_think:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         headers = {
@@ -476,8 +489,11 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         task: "StrategyGenerationTask",
         resources: agl.NamedResources,
         rollout: agl.Rollout,
-    ) -> float:
+    ) -> Optional[float]:
         """Execute a rollout: generate strategy (trained) → score / verify (not trained).
+
+        On success, returns ``None`` after emitting a multi-dimensional reward span so the
+        runner does not append a duplicate scalar reward span.
 
         v2 flow (scorer mode):
             1. Generate strategy  (traced)
@@ -500,9 +516,18 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 attempted_rollout.rollout_id,
                 attempted_rollout.attempt.attempt_id,
             )
+            _seed_raw = llm.sampling_parameters.get("seed")
+            llm_request_seed: Optional[int] = None
+            if _seed_raw is not None:
+                try:
+                    llm_request_seed = int(_seed_raw)
+                except (TypeError, ValueError):
+                    llm_request_seed = None
             traced_strategy_call = False
             answer_call_attempted = False
             answer_call_succeeded = False
+            current_mode = rollout.mode if hasattr(rollout, "mode") else "unknown"
+            is_validation = current_mode != "train"
 
             logger.info(
                 f"[Rollout {attempted_rollout.rollout_id}] START - "
@@ -542,15 +567,18 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     api_key=llm.api_key or "dummy-key",
                 )
 
-                response = await client.chat.completions.create(
-                    model=llm.model,
-                    messages=[
+                _strategy_kwargs: Dict[str, Any] = {
+                    "model": llm.model,
+                    "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    temperature=llm.sampling_parameters.get("temperature", 0.7),
-                    max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
-                )
+                    "temperature": llm.sampling_parameters.get("temperature", 0.7),
+                    "max_tokens": llm.sampling_parameters.get("max_tokens", 16384),
+                }
+                if llm_request_seed is not None:
+                    _strategy_kwargs["seed"] = llm_request_seed
+                response = await client.chat.completions.create(**_strategy_kwargs)
 
                 strategy_output = response.choices[0].message.content or ""
                 strategy = extract_strategy(strategy_output)
@@ -593,14 +621,20 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
                     async def _answer_once(bound_strategy: str) -> str:
                         answer_strategy = bound_strategy if self.use_strategy_for_answer else ""
+                        _ans_temp = (
+                            self.val_answer_temperature
+                            if (is_validation and self.val_answer_temperature is not None)
+                            else llm.sampling_parameters.get("temperature", 0.7)
+                        )
                         return await self._generate_answer_untraced(
                             base_url=ans_base_url,
                             api_key=ans_api_key,
                             model=ans_model,
                             strategy=answer_strategy,
                             problem=task["problem"],
-                            temperature=llm.sampling_parameters.get("temperature", 0.7),
-                            max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
+                            temperature=_ans_temp,
+                            max_tokens=self._answer_max_tokens_for_llm(llm),
+                            seed=llm_request_seed,
                         )
 
                     eval_result = await evaluate_strategy_k_samples(
@@ -710,9 +744,13 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             else ""
                         )
                         answer_temperature = (
-                            self.answer_temperature
-                            if self.answer_temperature is not None
-                            else llm.sampling_parameters.get("temperature", 0.7)
+                            self.val_answer_temperature
+                            if (is_validation and self.val_answer_temperature is not None)
+                            else (
+                                self.answer_temperature
+                                if self.answer_temperature is not None
+                                else llm.sampling_parameters.get("temperature", 0.7)
+                            )
                         )
                         should_use_k_answers = (
                             self.reward_mode == "scorer_only"
@@ -728,7 +766,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                     strategy=answer_strategy,
                                     problem=task["problem"],
                                     temperature=answer_temperature,
-                                    max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
+                                    max_tokens=self._answer_max_tokens_for_llm(llm),
+                                    seed=llm_request_seed,
                                 )
                                 answer_raw_list.append(answer_raw)
                                 answer_extracted = self.reward_config.extract_answer(answer_raw) or ""
@@ -774,8 +813,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                 model=ans_model,
                                 strategy=answer_strategy,
                                 problem=task["problem"],
-                                    temperature=answer_temperature,
-                                max_tokens=llm.sampling_parameters.get("max_tokens", 16384),
+                                temperature=answer_temperature,
+                                max_tokens=self._answer_max_tokens_for_llm(llm),
+                                seed=llm_request_seed,
                             )
                             extracted_answer = self.reward_config.extract_answer(answer_output)
                             if extracted_answer:
@@ -1000,7 +1040,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 },
                 primary_key="final",
             )
-            return float(final_reward)
+            # Return None so LitAgentRunner does not emit a second scalar reward span
+            # (which would override multi-dimensional reward_dimensions in the daemon).
+            return None
 
         except Exception as e:
             logger.error(
