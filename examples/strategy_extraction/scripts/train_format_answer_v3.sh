@@ -89,6 +89,7 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --answer-model-name "${ANSWER_MODEL_NAME}" \
     --strategy-prompt-version strategy_update_2026-03-09 \
     --answer-prompt-version v1 \
+    --val-answer-temperature 0.0 \
     --wandb-project StrategyGeneration \
     --wandb-experiment strategy_format_answer_v3 \
     "$@"

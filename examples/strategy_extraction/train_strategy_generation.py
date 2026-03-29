@@ -589,6 +589,7 @@ def train(
     use_strategy_for_answer: bool,
     skip_strategy_generation: bool,
     answer_temperature: float | None,
+    val_answer_temperature: float | None,
     use_hard_correctness_metric: bool,
     answer_no_think: bool,
     train_dataset_json: str,
@@ -874,6 +875,7 @@ def train(
         use_strategy_for_answer=use_strategy_for_answer,
         skip_strategy_generation=skip_strategy_generation,
         answer_temperature=answer_temperature,
+        val_answer_temperature=val_answer_temperature,
         use_hard_correctness_metric=use_hard_correctness_metric,
         answer_no_think=answer_no_think,
         strategy_prompt_version=strategy_prompt_version,
@@ -1149,7 +1151,14 @@ def main() -> None:
         "--answer-temperature",
         type=float,
         default=None,
-        help="Override answer decoding temperature. If unset, uses rollout sampling temperature.",
+        help="Override answer decoding temperature for training rollouts. If unset, uses rollout sampling temperature.",
+    )
+    parser.add_argument(
+        "--val-answer-temperature",
+        type=float,
+        default=0.0,
+        help="Answer decoding temperature used during validation (default: 0.0 = greedy/deterministic). "
+             "Set to None to inherit from rollout sampling temperature.",
     )
     parser.add_argument(
         "--use-hard-correctness-metric",
@@ -1242,6 +1251,7 @@ def main() -> None:
         use_strategy_for_answer=args.use_strategy_for_answer,
         skip_strategy_generation=args.skip_strategy_generation,
         answer_temperature=args.answer_temperature,
+        val_answer_temperature=args.val_answer_temperature,
         use_hard_correctness_metric=args.use_hard_correctness_metric,
         answer_no_think=args.answer_no_think,
         val_only=args.val_only,
