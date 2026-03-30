@@ -83,7 +83,7 @@ class ClientServerExecutionStrategy(ExecutionStrategy):
                 algorithm bundle locally. Defaults to `AGL_SERVER_HOST`
                 or `"localhost"` if unset.
             server_port: Port for the HTTP server in "algorithm"/"both" modes.
-                Defaults to `AGL_SERVER_PORT` or `4747` if unset.
+                Defaults to `AGL_SERVER_PORT` or `4748` if unset.
             n_runners: Number of runner processes to spawn in "runner"/"both".
             graceful_timeout: How long to wait (seconds) after setting the stop
                 event before escalating to signals.
@@ -108,7 +108,7 @@ class ClientServerExecutionStrategy(ExecutionStrategy):
         self.server_host = resolve_str_env_var(
             LightningEnvVar.AGL_SERVER_HOST, override=server_host, fallback="localhost"
         )
-        self.server_port = resolve_int_env_var(LightningEnvVar.AGL_SERVER_PORT, override=server_port, fallback=4747)
+        self.server_port = resolve_int_env_var(LightningEnvVar.AGL_SERVER_PORT, override=server_port, fallback=4748)
         self.graceful_timeout = graceful_timeout
         self.terminate_timeout = terminate_timeout
         if main_process not in ("algorithm", "runner"):

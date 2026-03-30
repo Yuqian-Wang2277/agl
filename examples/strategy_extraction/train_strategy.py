@@ -33,7 +33,6 @@ AGL_MANAGED_STORE=0 python train_strategy.py \\
 import argparse
 import logging
 import os
-import socket
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -54,30 +53,6 @@ except ImportError:
     from examples.strategy_extraction.strategy_agent import StrategyExtractionAgent, StrategyTask
 
 logger = logging.getLogger(__name__)
-
-
-def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
-    """Find an available port starting from start_port.
-    
-    Args:
-        start_port: Port to start searching from.
-        max_attempts: Maximum number of ports to try.
-        
-    Returns:
-        Available port number.
-        
-    Raises:
-        RuntimeError: If no free port found within max_attempts.
-    """
-    for port in range(start_port, start_port + max_attempts):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                logger.info(f"Found available port: {port}")
-                return port
-        except OSError:
-            continue
-    raise RuntimeError(f"No free port found in range {start_port}-{start_port + max_attempts}")
 
 
 def train(
@@ -149,11 +124,11 @@ def train(
     except Exception as e:
         logger.debug(f"Ray cleanup: {e}")
     
-    # Auto-detect available port if not using external store
+    # Lightning Store HTTP port. Default 4748; override with AGL_SERVER_PORT.
     if not external_store_address:
-        free_port = find_free_port()
-        os.environ["AGL_SERVER_PORT"] = str(free_port)
-        logger.info(f"Using auto-detected port: {free_port}")
+        if not (os.environ.get("AGL_SERVER_PORT") or "").strip():
+            os.environ["AGL_SERVER_PORT"] = "4748"
+        logger.info(f"Lightning Store port (AGL_SERVER_PORT): {os.environ['AGL_SERVER_PORT']}")
     
     # Build data paths
     train_dir = os.path.join(data_base_path, train_subdir)

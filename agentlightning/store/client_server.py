@@ -263,8 +263,8 @@ class LightningStoreServer(LightningStore):
             self.launcher_args = launcher_args
         else:
             if port is None:
-                server_logger.warning("No port provided, using default port 4747.")
-                port = 4747
+                server_logger.warning("No port provided, using default port 4748.")
+                port = 4748
             self.launcher_args = PythonServerLauncherArgs(
                 host=host,
                 port=port,

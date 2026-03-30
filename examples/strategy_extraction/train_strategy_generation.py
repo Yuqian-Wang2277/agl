@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import socket
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -518,19 +517,6 @@ def _count_validation_rows(saved_path: str) -> int:
         return 0
 
 
-def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
-    """Find an available port starting from start_port."""
-    for port in range(start_port, start_port + max_attempts):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                logger.info(f"Found available port: {port}")
-                return port
-        except OSError:
-            continue
-    raise RuntimeError(f"No free port in range {start_port}-{start_port + max_attempts}")
-
-
 # ------------------------------------------------------------------ #
 #  train()
 # ------------------------------------------------------------------ #
@@ -621,11 +607,11 @@ def train(
     except Exception as e:
         logger.debug(f"Ray cleanup: {e}")
 
-    # Port
+    # Lightning Store HTTP port (managed client-server store). Default 4748; override with AGL_SERVER_PORT.
     if not external_store_address:
-        free_port = find_free_port()
-        os.environ["AGL_SERVER_PORT"] = str(free_port)
-        logger.info(f"Using port: {free_port}")
+        if not (os.environ.get("AGL_SERVER_PORT") or "").strip():
+            os.environ["AGL_SERVER_PORT"] = "4748"
+        logger.info(f"Lightning Store port (AGL_SERVER_PORT): {os.environ['AGL_SERVER_PORT']}")
 
     # Data paths — training and validation roots may differ (e.g. custom train corpus + standard eval).
     train_dir = os.path.join(data_base_path, train_subdir)

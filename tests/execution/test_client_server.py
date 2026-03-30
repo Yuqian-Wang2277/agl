@@ -98,7 +98,7 @@ def test_env_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     strat = ClientServerExecutionStrategy()
 
     assert strat.server_host == "localhost"
-    assert strat.server_port == 4747
+    assert strat.server_port == 4748
     assert strat.main_process == "algorithm"
     assert strat.managed_store is True
 

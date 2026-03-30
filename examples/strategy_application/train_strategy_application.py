@@ -20,7 +20,6 @@ python train_strategy_application.py \\
 import argparse
 import logging
 import os
-import socket
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -114,19 +113,6 @@ def merge_remaining_validation_files(validation_output_dir: str) -> None:
                 logger.error(f"Failed to write merged validation file {merged_path}: {e}")
 
 
-def find_free_port(start_port: int = 4747, max_attempts: int = 100) -> int:
-    """Find an available port starting from start_port."""
-    for port in range(start_port, start_port + max_attempts):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                logger.info(f"Found available port: {port}")
-                return port
-        except OSError:
-            continue
-    raise RuntimeError(f"No free port found in range {start_port}-{start_port + max_attempts}")
-
-
 def train(
     *,
     data_base_path: str,
@@ -196,11 +182,11 @@ def train(
     except Exception as e:
         logger.debug(f"Ray cleanup: {e}")
     
-    # Auto-detect port if not using external store
+    # Lightning Store HTTP port. Default 4748; override with AGL_SERVER_PORT.
     if not external_store_address:
-        free_port = find_free_port()
-        os.environ["AGL_SERVER_PORT"] = str(free_port)
-        logger.info(f"Using auto-detected port: {free_port}")
+        if not (os.environ.get("AGL_SERVER_PORT") or "").strip():
+            os.environ["AGL_SERVER_PORT"] = "4748"
+        logger.info(f"Lightning Store port (AGL_SERVER_PORT): {os.environ['AGL_SERVER_PORT']}")
     
     # Build data paths
     train_dir = os.path.join(data_base_path, train_subdir)
