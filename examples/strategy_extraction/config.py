@@ -114,11 +114,10 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 "n": 8,
                 "log_prob_micro_batch_size_per_gpu": 4,
                 "name": "vllm",
-                "gpu_memory_utilization": 0.5,  # Further reduced to accommodate larger context window
-                # Qwen3-4B supports max_model_len=32768, but we use a smaller value to:
-                # 1. Save GPU memory (KV cache grows with context length)
-                # 2. Avoid OOM with parallel training on 8 GPUs
-                # 3. Our actual usage: ~2048 prompt + ~800 response = ~3000 tokens
+                # vLLM fraction of per-GPU memory; raise for more KV cache, lower if actor/FSDP OOMs.
+                "gpu_memory_utilization": 0.85,
+                # Qwen3-4B supports max_model_len=32768; long contexts increase KV usage.
+                # With 8 GPUs and FSDP offload, watch for OOM if this is high.
                 "max_model_len": 32768,  # Reasonable balance: enough for our use case, saves memory
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },

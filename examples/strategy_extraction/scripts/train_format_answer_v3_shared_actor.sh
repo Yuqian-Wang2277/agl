@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Copyright (c) Microsoft. All rights reserved.
+#
+# Strategy generation training with reward = format (strategy tags) + answer correctness (reward/v3).
+# Trainable: strategy model (VERL). Answer generation uses the same VERL vLLM actor weights as strategy
+# (un-traced HTTP call to main_llm) — no separate frozen 8B server.
+#
+# Disable a signal by setting its weight to 0 (--format-weight 0 or --correctness-weight 0).
+#
+# ============================================================
+#  Prerequisites
+# ============================================================
+#  No standalone answer vLLM. Strategy and answer share the rollout actor; only strategy tokens are trained.
+#
+#  Qwen3 “thinking” off for the answer call: clients send
+#    "chat_template_kwargs": {"enable_thinking": false}
+#  in the JSON body. This script passes that via --answer-no-think.
+#
+# ============================================================
+#  Data layout
+# ============================================================
+#  Training data:   LLMReflection-czj/data/<TRAIN_SUBDIR>/  (problem-type subdirs + JSON)
+#  Validation data: LLMReflection/data/<val-subdirs>/       (same layout as eval_no_verl.sh)
+#  With --val-sampling-mode per_subtask_fixed, validation size is
+#    (val-samples-per-subtask) * (number of subtask JSON files per split), NOT --num-val-samples.
+#  Leave --num-val-samples as-is unless you switch to global/balanced val sampling.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/train_format_answer_v3_shared_actor.sh
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/train_format_answer_v3_shared_actor.sh \
+#       --format-weight 0 --correctness-weight 1.0
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+
+cd "$REPO_ROOT"
+
+# --- Roots (override with env vars if needed) ---
+CZJ_TRAIN_ROOT="${CZJ_TRAIN_ROOT:-/home/test/test16/chenlu/projects/LLMReflection-czj/data}"
+TRAIN_SUBDIR="${TRAIN_SUBDIR:-train_all_project_suitable}"
+VAL_DATA_ROOT="${VAL_DATA_ROOT:-/home/test/test16/chenlu/projects/LLMReflection/data/}"
+
+# --- Model (strategy = same weights used for un-traced answer call) ---
+STRATEGY_MODEL_PATH="${STRATEGY_MODEL_PATH:-/home/test/test16/chenlu/model/Qwen3-4B}"
+
+echo "========================================="
+echo " Strategy gen — format + answer (reward v3, shared actor)"
+echo "========================================="
+echo " Train data : ${CZJ_TRAIN_ROOT}/${TRAIN_SUBDIR}"
+echo " Val root   : ${VAL_DATA_ROOT}"
+echo " Reward     : scorer_only + reward v3 (no strategy-scorer LLM)"
+echo " Answer     : same VERL actor as strategy (no separate 8B vLLM)"
+echo " Weights    : format + correctness (set either to 0 to disable)"
+echo "========================================="
+echo ""
+
+python -m examples.strategy_extraction.train_strategy_generation \
+    --data-base-path "${CZJ_TRAIN_ROOT}" \
+    --train-subdir "${TRAIN_SUBDIR}" \
+    --val-data-base-path "${VAL_DATA_ROOT}" \
+    --val-subdirs test-id-subtask test-ood-task test-bbh \
+    --val-sampling-mode per_subtask_fixed \
+    --val-samples-per-subtask 20 \
+    --val-sampling-seed 42 \
+    --model-path "${STRATEGY_MODEL_PATH}" \
+    --fewshot-min 3 \
+    --fewshot-max 5 \
+    --num-train-samples 20000 \
+    --num-val-samples 500 \
+    --n-runners 10 \
+    --n-gpus 8 \
+    --reward-version v3 \
+    --reward-mode scorer_only \
+    --format-weight 0.3 \
+    --correctness-weight 0.7 \
+    --grounded-proxy-k 1 \
+    --answer-no-think \
+    ${ANSWER_MAX_TOKENS:+--answer-max-tokens "${ANSWER_MAX_TOKENS}"} \
+    --strategy-prompt-version strategy_update_2026-03-09 \
+    --answer-prompt-version v1 \
+    --val-answer-temperature 0.0 \
+    --wandb-project StrategyGeneration \
+    --wandb-experiment strategy_format_answer_v3_shared_actor \
+    "$@"
