@@ -115,7 +115,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 "log_prob_micro_batch_size_per_gpu": 4,
                 "name": "vllm",
                 # vLLM fraction of per-GPU memory; raise for more KV cache, lower if actor/FSDP OOMs.
-                "gpu_memory_utilization": 0.85,
+                "gpu_memory_utilization": 0.50,
                 # Qwen3-4B supports max_model_len=32768; long contexts increase KV usage.
                 # With 8 GPUs and FSDP offload, watch for OOM if this is high.
                 "max_model_len": 32768,  # Reasonable balance: enough for our use case, saves memory
