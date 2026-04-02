@@ -23,6 +23,11 @@
 #    "chat_template_kwargs": {"enable_thinking": false}
 #  in the JSON body. This script passes that when you use --answer-no-think below.
 #
+#  Strategy anti-repetition: configure vLLM so default sampling uses repetition_penalty=1.1
+#  (see your vllm serve --help; flag names vary by version). train_strategy_generation.py
+#  also sends repetition_penalty=1.1 in extra_body by default; use --strategy-repetition-penalty 0
+#  to omit and rely on server defaults only.
+#
 #  Override URLs/names with ANSWER_MODEL_BASE_URL / ANSWER_MODEL_NAME below.
 #
 # ============================================================
@@ -85,17 +90,21 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --n-gpus 8 \
     --reward-version v3 \
     --reward-mode scorer_only \
-    --format-weight 0.2 \
-    --correctness-weight 0.8 \
+    --format-weight 0.1 \
+    --correctness-weight 0.9 \
     --grounded-proxy-k 1 \
     --answer-model-path "${ANSWER_MODEL_PATH}" \
     --answer-model-base-url "${ANSWER_MODEL_BASE_URL}" \
     --answer-model-name "${ANSWER_MODEL_NAME}" \
     --answer-no-think \
+    --strategy-no-think \
     ${ANSWER_MAX_TOKENS:+--answer-max-tokens "${ANSWER_MAX_TOKENS}"} \
-    --strategy-prompt-version strategy_update_2026-03-09 \
+    --strategy-prompt-version repetition_controls_2026-04-01 \
     --answer-prompt-version v1 \
     --val-answer-temperature 0.0 \
     --wandb-project StrategyGeneration \
     --wandb-experiment strategy_format_answer_v3 \
+    --strategy-repetition-penalty 1.1 \
+    --answer-request-retries 3 \
+    --answer-retry-delay-sec 1.0 \
     "$@"

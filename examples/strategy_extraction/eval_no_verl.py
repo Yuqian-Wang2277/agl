@@ -260,6 +260,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Skip strategy generation and evaluate raw answer accuracy (no-strategy baseline). "
         "When set, the strategy model server is not called at all.",
     )
+    parser.add_argument(
+        "--strategy-no-think",
+        action="store_true",
+        default=False,
+        help="Disable Qwen3 think mode for strategy /chat/completions (same as train --strategy-no-think).",
+    )
+    parser.add_argument(
+        "--strategy-repetition-penalty",
+        type=float,
+        default=1.1,
+        help="vLLM extra_body.repetition_penalty for strategy /chat/completions (default 1.1). "
+        "Use 0 or negative to omit and use server defaults only (see train_strategy_generation).",
+    )
+    parser.add_argument(
+        "--answer-no-think",
+        action="store_true",
+        default=False,
+        help="Disable Qwen3 think mode for answer /chat/completions (same as train --answer-no-think).",
+    )
+    parser.add_argument(
+        "--answer-request-retries",
+        type=int,
+        default=3,
+        help="Retries per endpoint for answer /chat/completions (see train_strategy_generation).",
+    )
+    parser.add_argument(
+        "--answer-retry-delay-sec",
+        type=float,
+        default=1.0,
+        help="Delay between answer retries (seconds).",
+    )
+    parser.add_argument(
+        "--no-answer-fallback-rollout",
+        action="store_true",
+        default=False,
+        help="Do not fall back to the strategy (rollout) model if the answer server fails.",
+    )
 
     return parser
 
@@ -341,6 +378,10 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     validation_output_dir = exp_dir
 
+    strategy_repetition_penalty_effective: float | None = (
+        None if args.strategy_repetition_penalty <= 0 else float(args.strategy_repetition_penalty)
+    )
+
     # Build per-worker agent instances to avoid shared-state conflicts under concurrency.
     # Each worker writes its own validation shard: validation_step0_worker{worker_id}.json
     strategy_base_url = args.strategy_model_base_url or args.answer_model_base_url
@@ -369,6 +410,12 @@ async def _run_eval(args: argparse.Namespace) -> None:
             strategy_prompt_version=args.strategy_prompt_version,
             answer_prompt_version=args.answer_prompt_version,
             reward_version=args.reward_version,
+            strategy_no_think=args.strategy_no_think,
+            strategy_repetition_penalty=strategy_repetition_penalty_effective,
+            answer_no_think=args.answer_no_think,
+            answer_request_retries=args.answer_request_retries,
+            answer_retry_delay_sec=args.answer_retry_delay_sec,
+            answer_fallback_rollout_on_failure=not args.no_answer_fallback_rollout,
         )
         # Ensure shard filenames don't collide across workers in the same process.
         agent._worker_id = f"{os.getpid()}_{worker_idx}"

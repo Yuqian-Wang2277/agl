@@ -129,9 +129,15 @@ def _parse_ground_truths(ground_truth: str) -> List[str]:
     gt = (ground_truth or "").strip()
     if not gt:
         return []
-    # Try Python-literal list first: "['a', 'b']"
+    # Try Python-literal list/tuple: "['a', 'b']", "(2, 2)", etc.
     try:
         obj = ast.literal_eval(gt)
+        # Tuple of only int/float (e.g. tensor/matrix *shape* "(2,2)") is one answer,
+        # not a multiset of separate numeric labels. Expanding it makes preds like
+        # "(2,2)" fail _parse_numeric and score 0 against ['2','2'].
+        if isinstance(obj, tuple) and len(obj) > 0:
+            if all(isinstance(x, (int, float)) for x in obj):
+                return [gt]
         if isinstance(obj, (list, tuple)):
             vals = [str(x).strip() for x in obj if str(x).strip()]
             if vals:
@@ -365,6 +371,9 @@ def _route_type(gt_list: Sequence[str]) -> str:
     gt_norm = _normalize_for_exact(gt)
     if re.fullmatch(r"[a-h]", gt_norm):
         return "option_letter"
+    # "(C)" / "(a)" style labels: treat like option_letter, not short_phrase fuzzy.
+    if re.fullmatch(r"\(\s*[a-z]\s*\)", gt_norm):
+        return "option_letter"
 
     if _parse_numeric(gt) is not None:
         return "numeric"
@@ -389,6 +398,16 @@ def _score_yes_no(pred: str, gt: str) -> Tuple[float, int]:
 def _score_option_letter(pred: str, gt: str) -> Tuple[float, int]:
     p = _normalize_for_exact(pred)
     g = _normalize_for_exact(gt)
+
+    if _exact_match(pred, gt):
+        return 1.0, 1
+
+    # Gold is "(C)" but model outputs bare "C": letter correct, format incomplete → partial soft.
+    m_gt_paren = re.fullmatch(r"\(\s*([a-z])\s*\)", g)
+    if m_gt_paren:
+        inner_g = m_gt_paren.group(1)
+        if re.fullmatch(r"[a-z]", p) and p == inner_g:
+            return 0.5, 0
 
     # 1. 基础清理：解决纯选项的符号包裹问题（原版已实现）
     # 容忍 "(a)" / "a." / "a)"
@@ -457,9 +476,31 @@ def _score_numeric(
     return soft, hard
 
 
+def _is_symbol_only_span(text: str) -> bool:
+    """True if normalized text has no alphanumeric/CJK tokens (e.g. Dyck ') )' / '[]')."""
+    n = _normalize_for_exact(text or "")
+    return bool(n) and len(_tokenize(n)) == 0
+
+
+def _ws_stripped_equal(pred: str, gt: str) -> bool:
+    """Compare strings after normalization and removing all whitespace."""
+    p = _normalize_for_exact(pred)
+    g = _normalize_for_exact(gt)
+    if not p or not g:
+        return False
+    return re.sub(r"\s+", "", p) == re.sub(r"\s+", "", g)
+
+
 def _score_short_phrase(pred: str, gt: str, cfg: JudgeConfig) -> Tuple[float, int]:
     if _exact_match(pred, gt):
         return 1.0, 1
+    # Dyck / delimiter-only: ') )' vs '))' — SequenceMatcher ~0.8, below fuzzy thresholds.
+    if (
+        _is_symbol_only_span(pred)
+        and _is_symbol_only_span(gt)
+        and _ws_stripped_equal(pred, gt)
+    ):
+        return 0.5, 0
     sim = SequenceMatcher(None, _normalize_for_exact(pred), _normalize_for_exact(gt)).ratio()
     if sim >= 0.92:
         return min(cfg.short_soft_edit_cap, 0.5), 0
@@ -492,7 +533,15 @@ def _numeric_conflict_penalty(pred: str, gt: str) -> float:
 
 
 def _score_medium_long(pred: str, gt: str) -> Tuple[float, int]:
-    hard = int(_exact_match(pred, gt))
+    if _exact_match(pred, gt):
+        return 1.0, 1
+    if (
+        _is_symbol_only_span(pred)
+        and _is_symbol_only_span(gt)
+        and _ws_stripped_equal(pred, gt)
+    ):
+        return 0.5, 0
+    hard = 0
     base = 0.7 * _char_f1(pred, gt) + 0.3 * _token_f1(pred, gt)
     penalty = 0.0
     if _negation_conflict(pred, gt):

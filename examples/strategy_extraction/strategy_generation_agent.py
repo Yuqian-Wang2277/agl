@@ -12,8 +12,15 @@ Reward modes:
 
 All non-strategy LLM calls use raw httpx (bypassing OpenAI SDK tracing)
 so that only strategy-generation tokens receive gradient updates.
+
+Traced strategy ``/chat/completions`` requests merge ``extra_body`` fields:
+``chat_template_kwargs`` (when ``strategy_no_think``) and ``repetition_penalty``
+(default 1.1; omit by setting ``strategy_repetition_penalty`` to ``None`` or ``<= 0``).
+Configure vLLM so server-side defaults also use ``repetition_penalty=1.1`` when possible
+(flag names vary by vLLM version).
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -110,8 +117,13 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         answer_temperature: Optional[float] = None,
         val_answer_temperature: Optional[float] = None,
         use_hard_correctness_metric: bool = False,
+        strategy_no_think: bool = False,
+        strategy_repetition_penalty: Optional[float] = 1.1,
         answer_no_think: bool = False,
         answer_max_tokens: Optional[int] = None,
+        answer_request_retries: int = 3,
+        answer_retry_delay_sec: float = 1.0,
+        answer_fallback_rollout_on_failure: bool = True,
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
@@ -148,8 +160,13 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self.answer_temperature = answer_temperature
         self.val_answer_temperature = val_answer_temperature
         self.use_hard_correctness_metric = use_hard_correctness_metric
+        self.strategy_no_think = strategy_no_think
+        self.strategy_repetition_penalty = strategy_repetition_penalty
         self.answer_no_think = answer_no_think
         self.answer_max_tokens = answer_max_tokens
+        self.answer_request_retries = max(1, int(answer_request_retries))
+        self.answer_retry_delay_sec = max(0.0, float(answer_retry_delay_sec))
+        self.answer_fallback_rollout_on_failure = answer_fallback_rollout_on_failure
 
         # Load TOML prompts and reward config
         self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
@@ -200,6 +217,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             f"skip_strategy_generation={self.skip_strategy_generation}, "
             f"answer_temperature={self.answer_temperature}, "
             f"use_hard_correctness_metric={self.use_hard_correctness_metric}, "
+            f"strategy_no_think={self.strategy_no_think}, strategy_repetition_penalty={self.strategy_repetition_penalty}, "
+            f"answer_no_think={self.answer_no_think}, "
             f"strategy_prompt={strategy_prompt_version}, "
             f"answer_prompt={answer_prompt_version}, "
             f"reward={self.reward_config.name}, pid={os.getpid()})"
@@ -332,7 +351,11 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
     #  Un-traced answer generation (raw httpx, bypasses OpenTelemetry)
     # ------------------------------------------------------------------ #
 
-    async def _generate_answer_untraced(
+    @staticmethod
+    def _normalize_openai_base_url(url: str) -> str:
+        return (url or "").rstrip("/")
+
+    async def _post_answer_chat_completions_once(
         self,
         base_url: str,
         api_key: str,
@@ -343,14 +366,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         max_tokens: int,
         seed: Optional[int] = None,
     ) -> str:
-        """Generate an answer using raw httpx — NOT captured by AGL tracing.
-
-        This ensures the answer-generation tokens are excluded from VERL's
-        training triplets so that only strategy-generation tokens are optimised.
-
-        Prompts are sourced from ``self.answer_prompt`` (TOML).
-        """
-        url = f"{base_url}/chat/completions"
+        """Single /chat/completions POST; returns message content or "" on any failure."""
+        url = f"{self._normalize_openai_base_url(base_url)}/chat/completions"
         payload: Dict[str, Any] = {
             "model": model,
             "messages": [
@@ -369,8 +386,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             "Authorization": f"Bearer {api_key}",
         }
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
@@ -379,12 +397,94 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     f"(url={url}, model={model}): {e.response.text[:300]}"
                 )
                 return ""
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                logger.warning(f"Answer model invalid JSON (url={url}, model={model}): {e}")
+                return ""
+        except httpx.TimeoutException as e:
+            logger.warning(f"Answer model timeout (url={url}, model={model}): {e}")
+            return ""
+        except httpx.RequestError as e:
+            logger.warning(f"Answer model request error (url={url}, model={model}): {e}")
+            return ""
 
         choices = data.get("choices", [])
         if not choices:
+            logger.warning(f"Answer model empty choices (url={url}, model={model})")
             return ""
         return choices[0].get("message", {}).get("content", "") or ""
+
+    async def _generate_answer_untraced(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        strategy: str,
+        problem: str,
+        temperature: float,
+        max_tokens: int,
+        seed: Optional[int] = None,
+        *,
+        rollout_fallback_base_url: Optional[str] = None,
+        rollout_fallback_model: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Generate an answer using raw httpx — NOT captured by AGL tracing.
+
+        Retries transient empty/error responses on the primary (base_url, model),
+        then optionally falls back to the rollout/training endpoint so answer
+        service outages do not zero out correctness when a strategy exists.
+
+        Returns:
+            (content, source_tag) where source_tag is ``primary``, ``rollout_fallback``, or ``none``.
+        """
+        primary_u = self._normalize_openai_base_url(base_url)
+        primary_m = model or ""
+        fb_u = self._normalize_openai_base_url(rollout_fallback_base_url or "")
+        fb_m = rollout_fallback_model or ""
+        distinct_fallback = bool(
+            fb_u
+            and fb_m
+            and (fb_u != primary_u or fb_m != primary_m)
+        )
+
+        async def _attempt_pair(bu: str, md: str, label: str) -> str:
+            for attempt in range(self.answer_request_retries):
+                out = await self._post_answer_chat_completions_once(
+                    bu,
+                    api_key,
+                    md,
+                    strategy,
+                    problem,
+                    temperature,
+                    max_tokens,
+                    seed=seed,
+                )
+                if out:
+                    return out
+                if attempt + 1 < self.answer_request_retries and self.answer_retry_delay_sec > 0:
+                    await asyncio.sleep(self.answer_retry_delay_sec)
+            logger.warning(
+                f"Answer generation exhausted retries ({self.answer_request_retries}) "
+                f"for {label} url={bu} model={md}"
+            )
+            return ""
+
+        text = await _attempt_pair(base_url, model, "primary")
+        if text:
+            return text, "primary"
+        if (
+            self.answer_fallback_rollout_on_failure
+            and distinct_fallback
+        ):
+            text_fb = await _attempt_pair(fb_u, fb_m, "rollout_fallback")
+            if text_fb:
+                logger.info(
+                    "Answer recovered via rollout/training model fallback "
+                    f"(primary had failed: {primary_u} / {primary_m})"
+                )
+                return text_fb, "rollout_fallback"
+        return "", "none"
 
     # ------------------------------------------------------------------ #
     #  Un-traced strategy scoring (raw httpx, bypasses OpenTelemetry)
@@ -578,6 +678,16 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 }
                 if llm_request_seed is not None:
                     _strategy_kwargs["seed"] = llm_request_seed
+                extra_body: Dict[str, Any] = {}
+                if self.strategy_no_think:
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+                if (
+                    self.strategy_repetition_penalty is not None
+                    and self.strategy_repetition_penalty > 0
+                ):
+                    extra_body["repetition_penalty"] = float(self.strategy_repetition_penalty)
+                if extra_body:
+                    _strategy_kwargs["extra_body"] = extra_body
                 response = await client.chat.completions.create(**_strategy_kwargs)
 
                 strategy_output = response.choices[0].message.content or ""
@@ -612,12 +722,14 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             hard_correct = 0
             hard_correct_mean = 0.0
             hard_correct_list: List[int] = []
+            answer_used_rollout_fallback = False
 
             if strategy and self.reward_mode == "hybrid_grounded":
                 try:
                     ans_base_url = self.answer_model_base_url or base_url
                     ans_api_key = llm.api_key or "dummy-key"
                     ans_model = self.answer_model_name or llm.model
+                    hybrid_answer_via: List[str] = []
 
                     async def _answer_once(bound_strategy: str) -> str:
                         answer_strategy = bound_strategy if self.use_strategy_for_answer else ""
@@ -626,7 +738,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             if (is_validation and self.val_answer_temperature is not None)
                             else llm.sampling_parameters.get("temperature", 0.7)
                         )
-                        return await self._generate_answer_untraced(
+                        _text, _via = await self._generate_answer_untraced(
                             base_url=ans_base_url,
                             api_key=ans_api_key,
                             model=ans_model,
@@ -635,7 +747,11 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             temperature=_ans_temp,
                             max_tokens=self._answer_max_tokens_for_llm(llm),
                             seed=llm_request_seed,
+                            rollout_fallback_base_url=base_url,
+                            rollout_fallback_model=llm.model,
                         )
+                        hybrid_answer_via.append(_via)
+                        return _text
 
                     eval_result = await evaluate_strategy_k_samples(
                         strategy=strategy,
@@ -657,6 +773,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     grounded_proxy = float(eval_result["grounded_proxy"])
                     soft_correctness_mean = float(eval_result["soft_correctness_mean"])
                     correctness = float(eval_result["single_sample_correctness"])
+                    answer_used_rollout_fallback = any(v == "rollout_fallback" for v in hybrid_answer_via)
 
                     representative = select_representative_answer(answer_raw_list, router_scores)
                     rep_idx = int(representative.get("representative_index", -1))
@@ -759,7 +876,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         )
                         if should_use_k_answers:
                             for _ in range(self.grounded_proxy_k):
-                                answer_raw = await self._generate_answer_untraced(
+                                answer_raw, _via = await self._generate_answer_untraced(
                                     base_url=ans_base_url,
                                     api_key=ans_api_key,
                                     model=ans_model,
@@ -768,7 +885,11 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                     temperature=answer_temperature,
                                     max_tokens=self._answer_max_tokens_for_llm(llm),
                                     seed=llm_request_seed,
+                                    rollout_fallback_base_url=base_url,
+                                    rollout_fallback_model=llm.model,
                                 )
+                                if _via == "rollout_fallback":
+                                    answer_used_rollout_fallback = True
                                 answer_raw_list.append(answer_raw)
                                 answer_extracted = self.reward_config.extract_answer(answer_raw) or ""
                                 answer_extracted_list.append(answer_extracted)
@@ -807,7 +928,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             hard_correct = hard_correct_list[rep_idx] if rep_idx < len(hard_correct_list) else 0
                             answer_call_succeeded = len(answer_raw_list) > 0
                         else:
-                            answer_output = await self._generate_answer_untraced(
+                            answer_output, _via = await self._generate_answer_untraced(
                                 base_url=ans_base_url,
                                 api_key=ans_api_key,
                                 model=ans_model,
@@ -816,7 +937,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                 temperature=answer_temperature,
                                 max_tokens=self._answer_max_tokens_for_llm(llm),
                                 seed=llm_request_seed,
+                                rollout_fallback_base_url=base_url,
+                                rollout_fallback_model=llm.model,
                             )
+                            answer_used_rollout_fallback = _via == "rollout_fallback"
                             extracted_answer = self.reward_config.extract_answer(answer_output)
                             if extracted_answer:
                                 correctness = self.reward_config.compute_answer_correctness(
@@ -896,6 +1020,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 "oc_final_score_100": oc_final_score_100,
                 "answer_model_version": self.answer_model_name or llm.model,
                 "used_soft_fallback": used_soft_fallback,
+                "answer_used_rollout_fallback": answer_used_rollout_fallback,
                 "final": final_reward,
             }
 

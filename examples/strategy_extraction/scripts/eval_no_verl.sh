@@ -14,6 +14,10 @@
 #         --gpu-memory-utilization 0.90 \
 #         --max-model-len 32768
 #
+#   策略 vLLM：建议将默认采样设为 repetition_penalty=1.1（具体参数名见 vllm serve --help，随版本而异）。
+#   eval_no_verl.py 默认在请求的 extra_body 中发送 repetition_penalty=1.1；传 --strategy-repetition-penalty 0
+#   可省略该字段、完全依赖服务端默认。
+#
 #   终端 2 — 答案生成模型（Qwen3-8B，端口 8200）：
 #     CUDA_VISIBLE_DEVICES=4,5,6,7 python -m vllm.entrypoints.openai.api_server \
 #         --model /home/test/test16/chenlu/model/Qwen3-8B \
@@ -46,14 +50,21 @@ cd "$REPO_ROOT"
 python -m examples.strategy_extraction.eval_no_verl \
   --data-base-path /home/test/test16/chenlu/projects/LLMReflection/data/ \
   --val-subdirs test-id-subtask test-ood-task test-bbh \
-  --model-path /home/test/test16/chenlu/model/Qwen3-1.7B \
+  --model-path /home/test/test16/chenlu/model/Qwen3-4B \
   --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}" \
-  --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-1.7B}" \
-  --answer-model-path /home/test/test16/chenlu/model/Qwen3-1.7B \
+  --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}" \
+  --answer-model-path /home/test/test16/chenlu/model/Qwen3-4B \
   --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}" \
-  --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-1.7B}" \
-  --concurrency "${EVAL_CONCURRENCY:-128}" \
+  --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-4B}" \
+  --concurrency "${EVAL_CONCURRENCY:-64}" \
   --temperature 0 \
   --llm-seed 42 \
+  --strategy-no-think \
+  --answer-no-think \
+  --strategy-prompt-version repetition_controls_2026-04-01 \
+  --strategy-repetition-penalty 1.1 \
+  --reward-version v3 \
+  --answer-request-retries 3 \
+  --answer-retry-delay-sec 1.0 \
   "$@"
 

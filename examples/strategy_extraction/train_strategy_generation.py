@@ -577,8 +577,13 @@ def train(
     answer_temperature: float | None,
     val_answer_temperature: float | None,
     use_hard_correctness_metric: bool,
+    strategy_no_think: bool,
+    strategy_repetition_penalty: float | None,
     answer_no_think: bool,
     answer_max_tokens: int | None,
+    answer_request_retries: int,
+    answer_retry_delay_sec: float,
+    answer_fallback_rollout_on_failure: bool,
     train_dataset_json: str,
     val_only: bool,
 ) -> None:
@@ -714,6 +719,12 @@ def train(
                         "skip_strategy_generation": skip_strategy_generation,
                         "answer_temperature": answer_temperature,
                         "use_hard_correctness_metric": use_hard_correctness_metric,
+                        "strategy_no_think": strategy_no_think,
+                        "strategy_repetition_penalty": strategy_repetition_penalty,
+                        "answer_no_think": answer_no_think,
+                        "answer_request_retries": answer_request_retries,
+                        "answer_retry_delay_sec": answer_retry_delay_sec,
+                        "answer_fallback_rollout_on_failure": answer_fallback_rollout_on_failure,
                         "train_dataset_json": train_dataset_json,
                         "wandb_project": wandb_project,
                         "wandb_experiment": wandb_experiment,
@@ -865,8 +876,13 @@ def train(
         answer_temperature=answer_temperature,
         val_answer_temperature=val_answer_temperature,
         use_hard_correctness_metric=use_hard_correctness_metric,
+        strategy_no_think=strategy_no_think,
+        strategy_repetition_penalty=strategy_repetition_penalty,
         answer_no_think=answer_no_think,
         answer_max_tokens=answer_max_tokens,
+        answer_request_retries=answer_request_retries,
+        answer_retry_delay_sec=answer_retry_delay_sec,
+        answer_fallback_rollout_on_failure=answer_fallback_rollout_on_failure,
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
@@ -1155,6 +1171,18 @@ def main() -> None:
         help="Use exact/hard correctness as the correctness metric instead of soft scorer correctness.",
     )
     parser.add_argument(
+        "--strategy-no-think",
+        action="store_true",
+        help="Disable Qwen3 think mode for strategy generation (AsyncOpenAI extra_body.chat_template_kwargs).",
+    )
+    parser.add_argument(
+        "--strategy-repetition-penalty",
+        type=float,
+        default=1.1,
+        help="vLLM extra_body.repetition_penalty for traced strategy /chat/completions (default 1.1; aligns with "
+        "recommended server default). Use 0 or a negative value to omit the field and rely on vLLM server defaults only.",
+    )
+    parser.add_argument(
         "--answer-no-think",
         action="store_true",
         help="Disable think mode for the answer model (sets enable_thinking=False in chat_template_kwargs).",
@@ -1164,6 +1192,23 @@ def main() -> None:
         type=int,
         default=None,
         help="Override max_tokens for answer-model /chat/completions only (default: rollout LLM max_tokens or 16384).",
+    )
+    parser.add_argument(
+        "--answer-request-retries",
+        type=int,
+        default=3,
+        help="Retries per endpoint (primary answer server, then optional rollout fallback) on empty/error answer responses.",
+    )
+    parser.add_argument(
+        "--answer-retry-delay-sec",
+        type=float,
+        default=1.0,
+        help="Pause between answer retries (seconds).",
+    )
+    parser.add_argument(
+        "--no-answer-fallback-rollout",
+        action="store_true",
+        help="Disable fallback to the rollout/training model when the dedicated answer server returns empty/errors.",
     )
     parser.add_argument(
         "--strict-no-strategy-baseline",
@@ -1191,6 +1236,10 @@ def main() -> None:
 
         if resolve_bool_env_var(LightningEnvVar.AGL_MANAGED_STORE, fallback=True):
             raise ValueError("Set AGL_MANAGED_STORE=0 when using an external store.")
+
+    _sprp: float | None = args.strategy_repetition_penalty
+    if _sprp is not None and _sprp <= 0:
+        _sprp = None
 
     train(
         data_base_path=args.data_base_path,
@@ -1248,8 +1297,13 @@ def main() -> None:
         answer_temperature=args.answer_temperature,
         val_answer_temperature=args.val_answer_temperature,
         use_hard_correctness_metric=args.use_hard_correctness_metric,
+        strategy_no_think=args.strategy_no_think,
+        strategy_repetition_penalty=_sprp,
         answer_no_think=args.answer_no_think,
         answer_max_tokens=args.answer_max_tokens,
+        answer_request_retries=args.answer_request_retries,
+        answer_retry_delay_sec=args.answer_retry_delay_sec,
+        answer_fallback_rollout_on_failure=not args.no_answer_fallback_rollout,
         val_only=args.val_only,
     )
 

@@ -78,6 +78,7 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --correctness-weight 0.7 \
     --grounded-proxy-k 1 \
     --answer-no-think \
+    --strategy-no-think \
     ${ANSWER_MAX_TOKENS:+--answer-max-tokens "${ANSWER_MAX_TOKENS}"} \
     --strategy-prompt-version strategy_update_2026-03-09 \
     --answer-prompt-version v1 \
