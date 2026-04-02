@@ -61,7 +61,7 @@ class StrategyConfig:
     # instance; the user must start the server before training.
     strategy_scorer_model_path: str = ""
     strategy_scorer_base_url: str = ""
-    strategy_scoring_prompt_version: str = "v2"
+    strategy_scoring_prompt_version: str = "four_dim"
     scorer_weight: float = 1.0
     reward_mode: str = "hybrid_grounded"
     grounded_proxy_weight: float = 0.5

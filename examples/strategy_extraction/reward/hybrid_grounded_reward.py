@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-from typing import Any, Awaitable, Callable, Dict, List, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 AsyncAnswerFn = Callable[[str], Awaitable[str]]
@@ -21,16 +24,25 @@ CorrectnessFn = Callable[[str, str], float]
 
 _CAP_FLAG_MAP = {
     "correct_but_unrelated": 55.0,
+    # Use sparingly: only if strategy explicitly mandates verification and failure is plausibly executor slip.
     "wrong_but_strategy_ok": 75.0,
     "core_wrong_step": 35.0,
     "generic_template": 50.0,
     "leaked_answer": 60.0,
+    # Strategy quality caps (wrong direction, missing checks, etc.)
+    "weak_entity_anchor": 45.0,
+    "reasoning_no_intermediate": 45.0,
+    "output_contract_missing": 48.0,
+    "task_invariant_missing": 45.0,
+    "insufficient_verification_when_wrong": 52.0,
 }
 _PENALTY_MAP = {
     "generic_not_operational": 15.0,
     "memorization_leakage": 15.0,
     "contradiction": 20.0,
     "missing_check": 10.0,
+    "no_uniqueness_or_disambiguation": 12.0,
+    "no_option_or_gt_shape_crosscheck": 12.0,
 }
 _DIMENSION_KEYS = [
     "A_outcome_support",
@@ -40,6 +52,30 @@ _DIMENSION_KEYS = [
     "E_transfer_robustness",
     "F_clarity_economy",
 ]
+# Keys produced by four_dim.toml / 2026-03-29_four_dim_zh_rubric.toml.
+_FOUR_DIM_KEYS = [
+    "A_direction_relevance",
+    "B_process_executability",
+    "C_transfer_generality",
+    "D_conciseness",
+]
+
+DEFAULT_FOUR_DIM_WEIGHTS: Tuple[float, float, float, float] = (0.30, 0.30, 0.30, 0.10)
+
+
+def normalize_four_dim_weights(
+    weights: Optional[Sequence[float]],
+) -> Tuple[float, float, float, float]:
+    """Return non-negative weights that sum to 1; default if None or invalid."""
+    if weights is None or len(weights) != 4:
+        return DEFAULT_FOUR_DIM_WEIGHTS
+    w = tuple(max(0.0, _to_float(x, 0.0)) for x in weights)
+    s = sum(w)
+    if s <= 1e-12:
+        return DEFAULT_FOUR_DIM_WEIGHTS
+    if abs(s - 1.0) > 1e-3:
+        logger.warning("oc_four_dim_weights sum is %s; normalizing to 1.0", s)
+    return tuple(x / s for x in w)
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -195,22 +231,42 @@ def build_outcome_conditioned_scorer_prompt(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def parse_oc_scorer_response(raw_json: str) -> Dict[str, Any]:
-    """Parse OC-scorer JSON and compute deterministic final score."""
+def parse_oc_scorer_response(
+    raw_json: str,
+    *,
+    four_dim_weights: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    """Parse OC-scorer JSON and compute deterministic final score.
+
+    Args:
+        raw_json: Scorer model output (JSON or markdown-wrapped JSON).
+        four_dim_weights: Optional (wA, wB, wC, wD) for four-dim rubrics; summed to 1 if needed.
+    """
     obj = _extract_json_obj(raw_json)
     dims = obj.get("dimension_scores", {}) if isinstance(obj, dict) else {}
     if not isinstance(dims, dict):
         dims = {}
 
-    score_values = {k: _to_float(dims.get(k), 0.0) for k in _DIMENSION_KEYS}
-    weighted_raw_100 = 20.0 * (
-        0.30 * score_values["A_outcome_support"]
-        + 0.20 * score_values["B_executability"]
-        + 0.15 * score_values["C_example_grounding"]
-        + 0.15 * score_values["D_problem_coverage"]
-        + 0.15 * score_values["E_transfer_robustness"]
-        + 0.05 * score_values["F_clarity_economy"]
-    )
+    # Prefer four-dim JSON when present (matches four_dim.toml).
+    if any(k in dims for k in _FOUR_DIM_KEYS):
+        score_values = {k: _to_float(dims.get(k), 0.0) for k in _FOUR_DIM_KEYS}
+        wa, wb, wc, wd = normalize_four_dim_weights(four_dim_weights)
+        weighted_raw_100 = 20.0 * (
+            wa * score_values["A_direction_relevance"]
+            + wb * score_values["B_process_executability"]
+            + wc * score_values["C_transfer_generality"]
+            + wd * score_values["D_conciseness"]
+        )
+    else:
+        score_values = {k: _to_float(dims.get(k), 0.0) for k in _DIMENSION_KEYS}
+        weighted_raw_100 = 20.0 * (
+            0.30 * score_values["A_outcome_support"]
+            + 0.20 * score_values["B_executability"]
+            + 0.15 * score_values["C_example_grounding"]
+            + 0.15 * score_values["D_problem_coverage"]
+            + 0.15 * score_values["E_transfer_robustness"]
+            + 0.05 * score_values["F_clarity_economy"]
+        )
 
     cap_flags = obj.get("cap_flags", []) if isinstance(obj.get("cap_flags", []), list) else []
     penalties = obj.get("penalties", []) if isinstance(obj.get("penalties", []), list) else []

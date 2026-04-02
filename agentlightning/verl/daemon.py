@@ -924,6 +924,8 @@ class AgentModeDaemon:
         metric_dict: Dict[str, Any] = {}
         _RD_METRIC_KEYS = {
             "format": "reward_format",
+            "scorer": "reward_scorer",
+            "grounded_proxy": "reward_grounded_proxy",
             "answer_soft": "reward_answer_soft",
             "answer_hard": "reward_answer_hard",
         }
@@ -1309,6 +1311,8 @@ class AgentModeDaemon:
         }
         _RD_METRIC_KEYS = {
             "format": "reward_format",
+            "scorer": "reward_scorer",
+            "grounded_proxy": "reward_grounded_proxy",
             "answer_soft": "reward_answer_soft",
             "answer_hard": "reward_answer_hard",
         }

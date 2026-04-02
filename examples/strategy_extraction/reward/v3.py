@@ -709,13 +709,21 @@ def compute_answer_correctness(
     return float(detail["soft_score"])
 
 
-def compute_final_reward(
-    format_reward: float,
-    correctness: float,
-    format_weight: float,
-    correctness_weight: float,
-) -> float:
-    return format_weight * format_reward + correctness_weight * correctness
+def compute_final_reward(*args: float) -> float:
+    """4-arg: (format, correctness, fw, cw). 6-arg: (format, scorer, correctness, fw, sw, cw)."""
+    if len(args) == 4:
+        format_reward, correctness, format_weight, correctness_weight = args
+        return format_weight * format_reward + correctness_weight * correctness
+    if len(args) == 6:
+        format_reward, scorer_reward, correctness, format_weight, scorer_weight, correctness_weight = args
+        return (
+            format_weight * format_reward
+            + scorer_weight * scorer_reward
+            + correctness_weight * correctness
+        )
+    raise TypeError(
+        f"compute_final_reward expected 4 or 6 positional args, got {len(args)}"
+    )
 
 
 REWARD = RewardConfig(

@@ -26,7 +26,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, cast
+from typing import Optional, Tuple, cast
 
 import agentlightning as agl
 
@@ -47,6 +47,18 @@ except ImportError:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_oc_four_dim_weights(raw: str | None) -> Tuple[float, float, float, float] | None:
+    """Parse 'wA,wB,wC,wD' for OC rubric aggregation; None if empty."""
+    if raw is None or not str(raw).strip():
+        return None
+    parts = [p.strip() for p in str(raw).split(",")]
+    if len(parts) != 4:
+        raise ValueError(
+            "--oc-four-dim-weights requires exactly four comma-separated floats, e.g. 0.3,0.3,0.3,0.1"
+        )
+    return tuple(float(p) for p in parts)  # type: ignore[return-value]
 
 
 # ---- Dataset creation (reuses strategy_application data format) ---- #
@@ -155,7 +167,10 @@ def _create_strategy_generation_dataset(
                 "problem": problem_text,
                 "ground_truth": ground_truth,
                 "ground_truths": [ground_truth],
-                "task_meta": {"problem_type": problem_type},
+                "task_meta": {
+                    "problem_type": problem_type,
+                    "expected_answer_format": "",
+                },
                 "source_problem_type": None,
             })
             sample_counts[problem_type] += 1
@@ -231,6 +246,9 @@ def _create_strategy_generation_dataset_per_subtask(
 
             subtask_name = subtask_file.stem
             subtask_id = f"{problem_type}/{subtask_name}"
+            file_expected_fmt = ""
+            if isinstance(raw.get("expected_answer_format"), str):
+                file_expected_fmt = raw["expected_answer_format"].strip()
 
             for _ in range(samples_per_subtask):
                 # Need at least one problem sample in addition to few-shot examples.
@@ -268,6 +286,7 @@ def _create_strategy_generation_dataset_per_subtask(
                             "subtask": subtask_name,
                             "subtask_id": subtask_id,
                             "validation_split": split_name,
+                            "expected_answer_format": file_expected_fmt,
                         },
                         "source_problem_type": subtask_id,
                     }
@@ -312,6 +331,15 @@ def _load_strategy_dataset_from_file(path: str) -> list[dict[str, object]]:
             item["ground_truths"] = [ground_truth] if ground_truth else []
         if "task_meta" not in item:
             item["task_meta"] = {"problem_type": item.get("problem_type", "unknown")}
+        tm = item["task_meta"]
+        if isinstance(tm, dict):
+            top_fmt = item.get("expected_answer_format")
+            if isinstance(top_fmt, str) and top_fmt.strip() and not tm.get("expected_answer_format"):
+                tm = {**tm, "expected_answer_format": top_fmt.strip()}
+                item["task_meta"] = tm
+            elif "expected_answer_format" not in tm:
+                tm = {**tm, "expected_answer_format": ""}
+                item["task_meta"] = tm
     return records
 
 
@@ -568,6 +596,8 @@ def train(
     strategy_scorer_model_name: str,
     strategy_scorer_base_url: str,
     strategy_scoring_prompt_version: str,
+    oc_four_dim_weights: Tuple[float, float, float, float] | None,
+    strategy_scorer_timeout_sec: float,
     # Fixed answer model
     answer_model_path: str,
     answer_model_base_url: str,
@@ -586,6 +616,8 @@ def train(
     answer_fallback_rollout_on_failure: bool,
     train_dataset_json: str,
     val_only: bool,
+    ppo_mini_batch_size: int | None = None,
+    ppo_micro_batch_size_per_gpu: int | None = None,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -712,6 +744,10 @@ def train(
                         "strategy_scorer_model_name": strategy_scorer_model_name,
                         "strategy_scorer_base_url": strategy_scorer_base_url,
                         "strategy_scoring_prompt_version": strategy_scoring_prompt_version,
+                        "oc_four_dim_weights": list(oc_four_dim_weights)
+                        if oc_four_dim_weights
+                        else None,
+                        "strategy_scorer_timeout_sec": strategy_scorer_timeout_sec,
                         "answer_model_path": answer_model_path,
                         "answer_model_base_url": answer_model_base_url,
                         "answer_model_name": answer_model_name,
@@ -827,6 +863,12 @@ def train(
         checkpoint_dir=checkpoint_dir,
         n_gpus=n_gpus,
     )
+    if ppo_mini_batch_size is not None:
+        config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] = ppo_mini_batch_size
+    if ppo_micro_batch_size_per_gpu is not None:
+        config["actor_rollout_ref"]["actor"]["ppo_micro_batch_size_per_gpu"] = (
+            ppo_micro_batch_size_per_gpu
+        )
     if val_only:
         config["trainer"]["val_only"] = True
         # Ensure trainer init can always form at least one train batch.
@@ -869,6 +911,8 @@ def train(
         strategy_scorer_base_url=strategy_scorer_base_url,
         strategy_scorer_model=strategy_scorer_model_name or strategy_scorer_model_path,
         strategy_scoring_prompt_version=strategy_scoring_prompt_version,
+        oc_four_dim_weights=oc_four_dim_weights,
+        strategy_scorer_timeout_sec=strategy_scorer_timeout_sec,
         answer_model_base_url=answer_model_base_url,
         answer_model_name=answer_model_name or answer_model_path,
         use_strategy_for_answer=use_strategy_for_answer,
@@ -1061,6 +1105,21 @@ def main() -> None:
     # Training
     parser.add_argument("--n-runners", type=int, default=StrategyConfig.n_runners)
     parser.add_argument("--n-gpus", type=int, default=8, help="Number of GPUs for VERL training")
+    parser.add_argument(
+        "--ppo-mini-batch-size",
+        "--ppo_mini_batch_size",
+        type=int,
+        default=None,
+        help="Override actor PPO mini-batch size (must match VERL: after (size*rollout.n)//n_gpus, "
+        "result divisible by ppo_micro_batch_size_per_gpu).",
+    )
+    parser.add_argument(
+        "--ppo-micro-batch-size-per-gpu",
+        "--ppo_micro_batch_size_per_gpu",
+        type=int,
+        default=None,
+        help="Override per-GPU PPO micro-batch size (must divide normalized mini-batch).",
+    )
     parser.add_argument("--lora", action="store_true")
     parser.add_argument("--lora-rank", type=int, default=StrategyConfig.lora_rank)
 
@@ -1108,6 +1167,18 @@ def main() -> None:
                         help="Base URL of the vLLM server for the strategy scorer (e.g. http://localhost:8100/v1)")
     parser.add_argument("--strategy-scoring-prompt-version", type=str, default=StrategyConfig.strategy_scoring_prompt_version,
                         help="Prompt version for strategy scoring (see prompt/strategy_scoring/)")
+    parser.add_argument(
+        "--oc-four-dim-weights",
+        type=str,
+        default="",
+        help="Comma-separated OC rubric weights A,B,C,D (e.g. 0.3,0.3,0.3,0.1). Empty = use defaults.",
+    )
+    parser.add_argument(
+        "--strategy-scorer-timeout-sec",
+        type=float,
+        default=120.0,
+        help="HTTP timeout (seconds) for strategy scorer /v1/chat/completions.",
+    )
 
     # Fixed answer-generation model (frozen copy, not trained)
     parser.add_argument("--answer-model-path", type=str, default="",
@@ -1241,6 +1312,8 @@ def main() -> None:
     if _sprp is not None and _sprp <= 0:
         _sprp = None
 
+    _oc_four_dim_w = _parse_oc_four_dim_weights(getattr(args, "oc_four_dim_weights", "") or "")
+
     train(
         data_base_path=args.data_base_path,
         val_data_base_path=args.val_data_base_path,
@@ -1264,6 +1337,8 @@ def main() -> None:
         min_val_first_batch_ratio=args.min_val_first_batch_ratio,
         n_runners=args.n_runners,
         n_gpus=args.n_gpus,
+        ppo_mini_batch_size=args.ppo_mini_batch_size,
+        ppo_micro_batch_size_per_gpu=args.ppo_micro_batch_size_per_gpu,
         lora=args.lora,
         lora_rank=args.lora_rank,
         external_store_address=args.external_store_address,
@@ -1289,6 +1364,8 @@ def main() -> None:
         strategy_scorer_model_name=args.strategy_scorer_model_name,
         strategy_scorer_base_url=args.strategy_scorer_base_url,
         strategy_scoring_prompt_version=args.strategy_scoring_prompt_version,
+        oc_four_dim_weights=_oc_four_dim_w,
+        strategy_scorer_timeout_sec=float(args.strategy_scorer_timeout_sec),
         answer_model_path=args.answer_model_path,
         answer_model_base_url=args.answer_model_base_url,
         answer_model_name=args.answer_model_name,

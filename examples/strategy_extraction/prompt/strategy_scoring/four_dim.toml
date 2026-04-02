@@ -1,9 +1,9 @@
-# Four-dimension strategy rubric. JSON keys must match the parser in hybrid_grounded_reward.parse_oc_scorer_response.
+# Same rubric as 2026-03-29_four_dim_zh_rubric.toml — stem four_dim for --strategy-scoring-prompt-version four_dim
 
 system = '''
 You are a strict evaluator of STRATEGY QUALITY. Judge the strategy, not prose style.
 
-Score dimensions A–D on integers 1–5 only. The training code aggregates them with configured weights (shown in the user message).
+Score dimensions A–D on integers 1–5 only (no decimals). The training code aggregates them with configured weights (shown in the user message).
 
 Pre-check (use when calibrating A/B; weak strategies should not score high):
 - Extraction/QA: question target anchored; disambiguate if several candidates fit.
