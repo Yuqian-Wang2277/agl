@@ -99,8 +99,8 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             # - Prompts > max_prompt_length: truncated and DROPPED from training (no gradient update)
             # - Responses > max_response_length: truncated but KEPT in training
             # - Must satisfy: max_prompt_length + max_response_length < max_model_len
-            "max_prompt_length": 16384,  # Conservative limit for few-shot prompts
-            "max_response_length": 16384,   # Target ~500 tokens, with buffer for variation
+            "max_prompt_length": 16384,  # Keep high to avoid filter_overlong_prompts filtering too many samples
+            "max_response_length": 4096, # Strategy responses target ~500 tokens; 4K gives ample buffer vs original 16384
             "filter_overlong_prompts": True,  # Enable prompt filtering
         },
         "actor_rollout_ref": {
@@ -112,18 +112,17 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             "rollout": {
                 "tensor_model_parallel_size": 1,
                 "n": 8,
-                "log_prob_micro_batch_size_per_gpu": 4,
+                "log_prob_micro_batch_size_per_gpu": 2,
                 "name": "vllm",
-                # vLLM fraction of per-GPU memory; raise for more KV cache, lower if actor/FSDP OOMs.
-                "gpu_memory_utilization": 0.50,
-                # Qwen3-4B supports max_model_len=32768; long contexts increase KV usage.
-                # With 8 GPUs and FSDP offload, watch for OOM if this is high.
-                "max_model_len": 32768,  # Reasonable balance: enough for our use case, saves memory
+                # vLLM fraction of per-GPU memory; keep at 0.45 to leave headroom for FSDP actor/ref.
+                "gpu_memory_utilization": 0.45,
+                # max_model_len must exceed max_prompt_length + max_response_length (8192+4096=12288).
+                "max_model_len": 16384,
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },
             "actor": {
-                "ppo_mini_batch_size": 28,
-                "ppo_micro_batch_size_per_gpu": 4,
+                "ppo_mini_batch_size": 24,
+                "ppo_micro_batch_size_per_gpu": 2,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": False,
                 "kl_loss_coef": 0.0,
@@ -136,7 +135,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 },
             },
             "ref": {
-                "log_prob_micro_batch_size_per_gpu": 8,
+                "log_prob_micro_batch_size_per_gpu": 2,
                 "fsdp_config": {"param_offload": True},
             },
         },
