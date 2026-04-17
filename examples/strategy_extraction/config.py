@@ -100,7 +100,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
             # - Responses > max_response_length: truncated but KEPT in training
             # - Must satisfy: max_prompt_length + max_response_length < max_model_len
             "max_prompt_length": 16384,  # Keep high to avoid filter_overlong_prompts filtering too many samples
-            "max_response_length": 4096, # Strategy responses target ~500 tokens; 4K gives ample buffer vs original 16384
+            "max_response_length": 16384, # Strategy responses target ~500 tokens; 4K gives ample buffer vs original 16384
             "filter_overlong_prompts": True,  # Enable prompt filtering
         },
         "actor_rollout_ref": {
@@ -115,13 +115,13 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 "log_prob_micro_batch_size_per_gpu": 2,
                 "name": "vllm",
                 # vLLM fraction of per-GPU memory; keep at 0.45 to leave headroom for FSDP actor/ref.
-                "gpu_memory_utilization": 0.45,
+                "gpu_memory_utilization": 0.85,
                 # max_model_len must exceed max_prompt_length + max_response_length (8192+4096=12288).
-                "max_model_len": 16384,
+                "max_model_len": 32768,
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },
             "actor": {
-                "ppo_mini_batch_size": 24,
+                "ppo_mini_batch_size": 28,
                 "ppo_micro_batch_size_per_gpu": 2,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": False,

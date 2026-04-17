@@ -250,17 +250,37 @@ def _create_strategy_generation_dataset_per_subtask(
             if isinstance(raw.get("expected_answer_format"), str):
                 file_expected_fmt = raw["expected_answer_format"].strip()
 
-            for _ in range(samples_per_subtask):
-                # Need at least one problem sample in addition to few-shot examples.
-                effective_fewshot_max = min(fewshot_max, len(examples_pool) - 1)
-                if effective_fewshot_max < fewshot_min:
-                    n_shots = max(1, effective_fewshot_max)
-                else:
-                    n_shots = rng.randint(fewshot_min, effective_fewshot_max)
+            # samples_per_subtask == 0 → 全量枚举：每道题恰好作为一次 problem_ex，不重复
+            full_mode = (samples_per_subtask == 0)
+            if full_mode:
+                problem_indices = list(range(len(examples_pool)))
+                rng.shuffle(problem_indices)
+                n_iters = len(problem_indices)
+            else:
+                problem_indices = []
+                n_iters = samples_per_subtask
 
-                picked = rng.sample(examples_pool, n_shots + 1)
-                fewshot = picked[:-1]
-                problem_ex = picked[-1]
+            for it in range(n_iters):
+                if full_mode:
+                    prob_idx = problem_indices[it]
+                    problem_ex = examples_pool[prob_idx]
+                    remaining_pool = [e for j, e in enumerate(examples_pool) if j != prob_idx]
+                    effective_fewshot_max = min(fewshot_max, len(remaining_pool))
+                    if effective_fewshot_max < fewshot_min:
+                        n_shots = max(1, effective_fewshot_max)
+                    else:
+                        n_shots = rng.randint(fewshot_min, effective_fewshot_max)
+                    fewshot = rng.sample(remaining_pool, min(n_shots, len(remaining_pool)))
+                else:
+                    # Need at least one problem sample in addition to few-shot examples.
+                    effective_fewshot_max = min(fewshot_max, len(examples_pool) - 1)
+                    if effective_fewshot_max < fewshot_min:
+                        n_shots = max(1, effective_fewshot_max)
+                    else:
+                        n_shots = rng.randint(fewshot_min, effective_fewshot_max)
+                    picked = rng.sample(examples_pool, n_shots + 1)
+                    fewshot = picked[:-1]
+                    problem_ex = picked[-1]
 
                 problem_text = str(problem_ex.get("input", "") or "")
                 target_val = problem_ex.get("target", [])
@@ -294,10 +314,10 @@ def _create_strategy_generation_dataset_per_subtask(
             subtask_counter += 1
 
     logger.info(
-        "Per-subtask validation dataset created: %d samples, %d subtasks, %d per subtask",
+        "Per-subtask validation dataset created: %d samples, %d subtasks, %s per subtask",
         len(dataset),
         subtask_counter,
-        samples_per_subtask,
+        "all" if samples_per_subtask == 0 else str(samples_per_subtask),
     )
     return dataset
 
@@ -618,6 +638,8 @@ def train(
     val_only: bool,
     ppo_mini_batch_size: int | None = None,
     ppo_micro_batch_size_per_gpu: int | None = None,
+    baseline_cache_path: str = "",
+    incremental_weight: float = 0.0,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -894,6 +916,23 @@ def train(
     rollout_traces_dir = os.path.join(checkpoint_dir, "rollout_traces")
     validation_output_dir = os.path.join(checkpoint_dir, "validation_outputs")
     test_freq = config.get("trainer", {}).get("test_freq", 50)
+
+    # Incremental reward baseline cache
+    _baseline_cache: dict[str, float] = {}
+    if baseline_cache_path and os.path.exists(baseline_cache_path):
+        import json as _json
+        with open(baseline_cache_path, encoding="utf-8") as _f:
+            _baseline_cache = _json.load(_f)
+        logger.info(
+            f"Loaded baseline cache: {len(_baseline_cache)} entries from {baseline_cache_path}, "
+            f"incremental_weight={incremental_weight}"
+        )
+    elif incremental_weight > 0.0:
+        logger.warning(
+            f"incremental_weight={incremental_weight} but baseline_cache_path is empty or not found "
+            f"({baseline_cache_path!r}). R_delta will be 0 for all samples."
+        )
+
     agent = StrategyGenerationAgent(
         save_full_output=save_full_output,
         rollout_traces_dir=rollout_traces_dir,
@@ -930,6 +969,8 @@ def train(
         strategy_prompt_version=strategy_prompt_version,
         answer_prompt_version=answer_prompt_version,
         reward_version=reward_version,
+        baseline_cache=_baseline_cache,
+        incremental_weight=incremental_weight,
     )
 
     # Trainer
@@ -1293,6 +1334,22 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--save-full-output", action="store_true", default=True)
 
+    # Incremental reward
+    parser.add_argument(
+        "--baseline-cache-path",
+        type=str,
+        default="",
+        help="Path to baseline_cache.json generated by build_baseline_cache.py. "
+             "Maps md5(problem)[:16] → avg_answer_soft of the SFT-strategy baseline.",
+    )
+    parser.add_argument(
+        "--incremental-weight",
+        type=float,
+        default=0.0,
+        help="Weight for R_delta = max(0, answer_soft - baseline_soft). "
+             "0.0 (default) disables incremental reward entirely.",
+    )
+
     args = parser.parse_args()
 
     if args.strict_no_strategy_baseline:
@@ -1382,6 +1439,8 @@ def main() -> None:
         answer_retry_delay_sec=args.answer_retry_delay_sec,
         answer_fallback_rollout_on_failure=not args.no_answer_fallback_rollout,
         val_only=args.val_only,
+        baseline_cache_path=args.baseline_cache_path,
+        incremental_weight=args.incremental_weight,
     )
 
 

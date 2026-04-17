@@ -82,9 +82,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--val-sampling-mode",
         type=str,
-        choices=["per_subtask_fixed", "global"],
+        choices=["per_subtask_fixed", "global", "all"],
         default="per_subtask_fixed",
-        help="Validation sampling mode (matches train_strategy_generation).",
+        help="Validation sampling mode: per_subtask_fixed (N samples per subtask JSON), "
+        "global (global cap across all subtasks), or all (enumerate every example exactly once).",
     )
     parser.add_argument(
         "--val-samples-per-subtask",
@@ -297,6 +298,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Do not fall back to the strategy (rollout) model if the answer server fails.",
     )
+    parser.add_argument(
+        "--num-samples-per-problem",
+        type=int,
+        default=3,
+        help="Number of independent rollouts per problem for pass@k evaluation. "
+        "When >1 and temperature==0, auto-switches temperature to 0.7 and uses "
+        "incrementing seeds (base_seed, base_seed+1, ...) per attempt.",
+    )
 
     return parser
 
@@ -319,6 +328,15 @@ async def _run_eval(args: argparse.Namespace) -> None:
                 fewshot_min=args.fewshot_min,
                 fewshot_max=args.fewshot_max,
                 samples_per_subtask=args.val_samples_per_subtask,
+                seed=args.val_sampling_seed,
+            )
+        elif args.val_sampling_mode == "all":
+            # 全量枚举：每道题恰好作为一次 problem_ex（samples_per_subtask=0 为哨兵值）
+            vds = _create_strategy_generation_dataset_per_subtask(
+                vd,
+                fewshot_min=args.fewshot_min,
+                fewshot_max=args.fewshot_max,
+                samples_per_subtask=0,
                 seed=args.val_sampling_seed,
             )
         else:
@@ -382,6 +400,19 @@ async def _run_eval(args: argparse.Namespace) -> None:
         None if args.strategy_repetition_penalty <= 0 else float(args.strategy_repetition_penalty)
     )
 
+    # Auto-switch temperature when running multiple samples per problem.
+    num_samples = max(1, int(args.num_samples_per_problem or 1))
+    effective_temperature = args.temperature
+    if num_samples > 1 and effective_temperature == 0.0:
+        logger.warning(
+            "num_samples_per_problem=%d with temperature=0; auto-switching temperature to 0.7 "
+            "so that each attempt produces a distinct output. Pass --temperature explicitly to override.",
+            num_samples,
+        )
+        effective_temperature = 0.7
+
+    base_seed = args.llm_seed if args.llm_seed is not None else 42
+
     # Build per-worker agent instances to avoid shared-state conflicts under concurrency.
     # Each worker writes its own validation shard: validation_step0_worker{worker_id}.json
     strategy_base_url = args.strategy_model_base_url or args.answer_model_base_url
@@ -423,8 +454,8 @@ async def _run_eval(args: argparse.Namespace) -> None:
         main_llm = _DummyLLM(
             model=strategy_model_name,
             base_url=strategy_base_url,
-            temperature=args.temperature,
-            seed=args.llm_seed,
+            temperature=effective_temperature,
+            seed=base_seed,
         )
         resources: agl.NamedResources = {"main_llm": main_llm}
         return agent, resources
@@ -435,13 +466,29 @@ async def _run_eval(args: argparse.Namespace) -> None:
     by_split_soft: Dict[str, List[float]] = {}
     by_split_hard: Dict[str, List[float]] = {}
 
-    logger.info("Starting lightweight evaluation over %d samples...", len(val_dataset))
-    start_ts = datetime.now().isoformat()
-    print(f"[{start_ts}] Starting eval_no_verl over {len(val_dataset)} samples")
+    # Per-problem tracking for pass@k: problem_idx -> list of (soft, hard) per attempt.
+    per_problem_soft: Dict[int, List[float]] = {}
+    per_problem_hard: Dict[int, List[float]] = {}
+    by_split_per_problem_soft: Dict[str, Dict[int, List[float]]] = {}
+    by_split_per_problem_hard: Dict[str, Dict[int, List[float]]] = {}
 
-    queue: asyncio.Queue[Tuple[int, StrategyGenerationTask]] = asyncio.Queue()
-    for idx, task in enumerate(val_dataset):
-        queue.put_nowait((idx, task))
+    logger.info(
+        "Starting lightweight evaluation over %d samples × %d attempt(s) = %d total rollouts...",
+        len(val_dataset),
+        num_samples,
+        len(val_dataset) * num_samples,
+    )
+    start_ts = datetime.now().isoformat()
+    print(
+        f"[{start_ts}] Starting eval_no_verl over {len(val_dataset)} problems "
+        f"× {num_samples} attempt(s) (pass@k eval)"
+    )
+
+    # Queue items: (problem_idx, attempt_idx, task)
+    queue: asyncio.Queue[Tuple[int, int, StrategyGenerationTask]] = asyncio.Queue()
+    for problem_idx, task in enumerate(val_dataset):
+        for attempt_idx in range(num_samples):
+            queue.put_nowait((problem_idx, attempt_idx, task))
 
     stats_lock = asyncio.Lock()
     workers: List[Tuple[StrategyGenerationAgent, agl.NamedResources]] = [
@@ -450,15 +497,16 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     async def _process_one(
         *,
-        idx: int,
+        problem_idx: int,
+        attempt_idx: int,
         task: StrategyGenerationTask,
         agent: StrategyGenerationAgent,
         resources: agl.NamedResources,
     ) -> None:
-        rollout_id = f"val-{idx:06d}"
+        rollout_id = f"val-{problem_idx:06d}-a{attempt_idx}"
         rollout = _SimpleRollout(
             rollout_id=rollout_id,
-            attempt=_SimpleAttempt(attempt_id="0"),
+            attempt=_SimpleAttempt(attempt_id=str(attempt_idx)),
             mode="val",
         )
         try:
@@ -482,6 +530,8 @@ async def _run_eval(args: argparse.Namespace) -> None:
                     s = float(soft)
                     overall_soft.append(s)
                     by_split_soft.setdefault(split, []).append(s)
+                    per_problem_soft.setdefault(problem_idx, []).append(s)
+                    by_split_per_problem_soft.setdefault(split, {}).setdefault(problem_idx, []).append(s)
                 except Exception:  # noqa: BLE001
                     pass
             if hard is not None:
@@ -489,6 +539,8 @@ async def _run_eval(args: argparse.Namespace) -> None:
                     h = float(hard)
                     overall_hard.append(h)
                     by_split_hard.setdefault(split, []).append(h)
+                    per_problem_hard.setdefault(problem_idx, []).append(h)
+                    by_split_per_problem_hard.setdefault(split, {}).setdefault(problem_idx, []).append(h)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -496,11 +548,19 @@ async def _run_eval(args: argparse.Namespace) -> None:
         agent, resources = workers[worker_idx]
         while True:
             try:
-                idx, task = queue.get_nowait()
+                problem_idx, attempt_idx, task = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            # Give this attempt a unique seed so outputs differ across attempts.
+            resources["main_llm"].sampling_parameters["seed"] = base_seed + attempt_idx
             try:
-                await _process_one(idx=idx, task=task, agent=agent, resources=resources)
+                await _process_one(
+                    problem_idx=problem_idx,
+                    attempt_idx=attempt_idx,
+                    task=task,
+                    agent=agent,
+                    resources=resources,
+                )
             finally:
                 queue.task_done()
 
@@ -517,9 +577,28 @@ async def _run_eval(args: argparse.Namespace) -> None:
     def _mean(xs: List[float]) -> float:
         return sum(xs) / len(xs) if xs else 0.0
 
+    def _pass_at_k(per_problem: Dict[int, List[float]], k: int, threshold: float = 0.5) -> Optional[float]:
+        """Fraction of problems where at least 1 of the first k attempts passes threshold."""
+        if not per_problem:
+            return None
+        results = [
+            any(v >= threshold for v in scores[:k])
+            for scores in per_problem.values()
+            if scores
+        ]
+        return sum(results) / len(results) if results else None
+
+    def _pass_at_k_split(
+        per_problem: Dict[int, List[float]], k: int, threshold: float = 0.5
+    ) -> Optional[str]:
+        v = _pass_at_k(per_problem, k, threshold)
+        return f"{v:.4f}" if v is not None else "NA"
+
     print("\n" + "=" * 90)
     print("StrategyGenerationAgent — eval_no_verl summary")
     print("=" * 90)
+    print(f"Problems:      {len(val_dataset)}")
+    print(f"Attempts/prob: {num_samples}  (temperature={effective_temperature:.2f}, base_seed={base_seed})")
     print(f"Samples(soft): {len(overall_soft)}")
     print(f"Samples(hard): {len(overall_hard)}")
     if overall_soft:
@@ -527,15 +606,33 @@ async def _run_eval(args: argparse.Namespace) -> None:
     if overall_hard:
         print(f"Acc_hard(all): {_mean(overall_hard):.4f}")
 
+    # pass@k overall
+    k_values = [k for k in (1, 2, 3) if k <= num_samples]
+    if k_values and (per_problem_hard or per_problem_soft):
+        print()
+        for k in k_values:
+            ph = _pass_at_k(per_problem_hard, k)
+            ps = _pass_at_k(per_problem_soft, k)
+            hard_str = f"{ph:.4f}" if ph is not None else "NA"
+            soft_str = f"{ps:.4f}" if ps is not None else "NA"
+            print(f"pass@{k}(hard): {hard_str}   pass@{k}(soft): {soft_str}")
+
     if by_split_soft or by_split_hard:
         print("\nBy validation split:")
-        for split in sorted(set(by_split_soft.keys()) | set(by_split_hard.keys())):
+        all_splits = sorted(set(by_split_soft.keys()) | set(by_split_hard.keys()))
+        for split in all_splits:
             soft_vals = by_split_soft.get(split, [])
             hard_vals = by_split_hard.get(split, [])
             soft_part = f"acc_soft={_mean(soft_vals):.4f}" if soft_vals else "acc_soft=NA"
             hard_part = f"acc_hard={_mean(hard_vals):.4f}" if hard_vals else "acc_hard=NA"
             n_part = max(len(soft_vals), len(hard_vals))
-            print(f"  - {split:20s} n={n_part:4d}  {soft_part}  {hard_part}")
+            pass_parts = []
+            for k in k_values:
+                ph_str = _pass_at_k_split(by_split_per_problem_hard.get(split, {}), k)
+                ps_str = _pass_at_k_split(by_split_per_problem_soft.get(split, {}), k)
+                pass_parts.append(f"p@{k}(h)={ph_str} p@{k}(s)={ps_str}")
+            pass_str = "  " + "  ".join(pass_parts) if pass_parts else ""
+            print(f"  - {split:20s} n={n_part:4d}  {soft_part}  {hard_part}{pass_str}")
     print("=" * 90 + "\n")
 
 

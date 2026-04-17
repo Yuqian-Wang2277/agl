@@ -90,8 +90,8 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --n-gpus 6 \
     --reward-version v3 \
     --reward-mode scorer_only \
-    --format-weight 0.1 \
-    --correctness-weight 0.9 \
+    --format-weight 1.0 \
+    --correctness-weight 0.0 \
     --grounded-proxy-k 1 \
     --answer-model-path "${ANSWER_MODEL_PATH}" \
     --answer-model-base-url "${ANSWER_MODEL_BASE_URL}" \

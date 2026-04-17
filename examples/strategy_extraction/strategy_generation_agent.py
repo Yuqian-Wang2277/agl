@@ -21,6 +21,7 @@ Configure vLLM so server-side defaults also use ``repetition_penalty=1.1`` when 
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -131,6 +132,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
         reward_version: str = "v2",
+        # Incremental reward: R_delta = max(0, answer_soft - baseline_soft)
+        baseline_cache: Optional[Dict[str, float]] = None,
+        incremental_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_full_output = save_full_output
@@ -230,6 +234,19 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         )
         if self.debug_baseline:
             logger.warning("AGL_DEBUG_BASELINE=1 enabled: rollout diagnostics are active.")
+
+        # Incremental reward: R_delta = max(0, answer_soft - baseline_soft)
+        self._baseline_cache: Dict[str, float] = baseline_cache or {}
+        self._incremental_weight: float = incremental_weight
+        if self._baseline_cache and self._incremental_weight > 0.0:
+            logger.info(
+                f"Incremental reward enabled: {len(self._baseline_cache)} baseline entries, "
+                f"incremental_weight={self._incremental_weight}"
+            )
+
+    def _problem_key(self, problem: str) -> str:
+        """Stable 16-char cache key derived from problem text (MD5 prefix)."""
+        return hashlib.md5(problem.encode("utf-8")).hexdigest()[:16]
 
     def _debug_rollout(self, rollout_id: str, stage: str, **fields: Any) -> None:
         """Emit compact rollout diagnostics when baseline debug is enabled."""
@@ -1226,6 +1243,26 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 final_reward=float(final_reward),
             )
 
+            # R_delta：相对 SFT 基线的增量奖励（可选）
+            r_delta = 0.0
+            baseline_soft_logged: Optional[float] = None
+            if self._incremental_weight > 0.0 and self._baseline_cache:
+                _key = self._problem_key(task.get("problem", ""))
+                _baseline_soft = self._baseline_cache.get(_key)
+                if _baseline_soft is not None:
+                    r_delta = max(0.0, answer_soft_metric - _baseline_soft)
+                    final_reward = final_reward + self._incremental_weight * r_delta
+                    baseline_soft_logged = _baseline_soft
+                    logger.info(
+                        f"[Rollout {attempted_rollout.rollout_id}] R_delta={r_delta:.3f} "
+                        f"(soft={answer_soft_metric:.3f} - baseline={_baseline_soft:.3f}), "
+                        f"final_with_delta={final_reward:.3f}"
+                    )
+                else:
+                    logger.debug(
+                        f"[Rollout {attempted_rollout.rollout_id}] 未找到基线分（problem key={_key}），跳过 R_delta"
+                    )
+
             agl.emit_reward(
                 {
                     "final": float(final_reward),
@@ -1234,6 +1271,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     "grounded_proxy": float(effective_proxy),
                     "answer_soft": float(answer_soft_metric),
                     "answer_hard": float(hard_correct_log),
+                    "r_delta": float(r_delta),
+                    "baseline_soft": float(baseline_soft_logged) if baseline_soft_logged is not None else -1.0,
                 },
                 primary_key="final",
             )

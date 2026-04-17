@@ -59,12 +59,20 @@ STRATEGY_SCORER_MODEL_PATH="${STRATEGY_SCORER_MODEL_PATH:-/home/test/test16/chen
 STRATEGY_SCORER_MODEL_NAME="${STRATEGY_SCORER_MODEL_NAME:-strategy_scorer}"
 STRATEGY_SCORER_BASE_URL="${STRATEGY_SCORER_BASE_URL:-http://localhost:8100/v1}"
 STRATEGY_SCORING_PROMPT_VERSION="${STRATEGY_SCORING_PROMPT_VERSION:-four_dim}"
-FORMAT_WEIGHT="${FORMAT_WEIGHT:-0.1}"
-SCORER_WEIGHT="${SCORER_WEIGHT:-0.2}"
-CORRECTNESS_WEIGHT="${CORRECTNESS_WEIGHT:-0.7}"
+FORMAT_WEIGHT="${FORMAT_WEIGHT:-0.0}"
+SCORER_WEIGHT="${SCORER_WEIGHT:-1.0}"
+CORRECTNESS_WEIGHT="${CORRECTNESS_WEIGHT:-0.0}"
 GROUNDED_PROXY_K="${GROUNDED_PROXY_K:-1}"
 OC_FOUR_DIM_WEIGHTS="${OC_FOUR_DIM_WEIGHTS:-0.3,0.3,0.3,0.1}"
 STRATEGY_SCORER_TIMEOUT_SEC="${STRATEGY_SCORER_TIMEOUT_SEC:-180}"
+
+# --- 增量奖励 R_delta（可选）---
+# 先运行 compute_train_baseline.sh + build_baseline_cache.py 生成 baseline_cache.json，
+# 然后设置以下两个变量启用增量奖励：
+#   BASELINE_CACHE_PATH=./baseline_cache.json INCREMENTAL_WEIGHT=0.3 bash scripts/train_generation.sh
+# INCREMENTAL_WEIGHT=0.0 表示禁用（默认），向后兼容。
+BASELINE_CACHE_PATH="${BASELINE_CACHE_PATH:-}"
+INCREMENTAL_WEIGHT="${INCREMENTAL_WEIGHT:-0.0}"
 
 echo "========================================="
 echo " Strategy generation — scorer_only (soft + OC)"
@@ -76,6 +84,7 @@ echo " Rubric     : ${STRATEGY_SCORING_PROMPT_VERSION}"
 echo " Reward w   : format=${FORMAT_WEIGHT} scorer=${SCORER_WEIGHT} correctness(soft)=${CORRECTNESS_WEIGHT}"
 echo " OC weights : ${OC_FOUR_DIM_WEIGHTS}"
 echo " K answers  : ${GROUNDED_PROXY_K} (mean soft if K>1, like v3 multi-sample path)"
+echo " R_delta    : incremental_weight=${INCREMENTAL_WEIGHT} baseline=${BASELINE_CACHE_PATH:-<disabled>}"
 echo "========================================="
 echo ""
 
@@ -120,4 +129,6 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --strategy-repetition-penalty 1.1 \
     --answer-request-retries 3 \
     --answer-retry-delay-sec 1.0 \
+    --incremental-weight "${INCREMENTAL_WEIGHT}" \
+    ${BASELINE_CACHE_PATH:+--baseline-cache-path "${BASELINE_CACHE_PATH}"} \
     "$@"
