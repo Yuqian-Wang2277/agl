@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, cast
@@ -136,6 +137,9 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # Incremental reward: R_delta = max(0, answer_soft - baseline_soft)
         baseline_cache: Optional[Dict[str, float]] = None,
         incremental_weight: float = 0.0,
+        # MIST reward: R_EIR × (1 + β·R_ICR)
+        beta: float = 0.0,
+        eir_k: float = 10.0,
     ) -> None:
         super().__init__()
         self.save_full_output = save_full_output
@@ -244,6 +248,16 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             logger.info(
                 f"Incremental reward enabled: {len(self._baseline_cache)} baseline entries, "
                 f"incremental_weight={self._incremental_weight}"
+            )
+
+        # MIST reward: R_EIR × (1 + β·R_ICR)
+        self._beta: float = float(beta)
+        self._eir_k: float = float(eir_k)
+        if self._baseline_cache:
+            logger.info(
+                f"MIST reward enabled: beta={self._beta}, eir_k={self._eir_k}, "
+                f"baseline_entries={len(self._baseline_cache)}"
+                + (" (pure EIR, no ICR scaling)" if self._beta == 0.0 else "")
             )
 
     def _problem_key(self, problem: str) -> str:
@@ -378,6 +392,95 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
     @staticmethod
     def _normalize_openai_base_url(url: str) -> str:
         return (url or "").rstrip("/")
+
+    # ------------------------------------------------------------------ #
+    #  MIST reward helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _compute_eir(a_curr: float, a_base: float, k: float) -> float:
+        """Execution Incremental Reward: sign(g_raw) · ln(1 + k·|g_raw|).
+
+        Uses asymmetric normalization: α=0.7 when improving (a_curr≥a_base),
+        α=0.3 when regressing, with denominator clamped to 0.05.
+        """
+        alpha = 0.7 if a_curr >= a_base else 0.3
+        denom = max(a_base ** alpha * (1.0 - a_base) ** (1.0 - alpha), 0.05)
+        g_raw = (a_curr - a_base) / denom
+        return math.copysign(math.log(1.0 + k * abs(g_raw)), g_raw)
+
+    @staticmethod
+    def _compute_icr(token_logprobs: List[float]) -> float:
+        """Internal Confidence Reward: exp(mean(log P(y_τ|...))) in (0, 1].
+
+        Returns 0.0 when logprobs are unavailable (graceful degradation).
+        """
+        if not token_logprobs:
+            return 0.0
+        return math.exp(sum(token_logprobs) / len(token_logprobs))
+
+    async def _post_answer_chat_completions_mist(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        strategy: str,
+        problem: str,
+        temperature: float,
+        max_tokens: int,
+        seed: Optional[int] = None,
+    ) -> tuple[str, List[float]]:
+        """Single answer call with logprobs=True for MIST ICR computation.
+
+        Returns:
+            (content, token_logprobs) where token_logprobs is a list of per-token
+            log-probabilities extracted from choices[0].logprobs.content.
+            Both are empty/[] on any failure.
+        """
+        url = f"{self._normalize_openai_base_url(base_url)}/chat/completions"
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": self.answer_prompt["system"]},
+                {"role": "user", "content": self.answer_prompt["user"].format(strategy=strategy, problem=problem)},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "logprobs": True,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        if self.answer_no_think:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"MIST answer call failed (url={url}): {e}")
+            return "", []
+
+        choices = data.get("choices", [])
+        if not choices:
+            logger.warning(f"MIST answer: empty choices (url={url})")
+            return "", []
+
+        content: str = choices[0].get("message", {}).get("content", "") or ""
+        token_logprobs: List[float] = []
+        try:
+            lp_data = choices[0].get("logprobs") or {}
+            lp_content = lp_data.get("content") or []
+            token_logprobs = [float(tok["logprob"]) for tok in lp_content if "logprob" in tok]
+        except Exception as e:
+            logger.warning(f"MIST: failed to parse logprobs, ICR will be 0.0: {e}")
+
+        return content, token_logprobs
 
     async def _post_answer_chat_completions_once(
         self,
@@ -749,6 +852,111 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     f"[Rollout {attempted_rollout.rollout_id}] Strategy: "
                     f"format={format_reward}, length={len(strategy) if strategy else 0}"
                 )
+
+            # ---- MIST reward branch (training only) ---- #
+            # Activated when baseline_cache is loaded (beta=0 → pure EIR; beta>0 → EIR×(1+β·ICR)).
+            # Format-invalid strategies are emitted with reward=0, format_ok=0 and skipped immediately.
+            if self._baseline_cache and not is_validation:
+                if strategy is None:
+                    # Format gate: no valid strategy → emit zero reward, skip answer call
+                    logger.info(
+                        f"[Rollout {attempted_rollout.rollout_id}] MIST: format invalid, skipping"
+                    )
+                    agl.emit_reward(
+                        {
+                            "final": 0.0,
+                            "format_ok": 0.0,
+                            "r_eir": 0.0,
+                            "r_icr": 0.0,
+                            "answer_soft": 0.0,
+                            "baseline_soft": -1.0,
+                        },
+                        primary_key="final",
+                    )
+                    return None
+
+                # Baseline gate (safety fallback; dataset filter should prevent this)
+                _mist_key = self._problem_key(task["problem"])
+                _a_base = self._baseline_cache.get(_mist_key)
+                if _a_base is None:
+                    logger.warning(
+                        f"[Rollout {attempted_rollout.rollout_id}] MIST: baseline not found "
+                        f"(key={_mist_key}), emitting zero reward"
+                    )
+                    agl.emit_reward(
+                        {
+                            "final": 0.0,
+                            "format_ok": 1.0,
+                            "r_eir": 0.0,
+                            "r_icr": 0.0,
+                            "answer_soft": 0.0,
+                            "baseline_soft": -1.0,
+                        },
+                        primary_key="final",
+                    )
+                    return None
+
+                # M=1 answer call with logprobs for ICR
+                _ans_base_url = self.answer_model_base_url or base_url
+                _ans_api_key = llm.api_key or "dummy-key"
+                _ans_model = self.answer_model_name or llm.model
+                _ans_temp = (
+                    self.answer_temperature
+                    if self.answer_temperature is not None
+                    else llm.sampling_parameters.get("temperature", 0.7)
+                )
+                _ans_content, _token_logprobs = await self._post_answer_chat_completions_mist(
+                    base_url=_ans_base_url,
+                    api_key=_ans_api_key,
+                    model=_ans_model,
+                    strategy=strategy,
+                    problem=task["problem"],
+                    temperature=_ans_temp,
+                    max_tokens=self._answer_max_tokens_for_llm(llm),
+                    seed=llm_request_seed,
+                )
+                if not _token_logprobs:
+                    logger.warning(
+                        f"[Rollout {attempted_rollout.rollout_id}] MIST: logprobs empty, "
+                        "ICR will be 0.0"
+                    )
+
+                # Compute A_curr (soft score)
+                _extracted = self.reward_config.extract_answer(_ans_content)
+                if _extracted:
+                    _jd = compute_answer_judgement(
+                        answer=_extracted,
+                        ground_truth=task["ground_truth"],
+                        numeric_tolerance=self.numeric_tolerance,
+                        f1_threshold=self.f1_threshold,
+                        task_meta=task.get("task_meta", {}),
+                    )
+                    _a_curr = float(_jd.get("soft_score", 0.0))
+                else:
+                    _a_curr = 0.0
+
+                # MIST formula: R = R_EIR × (1 + β·R_ICR)
+                _r_icr = self._compute_icr(_token_logprobs)
+                _r_eir = self._compute_eir(_a_curr, _a_base, self._eir_k)
+                _final = _r_eir * (1.0 + self._beta * _r_icr)
+
+                logger.info(
+                    f"[Rollout {attempted_rollout.rollout_id}] MIST: "
+                    f"a_curr={_a_curr:.3f}, a_base={_a_base:.3f}, "
+                    f"r_eir={_r_eir:.4f}, r_icr={_r_icr:.4f}, final={_final:.4f}"
+                )
+                agl.emit_reward(
+                    {
+                        "final": float(_final),
+                        "format_ok": 1.0,
+                        "r_eir": float(_r_eir),
+                        "r_icr": float(_r_icr),
+                        "answer_soft": float(_a_curr),
+                        "baseline_soft": float(_a_base),
+                    },
+                    primary_key="final",
+                )
+                return None
 
             # Outcome-conditioned scorer: any rubric TOML + vLLM base URL (even if reward-version
             # has no legacy extract_score hook, e.g. v3).

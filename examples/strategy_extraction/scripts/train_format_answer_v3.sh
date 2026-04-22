@@ -58,7 +58,7 @@ TRAIN_SUBDIR="${TRAIN_SUBDIR:-train_all_project_suitable}"
 VAL_DATA_ROOT="${VAL_DATA_ROOT:-/home/test/test16/chenlu/projects/LLMReflection/data/}"
 
 # --- Models (override with env vars or "$@") ---
-STRATEGY_MODEL_PATH="${STRATEGY_MODEL_PATH:-/home/test/test16/chenlu/model/Qwen3-4B}"
+STRATEGY_MODEL_PATH="${STRATEGY_MODEL_PATH:-/home/test/test16/chenlu/projects/fs/sft/sft_output/train_qwen4b_trainall_sig/1/checkpoint-1000_merged_hf}"
 ANSWER_MODEL_PATH="${ANSWER_MODEL_PATH:-/home/test/test16/chenlu/model/Qwen3-8B}"
 ANSWER_MODEL_BASE_URL="${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
 ANSWER_MODEL_NAME="${ANSWER_MODEL_NAME:-Qwen3-8B}"

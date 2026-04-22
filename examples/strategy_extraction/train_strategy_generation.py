@@ -808,6 +808,12 @@ def train(
     incremental_weight: float = 0.0,
     train_sampling_mode: str = "problem_type_balanced",
     train_new_problems_per_sample: int = 1,
+    beta: float = 0.0,
+    eir_k: float = 10.0,
+    train_batch_size: Optional[int] = None,
+    total_epochs: Optional[int] = None,
+    test_freq: Optional[int] = None,
+    save_freq: Optional[int] = None,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -1071,6 +1077,14 @@ def train(
         config["actor_rollout_ref"]["actor"]["ppo_micro_batch_size_per_gpu"] = (
             ppo_micro_batch_size_per_gpu
         )
+    if train_batch_size is not None:
+        config["data"]["train_batch_size"] = train_batch_size
+    if total_epochs is not None:
+        config["trainer"]["total_epochs"] = total_epochs
+    if test_freq is not None:
+        config["trainer"]["test_freq"] = test_freq
+    if save_freq is not None:
+        config["trainer"]["save_freq"] = save_freq
     if val_only:
         config["trainer"]["val_only"] = True
         # Ensure trainer init can always form at least one train batch.
@@ -1152,6 +1166,8 @@ def train(
         reward_version=reward_version,
         baseline_cache=_baseline_cache,
         incremental_weight=incremental_weight,
+        beta=beta,
+        eir_k=eir_k,
     )
 
     # Trainer
@@ -1563,6 +1579,48 @@ def main() -> None:
         help="Weight for R_delta = max(0, answer_soft - baseline_soft). "
              "0.0 (default) disables incremental reward entirely.",
     )
+    parser.add_argument(
+        "--train-batch-size",
+        "--train_batch_size",
+        type=int,
+        default=None,
+        help="Override VERL data.train_batch_size (problems per step). Default: 24 from config.",
+    )
+    parser.add_argument(
+        "--total-epochs",
+        "--total_epochs",
+        type=int,
+        default=None,
+        help="Override VERL trainer.total_epochs. Default: 3 from config.",
+    )
+    parser.add_argument(
+        "--test-freq",
+        "--test_freq",
+        type=int,
+        default=None,
+        help="Override VERL trainer.test_freq (validate every N steps). Default: 50 from config.",
+    )
+    parser.add_argument(
+        "--save-freq",
+        "--save_freq",
+        type=int,
+        default=None,
+        help="Override VERL trainer.save_freq (checkpoint every N steps). Default: 50 from config.",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.0,
+        help="MIST β: ICR amplification weight in R_EIR × (1 + β·R_ICR). "
+             "Requires --baseline-cache-path. 0.0 = pure EIR (no ICR scaling).",
+    )
+    parser.add_argument(
+        "--eir-k",
+        "--eir_k",
+        type=float,
+        default=10.0,
+        help="MIST k: log-smoothing scale for EIR = sign(g) · ln(1 + k·|g|). Default: 10.0.",
+    )
 
     args = parser.parse_args()
 
@@ -1658,6 +1716,12 @@ def main() -> None:
         incremental_weight=args.incremental_weight,
         train_sampling_mode=args.train_sampling_mode,
         train_new_problems_per_sample=args.train_new_problems_per_sample,
+        beta=args.beta,
+        eir_k=args.eir_k,
+        train_batch_size=args.train_batch_size,
+        total_epochs=args.total_epochs,
+        test_freq=args.test_freq,
+        save_freq=args.save_freq,
     )
 
 

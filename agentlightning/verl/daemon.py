@@ -1027,10 +1027,12 @@ class AgentModeDaemon:
                 }
                 for t in rollout.triplets
             ]
+            rd_meta = (rollout.metadata or {}).get("reward_dimensions") or {}
             info = {
                 "reward": final_reward,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
+                "format_ok": int(rd_meta.get("format_ok", 1)),
             }
             finished_id_to_sample_info[rollout_id] = info
             finished_id_to_final_reward[rollout_id] = final_reward
@@ -1064,9 +1066,12 @@ class AgentModeDaemon:
                     reward_list.append(sample_info["reward"])
                     prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
 
-                    # Mark samples with prompts exceeding max_prompt_length to be dropped later
+                    # Mark samples to be dropped later: prompt too long OR format invalid (MIST)
+                    format_ok = sample_info.get("format_ok", 1)
                     if len(prompt_ids) > max_prompt_length:
                         prompt_ids = prompt_ids[:max_prompt_length]
+                        is_drop_list.append(True)
+                    elif int(format_ok) == 0:
                         is_drop_list.append(True)
                     else:
                         is_drop_list.append(False)
@@ -1173,9 +1178,12 @@ class AgentModeDaemon:
 
                     reward_list.append(sample_info["reward"])
 
-                    # Mark samples with prompts exceeding max_prompt_length to be dropped later
+                    # Mark samples to be dropped later: prompt too long OR format invalid (MIST)
+                    _fmt_ok = sample_info.get("format_ok", 1)
                     if len(prompt_ids) > max_prompt_length:
                         prompt_ids = prompt_ids[:max_prompt_length]
+                        is_drop_list.append(True)
+                    elif int(_fmt_ok) == 0:
                         is_drop_list.append(True)
                     else:
                         is_drop_list.append(False)
