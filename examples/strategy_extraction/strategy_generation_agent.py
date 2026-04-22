@@ -105,6 +105,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         proxy_weight: float = 0.5,
         reward_mode: str = "hybrid_grounded",
         grounded_proxy_k: int = 4,
+        eval_problems_per_subtask: int = 0,
         numeric_tolerance: float = 0.02,
         f1_threshold: float = 0.5,
         # Strategy scorer (trained LLM that evaluates strategy quality)
@@ -152,6 +153,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         if self.reward_mode not in {"scorer_only", "hybrid_grounded"}:
             raise ValueError(f"Unsupported reward_mode: {self.reward_mode}")
         self.grounded_proxy_k = max(1, grounded_proxy_k)
+        self.eval_problems_per_subtask = max(0, eval_problems_per_subtask)
         self.numeric_tolerance = numeric_tolerance
         self.f1_threshold = f1_threshold
 
@@ -219,7 +221,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             f"StrategyGenerationAgent initialized "
             f"(format_w={format_weight}, scorer_w={scorer_weight}, "
             f"correctness_w={correctness_weight}, proxy_w={proxy_weight}, "
-            f"reward_mode={reward_mode}, grounded_proxy_k={self.grounded_proxy_k}, "
+            f"reward_mode={reward_mode}, grounded_proxy_k={self.grounded_proxy_k}, eval_problems_per_subtask={self.eval_problems_per_subtask}, "
             f"scorer_url={'SET' if strategy_scorer_base_url else 'NONE'}, "
             f"answer_url={'SET' if answer_model_base_url else 'training-model'}, "
             f"use_strategy_for_answer={self.use_strategy_for_answer}, "
@@ -918,12 +920,74 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                 else llm.sampling_parameters.get("temperature", 0.7)
                             )
                         )
+                        # Multi-problem hard pass@k: evaluate strategy on sibling eval problems
+                        # from the same subtask (populated at dataset creation time).
+                        _eval_probs = task.get("eval_problems", [])
+                        use_multi_problem = (
+                            not is_validation
+                            and self.eval_problems_per_subtask > 0
+                            and len(_eval_probs) > 0
+                        )
+
                         should_use_k_answers = (
-                            self.reward_mode == "scorer_only"
+                            not use_multi_problem
+                            and self.reward_mode == "scorer_only"
                             and self.correctness_weight > 0
                             and self.grounded_proxy_k > 1
                         )
-                        if should_use_k_answers:
+
+                        if use_multi_problem:
+                            # For each eval problem: attempt grounded_proxy_k answers and mark
+                            # pass=1 as soon as any answer is hard-correct (early exit).
+                            # correctness = mean pass rate over eval problems.
+                            passes: list[float] = []
+                            for _ep in _eval_probs[:self.eval_problems_per_subtask]:
+                                _ep_problem = _ep.get("problem", "")
+                                _ep_gt = _ep.get("ground_truth", "")
+                                if not _ep_problem or not _ep_gt:
+                                    continue
+                                _any_correct = 0
+                                for _ in range(self.grounded_proxy_k):
+                                    _ep_raw, _ep_via = await self._generate_answer_untraced(
+                                        base_url=ans_base_url,
+                                        api_key=ans_api_key,
+                                        model=ans_model,
+                                        strategy=answer_strategy,
+                                        problem=_ep_problem,
+                                        temperature=answer_temperature,
+                                        max_tokens=self._answer_max_tokens_for_llm(llm),
+                                        seed=llm_request_seed,
+                                        rollout_fallback_base_url=base_url,
+                                        rollout_fallback_model=llm.model,
+                                    )
+                                    if _ep_via == "rollout_fallback":
+                                        answer_used_rollout_fallback = True
+                                    _ep_ext = self.reward_config.extract_answer(_ep_raw) or ""
+                                    if _ep_ext:
+                                        _ep_hard_detail = compute_answer_judgement(
+                                            answer=_ep_ext,
+                                            ground_truth=_ep_gt,
+                                            numeric_tolerance=self.numeric_tolerance,
+                                            f1_threshold=self.f1_threshold,
+                                            task_meta=task.get("task_meta", {}),
+                                        )
+                                        if _ep_hard_detail.get("hard_correct", 0):
+                                            _any_correct = 1
+                                            break
+                                passes.append(float(_any_correct))
+                            correctness = sum(passes) / len(passes) if passes else 0.0
+                            hard_correct = int(correctness >= 1.0 - 1e-9)
+                            hard_correct_mean = correctness
+                            hard_correct_list = [int(p) for p in passes]
+                            soft_correctness_mean = correctness
+                            router_scores = [correctness]
+                            answer_call_succeeded = True
+                            logger.info(
+                                f"[Rollout {attempted_rollout.rollout_id}] "
+                                f"MultiProblem pass@{self.grounded_proxy_k}: "
+                                f"{passes} → correctness={correctness:.3f}"
+                            )
+                        elif should_use_k_answers:
                             for _ in range(self.grounded_proxy_k):
                                 answer_raw, _via = await self._generate_answer_untraced(
                                     base_url=ans_base_url,

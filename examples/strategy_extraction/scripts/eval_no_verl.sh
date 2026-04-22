@@ -3,7 +3,52 @@
 # This reuses the same data path and model defaults as the training scripts,
 # but runs rollouts concurrently via eval_no_verl.py.
 #
-# 前置步骤：分别在两个终端启动两个 vLLM 服务
+# ============================================================
+#  重要 setting 速查（实际生效值，含显式参数 + 隐式 default）
+# ============================================================
+#
+#  [few-shot]
+#    --fewshot-min 3  --fewshot-max 5   ← 脚本未显式指定，使用 eval_no_verl.py 默认值
+#    每道题随机抽取 3~5 个 few-shot 示例（由 val-sampling-seed=42 固定）
+#    ⚠ 训练脚本 train_format_answer_v3.sh 固定为 3-3；如需对齐，请添加
+#      --fewshot-min 3 --fewshot-max 3
+#
+#  [temperature & 采样多样性]
+#    默认: --temperature 0.0
+#    实际: NUM_SAMPLES_PER_PROBLEM=3 > 1 且 temperature==0 → 自动切换为 temperature=0.7
+#          (eval_no_verl.py 内部逻辑，确保多次采样输出互不相同)
+#    显式覆盖: --temperature 0.7（或其他值）可绕过自动切换
+#    单次确定性推理: --num-samples-per-problem 1 --temperature 0
+#
+#  [pass@k & seeds]
+#    NUM_SAMPLES_PER_PROBLEM=3：每道题独立推理 3 次
+#    种子: base_seed=42 → 3 次 rollout 依次使用 seed=42, 43, 44
+#    输出指标: pass@1 / pass@2 / pass@3（hard 0/1 和 soft F1 各一份）
+#
+#  [模型]
+#    策略模型: Qwen3-4B  端口 8100  no-think  repetition_penalty=1.1
+#              prompt_version=repetition_controls_2026-04-01
+#    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=v1
+#              grounded-proxy-k=1（每道题仅调用 answer model 1 次）
+#    ⚠ 脚本中 --answer-model-name 默认值为 Qwen3-4B，但 vLLM 注释启动的是 Qwen3-8B；
+#       须确保 ANSWER_MODEL_NAME=Qwen3-8B（或由环境变量覆盖），否则调用名称不匹配
+#
+#  [数据集]
+#    val-subdirs: test-id-subtask + test-ood-task + test-bbh
+#    采样模式 (FULL_DATASET=0): per_subtask_fixed，每 subtask 20 条，val-sampling-seed=42
+#    采样模式 (FULL_DATASET=1): 全量枚举，~123k 题
+#
+#  [reward / 评测逻辑]
+#    reward-mode=scorer_only，correctness-weight=1.0，format-weight=0.0，scorer-weight=0.0
+#    → 纯答案正确率评测，不含 format tag / strategy scorer 评分
+#    reward-version=v3，answer-request-retries=3
+#
+#  [并发]
+#    EVAL_CONCURRENCY=64（64 个异步 worker 并发推理）
+#
+# ============================================================
+#  前置步骤：分别在两个终端启动两个 vLLM 服务
+# ============================================================
 #
 #   终端 1 — 策略生成模型（Qwen3-4B，端口 8100）：
 #     CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \
@@ -30,13 +75,6 @@
 # 运行示例：
 #   bash examples/strategy_extraction/scripts/eval_no_verl.sh
 #   bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
-#
-# pass@k 说明：
-#   默认 NUM_SAMPLES_PER_PROBLEM=3，每道题独立推理 3 次（种子依次为 42/43/44），
-#   评测结束后输出 pass@1 / pass@2 / pass@3（hard 和 soft 两种指标）。
-#   当 num-samples-per-problem > 1 且 --temperature 未指定时，脚本内部自动切换为
-#   temperature=0.7 以保证多次采样的多样性；可通过 --temperature 显式覆盖。
-#   若只需单次确定性推理，可传 --num-samples-per-problem 1 --temperature 0。
 #
 # 可通过环境变量覆盖默认值，例如：
 #   STRATEGY_MODEL_BASE_URL=http://localhost:8100/v1 \
@@ -79,12 +117,14 @@ fi
 python -m examples.strategy_extraction.eval_no_verl \
   --data-base-path /home/test/test16/chenlu/projects/LLMReflection/data/ \
   --val-subdirs test-id-subtask test-ood-task test-bbh \
+  --fewshot-min 3 \
+  --fewshot-max 3 \
   --model-path /home/test/test16/chenlu/model/Qwen3-4B \
   --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}" \
   --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}" \
-  --answer-model-path /home/test/test16/chenlu/model/Qwen3-4B \
+  --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B \
   --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}" \
-  --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-4B}" \
+  --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}" \
   --concurrency "${EVAL_CONCURRENCY:-64}" \
   --llm-seed 42 \
   --num-samples-per-problem "${NUM_SAMPLES_PER_PROBLEM:-3}" \

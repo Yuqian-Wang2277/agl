@@ -60,8 +60,8 @@ STRATEGY_SCORER_MODEL_NAME="${STRATEGY_SCORER_MODEL_NAME:-strategy_scorer}"
 STRATEGY_SCORER_BASE_URL="${STRATEGY_SCORER_BASE_URL:-http://localhost:8100/v1}"
 STRATEGY_SCORING_PROMPT_VERSION="${STRATEGY_SCORING_PROMPT_VERSION:-four_dim}"
 FORMAT_WEIGHT="${FORMAT_WEIGHT:-0.0}"
-SCORER_WEIGHT="${SCORER_WEIGHT:-1.0}"
-CORRECTNESS_WEIGHT="${CORRECTNESS_WEIGHT:-0.0}"
+SCORER_WEIGHT="${SCORER_WEIGHT:-0.5}"
+CORRECTNESS_WEIGHT="${CORRECTNESS_WEIGHT:-0.5}"
 GROUNDED_PROXY_K="${GROUNDED_PROXY_K:-1}"
 OC_FOUR_DIM_WEIGHTS="${OC_FOUR_DIM_WEIGHTS:-0.3,0.3,0.3,0.1}"
 STRATEGY_SCORER_TIMEOUT_SEC="${STRATEGY_SCORER_TIMEOUT_SEC:-180}"
@@ -98,8 +98,9 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --val-sampling-seed 42 \
     --model-path "${STRATEGY_MODEL_PATH}" \
     --fewshot-min 3 \
-    --fewshot-max 5 \
-    --num-train-samples 20000 \
+    --fewshot-max 3 \
+    --train-sampling-mode per_subtask_exhaustive \
+    --train-new-problems-per-sample 1 \
     --num-val-samples 500 \
     --n-runners 10 \
     --n-gpus 6 \
@@ -109,6 +110,7 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --scorer-weight "${SCORER_WEIGHT}" \
     --correctness-weight "${CORRECTNESS_WEIGHT}" \
     --grounded-proxy-k "${GROUNDED_PROXY_K}" \
+    --eval-problems-per-subtask 4 \
     --strategy-scorer-model-path "${STRATEGY_SCORER_MODEL_PATH}" \
     --strategy-scorer-model-name "${STRATEGY_SCORER_MODEL_NAME}" \
     --strategy-scorer-base-url "${STRATEGY_SCORER_BASE_URL}" \

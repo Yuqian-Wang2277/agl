@@ -83,16 +83,19 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --val-sampling-seed 42 \
     --model-path "${STRATEGY_MODEL_PATH}" \
     --fewshot-min 3 \
-    --fewshot-max 5 \
-    --num-train-samples 20000 \
+    --fewshot-max 3 \
+    --train-sampling-mode per_subtask_exhaustive \
+    --train-new-problems-per-sample 4 \
     --num-val-samples 500 \
     --n-runners 10 \
     --n-gpus 6 \
     --reward-version v3 \
     --reward-mode scorer_only \
-    --format-weight 1.0 \
-    --correctness-weight 0.0 \
-    --grounded-proxy-k 1 \
+    --format-weight 0.0 \
+    --correctness-weight 1.0 \
+    --grounded-proxy-k 3 \
+    --eval-problems-per-subtask 4 \
+    --use-hard-correctness-metric \
     --answer-model-path "${ANSWER_MODEL_PATH}" \
     --answer-model-base-url "${ANSWER_MODEL_BASE_URL}" \
     --answer-model-name "${ANSWER_MODEL_NAME}" \

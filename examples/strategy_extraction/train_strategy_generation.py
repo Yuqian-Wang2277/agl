@@ -69,6 +69,7 @@ def _create_strategy_generation_dataset(
     fewshot_max: int,
     num_samples: int,
     seed: int = 42,
+    eval_problems_per_subtask: int = 0,
 ) -> list[dict[str, object]]:
     """Create a dataset that contains few-shot examples, a problem, and its ground truth.
 
@@ -160,6 +161,25 @@ def _create_strategy_generation_dataset(
                     break
                 continue
 
+            # Sample sibling eval problems from the same subtask (exclude fewshot + main problem).
+            eval_problems: list[dict[str, object]] = []
+            if eval_problems_per_subtask > 0:
+                eval_pool = [ex for ex in remaining if ex is not problem_ex]
+                n_eval = min(eval_problems_per_subtask, len(eval_pool))
+                if n_eval > 0:
+                    for ep in random.sample(eval_pool, n_eval):
+                        ep_input = ep.get("input", "")
+                        ep_target = ep.get("target", [])
+                        ep_gt = (
+                            str(ep_target[0])
+                            if isinstance(ep_target, list) and ep_target
+                            else str(ep_target)
+                        )
+                        if ep_input and str(ep_input).strip() and ep_gt and ep_gt.strip():
+                            eval_problems.append(
+                                {"problem": ep_input, "ground_truth": ep_gt, "ground_truths": [ep_gt]}
+                            )
+
             dataset.append({
                 "problem_type": problem_type,
                 "examples": valid_fewshot,
@@ -167,6 +187,7 @@ def _create_strategy_generation_dataset(
                 "problem": problem_text,
                 "ground_truth": ground_truth,
                 "ground_truths": [ground_truth],
+                "eval_problems": eval_problems,
                 "task_meta": {
                     "problem_type": problem_type,
                     "expected_answer_format": "",
@@ -318,6 +339,150 @@ def _create_strategy_generation_dataset_per_subtask(
         len(dataset),
         subtask_counter,
         "all" if samples_per_subtask == 0 else str(samples_per_subtask),
+    )
+    return dataset
+
+
+def _create_strategy_generation_dataset_per_subtask_train(
+    data_dir: str,
+    fewshot_n: int,
+    new_problems_per_sample: int,
+    seed: int = 42,
+) -> list[dict[str, object]]:
+    """Create training dataset by exhaustively iterating each subtask file.
+
+    Sampling rules:
+    - Each ``<problem_type>/<subtask>.json`` file is treated as an independent task unit.
+    - The examples pool for a subtask is shuffled once (controlled by ``seed``), then divided
+      into consecutive non-overlapping batches of ``fewshot_n`` examples.  Each batch becomes
+      the few-shot context of one training sample.  Tail examples that do not fill a full batch
+      are discarded, so a subtask with N examples contributes floor(N / fewshot_n) samples.
+    - For each few-shot batch, ``new_problems_per_sample`` (k) new problems are sampled
+      *without replacement within the sample* from the remaining examples (pool minus current
+      few-shot batch).  Different samples may share new-problem examples (放回 across samples).
+    - A subtask is skipped entirely when N - fewshot_n < new_problems_per_sample (not enough
+      remaining examples to fill k new problems for any batch).
+    - Total dataset size is determined by the data:
+        sum over qualifying subtasks of floor(N_i / fewshot_n)
+    """
+    import random
+
+    rng = random.Random(seed)
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Training directory not found: {data_dir}")
+
+    dataset: list[dict[str, object]] = []
+    skipped_subtasks: int = 0
+    included_subtasks: int = 0
+
+    for problem_type_dir in sorted([p for p in data_path.iterdir() if p.is_dir()], key=lambda p: p.name):
+        problem_type = problem_type_dir.name
+        for subtask_file in sorted(problem_type_dir.glob("*.json"), key=lambda p: p.name):
+            # --- Load and filter examples ---
+            try:
+                raw = json.loads(subtask_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning("Skip invalid json file %s: %s", subtask_file, e)
+                continue
+
+            examples_raw = raw.get("examples", [])
+            if not isinstance(examples_raw, list):
+                logger.warning("Skip malformed examples field: %s", subtask_file)
+                continue
+
+            examples_pool: list[dict[str, object]] = []
+            for ex in examples_raw:
+                if not isinstance(ex, dict):
+                    continue
+                ex_input = ex.get("input", "")
+                ex_target = ex.get("target", [])
+                if not ex_input or not str(ex_input).strip():
+                    continue
+                if isinstance(ex_target, list):
+                    if not ex_target or not str(ex_target[0]).strip():
+                        continue
+                elif not str(ex_target).strip():
+                    continue
+                examples_pool.append(ex)
+
+            N = len(examples_pool)
+
+            # --- Eligibility check ---
+            # Need at least fewshot_n examples for few-shot AND new_problems_per_sample remaining.
+            if N - fewshot_n < new_problems_per_sample:
+                logger.debug(
+                    "Skip subtask %s: N=%d, need fewshot_n=%d + k=%d=%d",
+                    subtask_file, N, fewshot_n, new_problems_per_sample, fewshot_n + new_problems_per_sample,
+                )
+                skipped_subtasks += 1
+                continue
+
+            subtask_name = subtask_file.stem
+            subtask_id = f"{problem_type}/{subtask_name}"
+            file_expected_fmt = ""
+            if isinstance(raw.get("expected_answer_format"), str):
+                file_expected_fmt = raw["expected_answer_format"].strip()
+
+            # --- Shuffle pool once, then slice into non-overlapping few-shot batches ---
+            pool_shuffled = list(examples_pool)
+            rng.shuffle(pool_shuffled)
+
+            n_batches = N // fewshot_n  # tail examples discarded
+            for batch_idx in range(n_batches):
+                fewshot_batch = pool_shuffled[batch_idx * fewshot_n : (batch_idx + 1) * fewshot_n]
+                fewshot_ids = {id(e) for e in fewshot_batch}
+                remaining = [e for e in pool_shuffled if id(e) not in fewshot_ids]
+                # remaining size = N - fewshot_n >= new_problems_per_sample (guaranteed above)
+
+                new_problem_exs = rng.sample(remaining, new_problems_per_sample)
+
+                # Build eval_problems list (same schema as eval_problems_per_subtask)
+                eval_problems: list[dict[str, object]] = []
+                for ep in new_problem_exs:
+                    ep_input = str(ep.get("input", "") or "")
+                    ep_target = ep.get("target", [])
+                    ep_gt = (
+                        str(ep_target[0]) if isinstance(ep_target, list) and ep_target else str(ep_target)
+                    )
+                    if ep_input.strip() and ep_gt.strip():
+                        eval_problems.append(
+                            {"problem": ep_input, "ground_truth": ep_gt, "ground_truths": [ep_gt]}
+                        )
+
+                # Use the first new problem as the primary problem field (backward-compatible)
+                if not eval_problems:
+                    continue
+                primary = eval_problems[0]
+
+                dataset.append(
+                    {
+                        "problem_type": problem_type,
+                        "examples": fewshot_batch,
+                        "num_shots": len(fewshot_batch),
+                        "problem": primary["problem"],
+                        "ground_truth": primary["ground_truth"],
+                        "ground_truths": primary["ground_truths"],
+                        "eval_problems": eval_problems,
+                        "task_meta": {
+                            "problem_type": problem_type,
+                            "subtask": subtask_name,
+                            "subtask_id": subtask_id,
+                            "expected_answer_format": file_expected_fmt,
+                        },
+                        "source_problem_type": subtask_id,
+                    }
+                )
+            included_subtasks += 1
+
+    logger.info(
+        "Per-subtask-exhaustive training dataset: %d samples from %d subtasks "
+        "(%d subtasks skipped, fewshot_n=%d, k=%d)",
+        len(dataset),
+        included_subtasks,
+        skipped_subtasks,
+        fewshot_n,
+        new_problems_per_sample,
     )
     return dataset
 
@@ -605,6 +770,7 @@ def train(
     grounded_proxy_weight: float,
     reward_mode: str,
     grounded_proxy_k: int,
+    eval_problems_per_subtask: int,
     correctness_weight: float,
     numeric_tolerance: float,
     f1_threshold: float,
@@ -640,6 +806,8 @@ def train(
     ppo_micro_batch_size_per_gpu: int | None = None,
     baseline_cache_path: str = "",
     incremental_weight: float = 0.0,
+    train_sampling_mode: str = "problem_type_balanced",
+    train_new_problems_per_sample: int = 1,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -806,10 +974,22 @@ def train(
         if train_dataset_json:
             print(f"[{datetime.now().isoformat()}] Loading pre-built training dataset: {train_dataset_json}")
             train_dataset = _load_strategy_dataset_from_file(train_dataset_json)
+        elif train_sampling_mode == "per_subtask_exhaustive":
+            print(
+                f"[{datetime.now().isoformat()}] Loading training dataset (per_subtask_exhaustive) from: {train_dir}"
+                f" [fewshot_n={fewshot_min}, k={train_new_problems_per_sample}]"
+            )
+            train_dataset = _create_strategy_generation_dataset_per_subtask_train(
+                train_dir,
+                fewshot_n=fewshot_min,
+                new_problems_per_sample=train_new_problems_per_sample,
+                seed=42,
+            )
         else:
             print(f"[{datetime.now().isoformat()}] Loading training dataset from: {train_dir}")
             train_dataset = _create_strategy_generation_dataset(
                 train_dir, fewshot_min, fewshot_max, num_train_samples, seed=42,
+                eval_problems_per_subtask=eval_problems_per_subtask,
             )
         print(f"[{datetime.now().isoformat()}] Training dataset: {len(train_dataset)} samples")
 
@@ -944,6 +1124,7 @@ def train(
         proxy_weight=grounded_proxy_weight,
         reward_mode=reward_mode,
         grounded_proxy_k=grounded_proxy_k,
+        eval_problems_per_subtask=eval_problems_per_subtask,
         correctness_weight=correctness_weight,
         numeric_tolerance=numeric_tolerance,
         f1_threshold=f1_threshold,
@@ -1100,6 +1281,29 @@ def main() -> None:
     parser.add_argument("--num-train-samples", type=int, default=StrategyConfig.num_train_samples)
     parser.add_argument("--num-val-samples", type=int, default=StrategyConfig.num_val_samples)
     parser.add_argument(
+        "--train-sampling-mode",
+        type=str,
+        choices=["problem_type_balanced", "per_subtask_exhaustive"],
+        default="problem_type_balanced",
+        help=(
+            "Training sampling mode. "
+            "'problem_type_balanced': legacy balanced random sampling across problem types (uses --num-train-samples). "
+            "'per_subtask_exhaustive': treat each subtask JSON as an independent task unit; "
+            "exhaust all examples as few-shot batches; total size = sum of floor(N_i/fewshot_n) "
+            "across qualifying subtasks (--num-train-samples is ignored)."
+        ),
+    )
+    parser.add_argument(
+        "--train-new-problems-per-sample",
+        type=int,
+        default=1,
+        help=(
+            "k: number of new problems attached to each few-shot batch in per_subtask_exhaustive mode. "
+            "Each sample gets fewshot_n few-shot examples + k new problems drawn from the remaining pool "
+            "of the same subtask. Subtasks where (N - fewshot_n) < k are skipped entirely. Default: 1."
+        ),
+    )
+    parser.add_argument(
         "--val-sampling-mode",
         type=str,
         choices=["problem_type_balanced", "per_subtask_fixed"],
@@ -1194,6 +1398,16 @@ def main() -> None:
         type=int,
         default=4,
         help="K samples used to compute grounded proxy",
+    )
+    parser.add_argument(
+        "--eval-problems-per-subtask",
+        type=int,
+        default=0,
+        help=(
+            "Number of sibling problems (same subtask) to evaluate each strategy on during training. "
+            "When > 0, each strategy is tested on this many additional problems from the same subtask; "
+            "correctness reward = mean hard pass@(grounded-proxy-k) across those problems. 0 = disabled."
+        ),
     )
     parser.add_argument("--correctness-weight", type=float, default=0.0, help="Weight for answer correctness reward (0 = disabled)")
     parser.add_argument("--numeric-tolerance", type=float, default=0.02, help="Numeric tolerance for answer matching")
@@ -1411,6 +1625,7 @@ def main() -> None:
         grounded_proxy_weight=args.grounded_proxy_weight,
         reward_mode=args.reward_mode,
         grounded_proxy_k=args.grounded_proxy_k,
+        eval_problems_per_subtask=args.eval_problems_per_subtask,
         correctness_weight=args.correctness_weight,
         numeric_tolerance=args.numeric_tolerance,
         f1_threshold=args.f1_threshold,
@@ -1441,6 +1656,8 @@ def main() -> None:
         val_only=args.val_only,
         baseline_cache_path=args.baseline_cache_path,
         incremental_weight=args.incremental_weight,
+        train_sampling_mode=args.train_sampling_mode,
+        train_new_problems_per_sample=args.train_new_problems_per_sample,
     )
 
 

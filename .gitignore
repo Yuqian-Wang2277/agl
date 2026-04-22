@@ -232,3 +232,4 @@ examples/actor-judge/judge_warmup_ckpt/
 examples/actor-judge/wandb/
 examples/actor-judge/checkpoints_actor_judge/
 checkpoints_baseline_train/
+data/
