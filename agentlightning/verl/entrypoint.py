@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Type
 
 import hydra
@@ -67,9 +68,19 @@ def run_ppo(
         except AttributeError:
             # verl < 0.6.0
             num_cpus = config.ray_init.num_cpus
+        # Forward WANDB env vars into Ray workers so wandb.init() inside the
+        # TaskRunner actor can see them (Ray actor processes do not always inherit
+        # the parent shell's environment when runtime_env.env_vars is specified).
+        _wandb_env_keys = ("WANDB_RUN_ID", "WANDB_RESUME", "WANDB_API_KEY", "WANDB_DIR", "WANDB_PROJECT")
+        _forwarded = {k: os.environ[k] for k in _wandb_env_keys if k in os.environ}
         ray.init(
             runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "VLLM_LOGGING_LEVEL": "WARN",
+                    **_forwarded,
+                }
             },
             num_cpus=num_cpus,
         )
