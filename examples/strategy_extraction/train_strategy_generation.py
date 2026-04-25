@@ -348,6 +348,7 @@ def _create_strategy_generation_dataset_per_subtask_train(
     fewshot_n: int,
     new_problems_per_sample: int,
     seed: int = 42,
+    baseline_cache: dict[str, float] | None = None,
 ) -> list[dict[str, object]]:
     """Create training dataset by exhaustively iterating each subtask file.
 
@@ -364,6 +365,8 @@ def _create_strategy_generation_dataset_per_subtask_train(
       remaining examples to fill k new problems for any batch).
     - Total dataset size is determined by the data:
         sum over qualifying subtasks of floor(N_i / fewshot_n)
+    - If ``baseline_cache`` is provided, the examples pool is filtered to only include problems
+      present in the cache before batching, eliminating cache-miss rollouts during MIST training.
     """
     import random
 
@@ -405,6 +408,26 @@ def _create_strategy_generation_dataset_per_subtask_train(
                 elif not str(ex_target).strip():
                     continue
                 examples_pool.append(ex)
+
+            # --- Baseline cache filter (optional) ---
+            # When baseline_cache is provided, retain only examples whose problem text has
+            # a cache entry.  This guarantees zero cache-miss rollouts during MIST training.
+            if baseline_cache:
+                import hashlib as _hashlib
+
+                def _pk(text: str) -> str:
+                    return _hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+
+                pre_filter = len(examples_pool)
+                examples_pool = [
+                    ex for ex in examples_pool
+                    if _pk(str(ex.get("input", "") or "")) in baseline_cache
+                ]
+                if len(examples_pool) < pre_filter:
+                    logger.debug(
+                        "Subtask %s: baseline_cache filter %d → %d examples",
+                        subtask_file, pre_filter, len(examples_pool),
+                    )
 
             N = len(examples_pool)
 
@@ -814,6 +837,7 @@ def train(
     total_epochs: Optional[int] = None,
     test_freq: Optional[int] = None,
     save_freq: Optional[int] = None,
+    filter_to_baseline_cache: bool = False,
 ) -> None:
     """Train strategy generation model."""
     original_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -970,6 +994,23 @@ def train(
         except Exception as e:
             logger.warning(f"Failed to save config: {e}")
 
+    # Incremental reward / MIST baseline cache — must load before building train_dataset
+    # when filter_to_baseline_cache needs the keys for per_subtask_exhaustive filtering.
+    _baseline_cache: dict[str, float] = {}
+    if baseline_cache_path and os.path.exists(baseline_cache_path):
+        import json as _json
+        with open(baseline_cache_path, encoding="utf-8") as _f:
+            _baseline_cache = _json.load(_f)
+        logger.info(
+            f"Loaded baseline cache: {len(_baseline_cache)} entries from {baseline_cache_path}, "
+            f"incremental_weight={incremental_weight}"
+        )
+    elif incremental_weight > 0.0:
+        logger.warning(
+            f"incremental_weight={incremental_weight} but baseline_cache_path is empty or not found "
+            f"({baseline_cache_path!r}). R_delta will be 0 for all samples."
+        )
+
     # ---- Load datasets ---- #
     train_dataset: list[dict[str, object]]
     if val_only:
@@ -990,6 +1031,7 @@ def train(
                 fewshot_n=fewshot_min,
                 new_problems_per_sample=train_new_problems_per_sample,
                 seed=42,
+                baseline_cache=_baseline_cache if filter_to_baseline_cache else None,
             )
         else:
             print(f"[{datetime.now().isoformat()}] Loading training dataset from: {train_dir}")
@@ -1110,22 +1152,6 @@ def train(
     rollout_traces_dir = os.path.join(checkpoint_dir, "rollout_traces")
     validation_output_dir = os.path.join(checkpoint_dir, "validation_outputs")
     test_freq = config.get("trainer", {}).get("test_freq", 50)
-
-    # Incremental reward baseline cache
-    _baseline_cache: dict[str, float] = {}
-    if baseline_cache_path and os.path.exists(baseline_cache_path):
-        import json as _json
-        with open(baseline_cache_path, encoding="utf-8") as _f:
-            _baseline_cache = _json.load(_f)
-        logger.info(
-            f"Loaded baseline cache: {len(_baseline_cache)} entries from {baseline_cache_path}, "
-            f"incremental_weight={incremental_weight}"
-        )
-    elif incremental_weight > 0.0:
-        logger.warning(
-            f"incremental_weight={incremental_weight} but baseline_cache_path is empty or not found "
-            f"({baseline_cache_path!r}). R_delta will be 0 for all samples."
-        )
 
     agent = StrategyGenerationAgent(
         save_full_output=save_full_output,
@@ -1573,6 +1599,17 @@ def main() -> None:
              "Maps md5(problem)[:16] → avg_answer_soft of the SFT-strategy baseline.",
     )
     parser.add_argument(
+        "--filter-to-baseline-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, filter each subtask's example pool to only problems present in "
+            "baseline_cache before exhaustive batching. Eliminates all cache-miss rollouts "
+            "and aligns the training set with cache coverage. Only effective when "
+            "--train-sampling-mode=per_subtask_exhaustive and --baseline-cache-path is set."
+        ),
+    )
+    parser.add_argument(
         "--incremental-weight",
         type=float,
         default=0.0,
@@ -1722,6 +1759,7 @@ def main() -> None:
         total_epochs=args.total_epochs,
         test_freq=args.test_freq,
         save_freq=args.save_freq,
+        filter_to_baseline_cache=args.filter_to_baseline_cache,
     )
 
 

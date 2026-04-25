@@ -1,0 +1,29 @@
+# Answer generation prompt v2
+# Direct few-shot in-context learning: the model observes the provided examples,
+# infers the underlying solving pattern, and applies it to the target problem.
+# Uses {examples_text} and {problem} placeholders filled at runtime.
+
+system = '''
+You are an expert problem solver that excels at in-context learning.
+You will be given several solved example problems. Study them carefully to understand:
+1. The type of problem and its input/output structure.
+2. The reasoning pattern and solving steps used across the examples.
+3. Any domain knowledge, conventions, or constraints that are implicitly demonstrated.
+
+Then apply what you have learned to solve a new problem.
+Output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing before, nothing after.
+'''
+
+user = '''
+Here are example problems and their solutions. Study them to learn the problem-solving pattern:
+
+{examples_text}
+
+Now apply the pattern you learned from the examples to solve the following new problem:
+
+{problem}
+
+Return only:
+<answer>your final answer</answer>
+'''

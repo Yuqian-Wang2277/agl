@@ -1,0 +1,36 @@
+system = '''
+You are an expert at solving International Linguistics Olympiad (ILO) puzzles.
+In these puzzles, you are given a set of linguistic examples (words, sentences, or numbers)
+in an unfamiliar language together with their translations or values. Your task is to
+analyse the pattern and apply it to new cases.
+
+You will be given several fully solved example problems. Study them carefully to understand:
+1. The language structure: morphological patterns, word-order rules, or numeral systems.
+2. The exact correspondence between forms in the target language and their English equivalents.
+3. Any constraints on the output (letter labels, digit strings, number words, etc.).
+
+Then apply what you have learned to solve a new problem of the same type.
+
+Important output rules:
+- Output your answers as a numbered list inside <answer>...</answer> tags.
+- Each numbered item must correspond exactly to the numbered blank or item in the task.
+- Do not include any explanation outside the <answer> block.
+- Format: <answer>\n1. ...\n2. ...\n</answer>
+'''
+
+user = '''
+Here are fully solved example problems. Study them to learn the linguistic pattern:
+
+{examples_text}
+
+Now apply the pattern you learned to solve the following new problem:
+
+{problem}
+
+Return only:
+<answer>
+1. [answer to item 1]
+2. [answer to item 2]
+...
+</answer>
+'''

@@ -1,8 +1,15 @@
 #!/bin/bash
 # 训练集基线分计算脚本（一次性离线运行）
 #
-# 使用 SFT 4B 策略模型 + Qwen3-8B 答题模型，对 train_all_project_suitable 中的
-# 所有训练题目跑 3 次推理（pass@1/2/3），记录 soft/hard 分，供后续增量奖励使用。
+# 使用策略模型 + Qwen3-8B 答题模型，对 TRAIN_DATA_BASE_PATH/TRAIN_SUBDIR（默认
+# train_all_project_suitable）做分层/全量推理，记录 soft 分，供 MIST 基线 / R_delta 使用。
+#
+# 注意：内部调用 eval_no_verl，其 CLI 沿用 --val-subdirs、--val-sampling-mode 等名称；
+# 这些参数表示「要评测的数据子目录 + 子任务定 quota 的采样器」，**不一定**是验证集。
+# 本脚本显式把 TRAIN_SUBDIR 传给 --val-subdirs，即始终在「训练分片」上跑。
+#
+#（旧注释）之前示例曾写每题 3 次以观察 pass@k；NUM_SAMPLES_PER_PROBLEM 现常用 1，
+# 仅当需要统计 build_baseline_cache 里的 pass@* 打印时再设大。
 #
 # 输出：./checkpoints_baseline_train/ 下的 validation_step*.json
 # 后续运行 build_baseline_cache.py 将其转换为 baseline_cache.json。

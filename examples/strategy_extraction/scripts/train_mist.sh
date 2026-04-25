@@ -21,7 +21,11 @@
 #   TRAIN_BATCH_SIZE=8 TOTAL_EPOCHS=1 TEST_FREQ=10 SAVE_FREQ=10 \
 #   BETA=0.5 EIR_K=10.0 \
 #   BASELINE_CACHE_PATH=./baseline_cache.json \
+#   FILTER_TO_BASELINE_CACHE=1 \
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/train_mist.sh
+#
+# To disable cache filtering (enumerate all train problems, cache-miss → reward=0):
+#   FILTER_TO_BASELINE_CACHE=0 bash scripts/train_mist.sh
 #
 set -euo pipefail
 
@@ -41,9 +45,10 @@ ANSWER_MODEL_BASE_URL="${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
 ANSWER_MODEL_NAME="${ANSWER_MODEL_NAME:-Qwen3-8B}"
 
 # --- MIST reward parameters ---
-BETA="${BETA:-0.5}"                              # β: ICR amplification weight
-EIR_K="${EIR_K:-10.0}"                          # k: log-smoothing scale for EIR
-BASELINE_CACHE_PATH="${BASELINE_CACHE_PATH:-}"   # path to baseline_cache.json (required for MIST)
+BETA="${BETA:-0.5}"                                    # β: ICR amplification weight
+EIR_K="${EIR_K:-10.0}"                                # k: log-smoothing scale for EIR
+BASELINE_CACHE_PATH="${BASELINE_CACHE_PATH:-}"         # path to baseline_cache.json (required for MIST)
+FILTER_TO_BASELINE_CACHE="${FILTER_TO_BASELINE_CACHE:-1}"  # 1=filter train set to cached problems only (recommended)
 
 # --- Quick-test / training schedule overrides ---
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-24}"       # VERL train_batch_size (problems per step)
@@ -63,6 +68,7 @@ echo " Val root   : ${VAL_DATA_ROOT}"
 echo " β (beta)   : ${BETA}"
 echo " k (eir_k)  : ${EIR_K}"
 echo " Baseline   : ${BASELINE_CACHE_PATH:-<not set — MIST disabled>}"
+echo " Filter     : ${FILTER_TO_BASELINE_CACHE} (1=filter train set to cached problems)"
 echo " Schedule   : batch=${TRAIN_BATCH_SIZE}, epochs=${TOTAL_EPOCHS}, test=${TEST_FREQ}, save=${SAVE_FREQ}"
 echo " Answer     : ${ANSWER_MODEL_BASE_URL} (${ANSWER_MODEL_NAME})"
 echo "========================================="
@@ -111,4 +117,5 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --test-freq "${TEST_FREQ}" \
     --save-freq "${SAVE_FREQ}" \
     ${BASELINE_CACHE_PATH:+--baseline-cache-path "${BASELINE_CACHE_PATH}"} \
+    ${FILTER_TO_BASELINE_CACHE:+--filter-to-baseline-cache} \
     "$@"
