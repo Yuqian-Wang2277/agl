@@ -4,14 +4,23 @@
 # but runs rollouts concurrently via eval_no_verl.py.
 #
 # ============================================================
-#  重要 setting 速查（实际生效值，含显式参数 + 隐式 default）
+#  模式选择（MODE 环境变量）
 # ============================================================
 #
-#  [few-shot]
-#    --fewshot-min 3  --fewshot-max 5   ← 脚本未显式指定，使用 eval_no_verl.py 默认值
-#    每道题随机抽取 3~5 个 few-shot 示例（由 val-sampling-seed=42 固定）
-#    ⚠ 训练脚本 train_format_answer_v3.sh 固定为 3-3；如需对齐，请添加
-#      --fewshot-min 3 --fewshot-max 3
+#  MODE=few-shot（仅答案模型，ICL in-context learning）
+#    使用 prompt: answer_generation/ICL(few-shot).toml
+#    只需启动答案模型（Qwen3-8B，端口 8200），无需策略模型。
+#    --skip-strategy-generation 跳过策略生成调用。
+#    --fewshot-min 3 --fewshot-max 3 控制每道题的 few-shot 示例数。
+#
+#  MODE=MIST（默认）（策略模型 + 答案模型）
+#    使用 prompt: strategy_generation/repetition_controls_2026-04-01.toml
+#                 answer_generation/v1.toml
+#    需要同时启动策略模型（Qwen3-4B，端口 8100）和答案模型（Qwen3-8B，端口 8200）。
+#
+# ============================================================
+#  重要 setting 速查（实际生效值，含显式参数 + 隐式 default）
+# ============================================================
 #
 #  [temperature & 采样多样性]
 #    默认: --temperature 0.0
@@ -25,13 +34,14 @@
 #    种子: base_seed=42 → 3 次 rollout 依次使用 seed=42, 43, 44
 #    输出指标: pass@1 / pass@2 / pass@3（hard 0/1 和 soft F1 各一份）
 #
-#  [模型]
+#  [模型 — MIST 模式]
 #    策略模型: Qwen3-4B  端口 8100  no-think  repetition_penalty=1.1
 #              prompt_version=repetition_controls_2026-04-01
 #    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=v1
 #              grounded-proxy-k=1（每道题仅调用 answer model 1 次）
-#    ⚠ 脚本中 --answer-model-name 默认值为 Qwen3-4B，但 vLLM 注释启动的是 Qwen3-8B；
-#       须确保 ANSWER_MODEL_NAME=Qwen3-8B（或由环境变量覆盖），否则调用名称不匹配
+#
+#  [模型 — few-shot 模式]
+#    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=ICL(few-shot)
 #
 #  [数据集]
 #    val-subdirs: test-id-subtask + test-ood-task + test-bbh
@@ -47,8 +57,10 @@
 #    EVAL_CONCURRENCY=64（64 个异步 worker 并发推理）
 #
 # ============================================================
-#  前置步骤：分别在两个终端启动两个 vLLM 服务
+#  前置步骤
 # ============================================================
+#
+#  [MIST 模式] 分别在两个终端启动两个 vLLM 服务：
 #
 #   终端 1 — 策略生成模型（Qwen3-4B，端口 8100）：
 #     CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \
@@ -72,11 +84,15 @@
 #         --gpu-memory-utilization 0.90 \
 #         --max-model-len 32768
 #
-# 运行示例：
-#   bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
+#  [few-shot 模式] 只需启动答案模型（终端 2，同上）。
 #
-# 可通过环境变量覆盖默认值，例如：
+# 运行示例：
+#   MODE=MIST    bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=few-shot bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=few-shot bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
+#
+# 可通过环境变量覆盖默认值，例如（MIST 模式）：
+#   MODE=MIST \
 #   STRATEGY_MODEL_BASE_URL=http://localhost:8100/v1 \
 #   STRATEGY_MODEL_NAME=Qwen3-4B \
 #   ANSWER_MODEL_BASE_URL=http://localhost:8200/v1 \
@@ -101,6 +117,14 @@ REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 
 cd "$REPO_ROOT"
 
+# --- 模式选择 ---
+MODE="${MODE:-MIST}"
+if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" ]]; then
+    echo "[ERROR] MODE 必须为 'few-shot' 或 'MIST'（当前值: $MODE）"
+    exit 1
+fi
+echo "[INFO] 运行模式: $MODE"
+
 # --- 采样模式 ---
 FULL_DATASET="${FULL_DATASET:-0}"
 VAL_SAMPLES_PER_SUBTASK="${VAL_SAMPLES_PER_SUBTASK:-20}"
@@ -114,27 +138,45 @@ else
     echo "[INFO] 采样模式：分层采样，每 subtask ${VAL_SAMPLES_PER_SUBTASK} 条（FULL_DATASET=0）"
 fi
 
+# --- 模式专属参数 ---
+MODE_ARGS=()
+if [[ "$MODE" == "few-shot" ]]; then
+    # few-shot：只有一个答案模型，跳过策略生成，使用 ICL prompt
+    MODE_ARGS+=(
+        --skip-strategy-generation
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --answer-prompt-version "ICL(few-shot)"
+    )
+else
+    # MIST：策略模型（Qwen3-4B）+ 答案模型（Qwen3-8B）
+    MODE_ARGS+=(
+        --model-path /home/test/test16/chenlu/model/Qwen3-4B
+        --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}"
+        --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}"
+        --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --strategy-no-think
+        --strategy-prompt-version repetition_controls_2026-04-01
+        --strategy-repetition-penalty 1.1
+        --answer-prompt-version v1
+    )
+fi
+
 python -m examples.strategy_extraction.eval_no_verl \
   --data-base-path /home/test/test16/chenlu/projects/LLMReflection/data/ \
   --val-subdirs test-id-subtask test-ood-task test-bbh \
   --fewshot-min 3 \
   --fewshot-max 3 \
-  --model-path /home/test/test16/chenlu/model/Qwen3-4B \
-  --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}" \
-  --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}" \
-  --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B \
-  --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}" \
-  --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}" \
   --concurrency "${EVAL_CONCURRENCY:-64}" \
   --llm-seed 42 \
   --num-samples-per-problem "${NUM_SAMPLES_PER_PROBLEM:-3}" \
-  --strategy-no-think \
   --answer-no-think \
-  --strategy-prompt-version repetition_controls_2026-04-01 \
-  --strategy-repetition-penalty 1.1 \
   --reward-version v3 \
   --answer-request-retries 3 \
   --answer-retry-delay-sec 1.0 \
+  "${MODE_ARGS[@]}" \
   "${SAMPLING_MODE_ARGS[@]}" \
   "$@"
 
