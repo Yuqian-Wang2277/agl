@@ -585,8 +585,55 @@ def make_solve_fn(
 
         return _mist
 
+    elif mode == "mist-inline":
+        # Train-free, single-model MIST.  The answer solver handles both:
+        #   Step 1 — extract a two-layer strategy from few-shot examples
+        #            (mist_inline_strategy.toml, FIRST_ORDER + SECOND_ORDER)
+        #   Step 2 — apply the strategy to solve the new problem
+        #            (mist_inline_answer.toml)
+        # No separate strategy_solver is used; designed for closed-source APIs.
+        inline_strat_tmpl = load_toml_prompt(
+            prompt_dir / "answer_generation" / "mist_inline_strategy.toml"
+        )
+        inline_strat_sys = inline_strat_tmpl["system"].strip()
+        inline_strat_usr = inline_strat_tmpl["user"]
+
+        inline_ans_tmpl = load_toml_prompt(
+            prompt_dir / "answer_generation" / "mist_inline_answer.toml"
+        )
+        inline_ans_sys = inline_ans_tmpl["system"].strip()
+        inline_ans_usr = inline_ans_tmpl["user"]
+
+        def _mist_inline(
+            prob: Dict[str, Any], si: int
+        ) -> Tuple[str, Dict[str, Any]]:
+            # Step 1: sample few-shot examples
+            seed = make_shot_seed(prob["id"], si, shot_seed, diverse_context)
+            shot_ids, examples_text = draw_shot_examples(
+                shot_pool, prob["task_type"], prob["id"], shot_num, seed
+            )
+            # Step 2: extract inline strategy from examples (same model)
+            strat_user_prompt = inline_strat_usr.format(examples_text=examples_text)
+            strategy = solver.get_response(strat_user_prompt, system_prompt=inline_strat_sys)
+            # Step 3: apply strategy to answer the problem
+            problem_text = format_problem_text(prob)
+            ans_user_prompt = inline_ans_usr.format(
+                strategy=strategy, problem=problem_text
+            )
+            resp = solver.get_response(ans_user_prompt, system_prompt=inline_ans_sys)
+            return resp, {
+                "few_shot_ids": shot_ids,
+                "inline_strategy_prompt": strat_user_prompt,
+                "inline_strategy": strategy,
+                "answer_prompt": ans_user_prompt,
+            }
+
+        return _mist_inline
+
     else:
-        raise ValueError(f"Unknown mode '{mode}'. Choose from: zero-shot, few-shot, MIST")
+        raise ValueError(
+            f"Unknown mode '{mode}'. Choose from: zero-shot, few-shot, MIST, mist-inline"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -697,12 +744,13 @@ def main() -> None:
     # ── Prompting mode ──────────────────────────────────────────────────────
     parser.add_argument(
         "--mode", type=str, default="zero-shot",
-        choices=["zero-shot", "few-shot", "MIST"],
+        choices=["zero-shot", "few-shot", "MIST", "mist-inline"],
         help=(
             "Prompting strategy:\n"
-            "  zero-shot  — answer directly (no examples)\n"
-            "  few-shot   — in-context learning from same-type examples (leave-one-out)\n"
-            "  MIST       — extract strategy from shot examples, then answer"
+            "  zero-shot   — answer directly (no examples)\n"
+            "  few-shot    — in-context learning from same-type examples (leave-one-out)\n"
+            "  MIST        — extract strategy from shot examples, then answer\n"
+            "  mist-inline — train-free single-model MIST (strategy + answer, same model)"
         ),
     )
     parser.add_argument("--shot_num", type=int, default=3,
@@ -768,7 +816,7 @@ def main() -> None:
     # ── Validation ───────────────────────────────────────────────────────────
     if args.backend == "openai_compatible" and not args.api_base:
         parser.error("--backend openai_compatible requires --api_base")
-    if args.mode in ("few-shot", "MIST") and args.shot_num <= 0:
+    if args.mode in ("few-shot", "MIST", "mist-inline") and args.shot_num <= 0:
         parser.error(f"--shot_num must be > 0 for --mode {args.mode}")
 
     # ── Output paths ─────────────────────────────────────────────────────────
@@ -805,6 +853,9 @@ def main() -> None:
     if args.mode == "MIST":
         meta["strategy_model"] = args.strategy_model or args.model
         meta["strategy_api_base"] = args.strategy_api_base or args.api_base
+    elif args.mode == "mist-inline":
+        meta["inline_strategy_prompt"] = "mist_inline_strategy"
+        meta["inline_answer_prompt"] = "mist_inline_answer"
 
     # ── Build solvers ────────────────────────────────────────────────────────
     solver = load_solver(args)
@@ -822,6 +873,8 @@ def main() -> None:
     if args.mode == "MIST":
         sm = args.strategy_model or args.model
         print(f"  Strategy mdl: {sm}  (T={args.strategy_temperature})")
+    elif args.mode == "mist-inline":
+        print(f"  Strategy    : inline (mist_inline_strategy.toml → mist_inline_answer.toml)")
     if args.mode != "zero-shot":
         ctx_label = "diverse" if args.context_diversity_mode == "diverse" else "reproducible"
         print(f"  Shot num    : {args.shot_num}  seed={args.shot_seed}  context={ctx_label}")

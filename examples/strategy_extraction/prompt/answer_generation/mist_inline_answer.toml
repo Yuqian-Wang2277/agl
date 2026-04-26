@@ -1,0 +1,28 @@
+# Inline MIST answer generation — train-free, single closed-source model.
+#
+# Receives the two-layer strategy (FIRST_ORDER + SECOND_ORDER) that the same
+# model extracted from few-shot examples in the preceding step, and applies
+# it to solve a new problem of the same type.
+#
+# Placeholders: {strategy}, {problem}
+
+system = '''
+You are an expert problem solver. You are given a two-layer problem-solving strategy
+that was extracted from similar example problems. Apply it to solve the new problem.
+
+Output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing before, nothing after.
+'''
+
+user = '''
+Here is a two-layer strategy derived from similar examples:
+
+{strategy}
+
+Now apply this strategy to solve the following new problem:
+
+{problem}
+
+Ground your reasoning in the FIRST_ORDER pattern and follow the SECOND_ORDER steps,
+then provide your final answer wrapped in <answer>...</answer> tags.
+'''
