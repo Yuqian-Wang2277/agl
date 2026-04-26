@@ -74,6 +74,9 @@
 #  OUTPUT_DIR               结果目录（默认 results/passk）
 #  OUTPUT_FILE              输出文件名（默认自动生成）
 #  PROMPT_DIR               TOML prompt 目录
+#  NO_THINK                 1 表示向 Qwen3/vLLM 禁用答案模型 thinking 模式（默认 1）
+#  STRATEGY_NO_THINK        1 表示向 Qwen3/vLLM 禁用策略模型 thinking 模式，仅 MIST（默认 1）
+#  CONCURRENCY              最大并发 LLM 请求数（默认 32）
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,8 +96,11 @@ BACKEND="${BACKEND:-openai}"
 API_KEY="${API_KEY:-${OPENAI_API_KEY:-}}"
 API_BASE="${API_BASE:-}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
-MAX_TOKENS="${MAX_TOKENS:-4096}"
-SLEEP_TIME="${SLEEP_TIME:-0.5}"
+MAX_TOKENS="${MAX_TOKENS:-8192}"
+SLEEP_TIME="${SLEEP_TIME:-0.05}"
+NO_THINK="${NO_THINK:-1}"
+STRATEGY_NO_THINK="${STRATEGY_NO_THINK:-1}"
+CONCURRENCY="${CONCURRENCY:-8}"
 
 STRATEGY_MODEL="${STRATEGY_MODEL:-}"
 STRATEGY_API_BASE="${STRATEGY_API_BASE:-}"
@@ -141,7 +147,10 @@ ARGS=(
     --task_type   "${TASK_TYPE}"
     --output_dir  "${OUTPUT_DIR}"
     --prompt_dir  "${PROMPT_DIR}"
+    --concurrency "${CONCURRENCY}"
 )
+
+[[ "${NO_THINK}" == "1" ]] && ARGS+=(--no_think)
 
 [[ -n "${API_KEY}" ]]     && ARGS+=(--api_key  "${API_KEY}")
 [[ -n "${API_BASE}" ]]    && ARGS+=(--api_base "${API_BASE}")
@@ -152,6 +161,7 @@ if [[ "$MODE" == "MIST" ]]; then
     [[ -n "${STRATEGY_API_BASE}" ]]    && ARGS+=(--strategy_api_base    "${STRATEGY_API_BASE}")
     [[ -n "${STRATEGY_API_KEY}" ]]     && ARGS+=(--strategy_api_key     "${STRATEGY_API_KEY}")
     ARGS+=(--strategy_temperature "${STRATEGY_TEMPERATURE}")
+    [[ "${STRATEGY_NO_THINK}" == "1" ]] && ARGS+=(--strategy_no_think)
 fi
 
 exec python3 run_linguini_passk.py "${ARGS[@]}" "$@"

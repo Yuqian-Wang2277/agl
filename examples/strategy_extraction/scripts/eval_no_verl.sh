@@ -18,6 +18,13 @@
 #                 answer_generation/v1.toml
 #    需要同时启动策略模型（Qwen3-4B，端口 8100）和答案模型（Qwen3-8B，端口 8200）。
 #
+#  MODE=mist-inline（单模型 train-free MIST）
+#    同一模型先提取两层策略（FIRST_ORDER + SECOND_ORDER），再用策略回答新题。
+#    无需单独策略模型，适合闭源 API（GPT-4o、Claude 等）。
+#    只需启动答案模型（端口 8200）或配置闭源 API。
+#    使用 prompt: answer_generation/mist_inline_strategy.toml（策略提取）
+#                 answer_generation/mist_inline_answer.toml（策略作答）
+#
 # ============================================================
 #  重要 setting 速查（实际生效值，含显式参数 + 隐式 default）
 # ============================================================
@@ -84,12 +91,14 @@
 #         --gpu-memory-utilization 0.90 \
 #         --max-model-len 32768
 #
-#  [few-shot 模式] 只需启动答案模型（终端 2，同上）。
+#  [few-shot / mist-inline 模式] 只需启动答案模型（终端 2，同上）。
+#  [mist-inline 闭源 API] 无需本地 vLLM，配置 ANSWER_MODEL_BASE_URL 和 ANSWER_MODEL_NAME 即可。
 #
 # 运行示例：
-#   MODE=MIST    bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=few-shot bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=few-shot bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
+#   MODE=MIST         bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=few-shot     bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=mist-inline  bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=few-shot     bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
 #
 # 可通过环境变量覆盖默认值，例如（MIST 模式）：
 #   MODE=MIST \
@@ -119,8 +128,8 @@ cd "$REPO_ROOT"
 
 # --- 模式选择 ---
 MODE="${MODE:-MIST}"
-if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" ]]; then
-    echo "[ERROR] MODE 必须为 'few-shot' 或 'MIST'（当前值: $MODE）"
+if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" && "$MODE" != "mist-inline" ]]; then
+    echo "[ERROR] MODE 必须为 'few-shot'、'MIST' 或 'mist-inline'（当前值: $MODE）"
     exit 1
 fi
 echo "[INFO] 运行模式: $MODE"
@@ -143,14 +152,24 @@ MODE_ARGS=()
 if [[ "$MODE" == "few-shot" ]]; then
     # few-shot：只有一个答案模型，跳过策略生成，使用 ICL prompt
     MODE_ARGS+=(
-        --skip-strategy-generation
+        --mode few-shot
         --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
         --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
         --answer-prompt-version "ICL(few-shot)"
     )
+elif [[ "$MODE" == "mist-inline" ]]; then
+    # mist-inline：单模型，两次调用（策略提取 + 策略作答），无需策略服务
+    MODE_ARGS+=(
+        --mode mist-inline
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --inline-strategy-prompt-version "${INLINE_STRATEGY_PROMPT_VERSION:-mist_inline_strategy}"
+        --answer-prompt-version "${ANSWER_PROMPT_VERSION:-mist_inline_answer}"
+    )
 else
     # MIST：策略模型（Qwen3-4B）+ 答案模型（Qwen3-8B）
     MODE_ARGS+=(
+        --mode MIST
         --model-path /home/test/test16/chenlu/model/Qwen3-4B
         --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}"
         --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}"

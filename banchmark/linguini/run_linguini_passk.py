@@ -24,16 +24,16 @@ all other problems of task_type T (P itself is excluded).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
 import random
 import re
-import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 import openai
 import requests
@@ -337,9 +337,9 @@ class OpenAICompatibleChat:
         kwargs: Dict[str, Any] = {"api_key": api_key or "EMPTY"}
         if base_url:
             kwargs["base_url"] = base_url
-        self.client = openai.OpenAI(**kwargs)
+        self.client = openai.AsyncOpenAI(**kwargs)
 
-    def get_response(
+    async def get_response(
         self, user_prompt: str, system_prompt: Optional[str] = None
     ) -> str:
         sp = system_prompt if system_prompt is not None else self.system_prompt
@@ -358,7 +358,7 @@ class OpenAICompatibleChat:
         while patience > 0:
             patience -= 1
             try:
-                resp = self.client.chat.completions.create(
+                resp = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     temperature=self.temperature,
@@ -378,7 +378,7 @@ class OpenAICompatibleChat:
                 if max_tokens <= 8:
                     return ""
                 if self.sleep_time > 0:
-                    time.sleep(self.sleep_time)
+                    await asyncio.sleep(self.sleep_time)
         return ""
 
 
@@ -391,10 +391,7 @@ class OllamaChat:
         self.model = model
         self.temperature = temperature
 
-    def get_response(
-        self, user_prompt: str, system_prompt: Optional[str] = None
-    ) -> str:
-        prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
+    def _sync_request(self, prompt: str) -> str:
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -410,6 +407,12 @@ class OllamaChat:
             print(f"Ollama HTTP {r.status_code}: {r.text[:500]}")
             return ""
         return r.json().get("response") or ""
+
+    async def get_response(
+        self, user_prompt: str, system_prompt: Optional[str] = None
+    ) -> str:
+        prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
+        return await asyncio.to_thread(self._sync_request, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -503,20 +506,20 @@ def make_solve_fn(
     shot_seed: int,
     diverse_context: bool,
     prompt_dir: Path,
-) -> Callable[[Dict[str, Any], int], Tuple[str, Dict[str, Any]]]:
-    """Return a ``(problem_dict, sample_idx) -> (response_str, extra_info_dict)`` callable."""
+) -> Callable[[Dict[str, Any], int], Coroutine[Any, Any, Tuple[str, Dict[str, Any]]]]:
+    """Return an async ``(problem_dict, sample_idx) -> (response_str, extra_info_dict)`` callable."""
 
     if mode == "zero-shot":
         tmpl = load_toml_prompt(prompt_dir / "answer_generation" / "zero-shot.toml")
         sys_p = tmpl["system"].strip()
         usr_tpl = tmpl["user"]
 
-        def _zero_shot(
+        async def _zero_shot(
             prob: Dict[str, Any], si: int
         ) -> Tuple[str, Dict[str, Any]]:
             problem_text = format_problem_text(prob)
             user_prompt = usr_tpl.format(problem=problem_text)
-            resp = solver.get_response(user_prompt, system_prompt=sys_p)
+            resp = await solver.get_response(user_prompt, system_prompt=sys_p)
             return resp, {"prompt": user_prompt, "few_shot_ids": []}
 
         return _zero_shot
@@ -528,7 +531,7 @@ def make_solve_fn(
         sys_p = tmpl["system"].strip()
         usr_tpl = tmpl["user"]
 
-        def _few_shot(
+        async def _few_shot(
             prob: Dict[str, Any], si: int
         ) -> Tuple[str, Dict[str, Any]]:
             seed = make_shot_seed(prob["id"], si, shot_seed, diverse_context)
@@ -539,7 +542,7 @@ def make_solve_fn(
             user_prompt = usr_tpl.format(
                 examples_text=examples_text, problem=problem_text
             )
-            resp = solver.get_response(user_prompt, system_prompt=sys_p)
+            resp = await solver.get_response(user_prompt, system_prompt=sys_p)
             return resp, {"prompt": user_prompt, "few_shot_ids": shot_ids}
 
         return _few_shot
@@ -557,25 +560,22 @@ def make_solve_fn(
 
         s_solver = strategy_solver or solver
 
-        def _mist(
+        async def _mist(
             prob: Dict[str, Any], si: int
         ) -> Tuple[str, Dict[str, Any]]:
-            # Step 1: sample few-shot examples
             seed = make_shot_seed(prob["id"], si, shot_seed, diverse_context)
             shot_ids, examples_text = draw_shot_examples(
                 shot_pool, prob["task_type"], prob["id"], shot_num, seed
             )
-            # Step 2: extract strategy from few-shot examples
             strategy_user_prompt = strat_usr_tpl.format(examples_text=examples_text)
-            strategy = s_solver.get_response(
+            strategy = await s_solver.get_response(
                 strategy_user_prompt, system_prompt=strat_sys_p
             )
-            # Step 3: apply strategy to answer the problem
             problem_text = format_problem_text(prob)
             answer_user_prompt = ans_usr_tpl.format(
                 strategy=strategy, problem=problem_text
             )
-            resp = solver.get_response(answer_user_prompt, system_prompt=ans_sys_p)
+            resp = await solver.get_response(answer_user_prompt, system_prompt=ans_sys_p)
             return resp, {
                 "few_shot_ids": shot_ids,
                 "strategy_prompt": strategy_user_prompt,
@@ -604,23 +604,20 @@ def make_solve_fn(
         inline_ans_sys = inline_ans_tmpl["system"].strip()
         inline_ans_usr = inline_ans_tmpl["user"]
 
-        def _mist_inline(
+        async def _mist_inline(
             prob: Dict[str, Any], si: int
         ) -> Tuple[str, Dict[str, Any]]:
-            # Step 1: sample few-shot examples
             seed = make_shot_seed(prob["id"], si, shot_seed, diverse_context)
             shot_ids, examples_text = draw_shot_examples(
                 shot_pool, prob["task_type"], prob["id"], shot_num, seed
             )
-            # Step 2: extract inline strategy from examples (same model)
             strat_user_prompt = inline_strat_usr.format(examples_text=examples_text)
-            strategy = solver.get_response(strat_user_prompt, system_prompt=inline_strat_sys)
-            # Step 3: apply strategy to answer the problem
+            strategy = await solver.get_response(strat_user_prompt, system_prompt=inline_strat_sys)
             problem_text = format_problem_text(prob)
             ans_user_prompt = inline_ans_usr.format(
                 strategy=strategy, problem=problem_text
             )
-            resp = solver.get_response(ans_user_prompt, system_prompt=inline_ans_sys)
+            resp = await solver.get_response(ans_user_prompt, system_prompt=inline_ans_sys)
             return resp, {
                 "few_shot_ids": shot_ids,
                 "inline_strategy_prompt": strat_user_prompt,
@@ -640,71 +637,87 @@ def make_solve_fn(
 # Core evaluation loop
 # ---------------------------------------------------------------------------
 
-def run_bucket(
+async def run_bucket(
     bucket_label: str,
     problems: List[Dict[str, Any]],
-    solve_fn: Callable[[Dict[str, Any], int], Tuple[str, Dict[str, Any]]],
+    solve_fn: Callable[[Dict[str, Any], int], Coroutine[Any, Any, Tuple[str, Dict[str, Any]]]],
     args: argparse.Namespace,
     results_root: Dict[str, Any],
+    out_path: str,
+    semaphore: asyncio.Semaphore,
 ) -> Tuple[PassKStats, List[List[float]]]:
-    """Evaluate one bucket (task_type) of problems."""
-    per_problem_scores: List[List[float]] = []
+    """Evaluate one bucket (task_type) of problems concurrently."""
     bucket_results = results_root.setdefault(bucket_label, {})
+    lock = asyncio.Lock()
 
-    for prob in tqdm(problems, desc=bucket_label):
+    # Build task list; per-problem completed-sample counter (includes resumed ones)
+    prob_completed: Dict[str, int] = {}
+    task_items: List[Tuple[Dict[str, Any], int]] = []
+
+    for prob in problems:
         pid = prob["id"]
-        entry = bucket_results.get(pid)
-        if entry and entry.get("samples"):
-            existing = entry["samples"]
-            if len(existing) >= args.num_samples and all(
-                verify_response(s.get("response")) for s in existing[: args.num_samples]
-            ):
-                scores = [
-                    _score_to_float(s.get("score"))
-                    for s in existing[: args.num_samples]
-                ]
-                per_problem_scores.append(scores)
-                continue
-
-        row = bucket_results.setdefault(pid, {"samples": [], "task_type": prob["task_type"]})
-        # Always refresh ground-truth fields so resumed results also contain them
-        row.update({
-            "eval_type": prob.get("eval_type", "single"),
-            "ground_truth": prob["answer"],
-        })
-        samples: List[Dict[str, Any]] = row["samples"]
-
+        existing = bucket_results.get(pid, {}).get("samples", [])
+        done = sum(
+            1 for i in range(args.num_samples)
+            if i < len(existing) and verify_response(existing[i].get("response"))
+        )
+        prob_completed[pid] = done
         for si in range(args.num_samples):
-            if si < len(samples) and verify_response(samples[si].get("response")):
+            if si < len(existing) and verify_response(existing[si].get("response")):
                 continue
+            task_items.append((prob, si))
+
+    async def process(prob: Dict[str, Any], si: int) -> None:
+        pid = prob["id"]
+        print(f"[{bucket_label}][{pid}] sample {si + 1}/{args.num_samples}")
+        try:
+            async with semaphore:
+                resp, extra = await solve_fn(prob, si)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            resp, extra = "", {"error": repr(e)}
+
+        predicted = parse_numbered_answers(resp) if resp else []
+        sc = score_answers(predicted, prob["answer"], prob.get("eval_type", "single"))
+
+        async with lock:
+            row = bucket_results.setdefault(
+                pid, {"samples": [], "task_type": prob["task_type"]}
+            )
+            row.update({
+                "eval_type": prob.get("eval_type", "single"),
+                "ground_truth": prob["answer"],
+            })
+            samples: List[Dict[str, Any]] = row["samples"]
             while len(samples) <= si:
                 samples.append({})
-            print(f"[{bucket_label}][{pid}] sample {si + 1}/{args.num_samples}")
-            try:
-                resp, extra = solve_fn(prob, si)
-                predicted = parse_numbered_answers(resp)
-                sc = score_answers(predicted, prob["answer"], prob.get("eval_type", "single"))
-                samples[si].update(extra)
-                samples[si]["response"] = resp
-                samples[si]["predicted_answers"] = predicted
-                samples[si]["score"] = sc
-            except Exception as e:
-                print(f"  ERROR: {e}")
-                samples[si]["error"] = repr(e)
-                samples[si]["score"] = 0.0
+            samples[si].update(extra)
+            samples[si]["response"] = resp
+            samples[si]["predicted_answers"] = predicted
+            samples[si]["score"] = sc
 
-        scores = [_score_to_float(samples[i].get("score")) for i in range(args.num_samples)]
+            prob_completed[pid] += 1
+            if prob_completed[pid] >= args.num_samples:
+                save_json(results_root, out_path)
+
+    if task_items:
+        await asyncio.gather(*[process(prob, si) for prob, si in task_items])
+
+    per_problem_scores: List[List[float]] = []
+    for prob in problems:
+        pid = prob["id"]
+        samples = bucket_results.get(pid, {}).get("samples", [])
+        scores = [
+            _score_to_float(samples[i].get("score")) if i < len(samples) else 0.0
+            for i in range(args.num_samples)
+        ]
         per_problem_scores.append(scores)
 
     ks = [k for k in (1, 2, 3) if k <= args.num_samples]
     pass_at = compute_pass_at_k(per_problem_scores, ks, args.pass_threshold)
     means = []
     for j in range(args.num_samples):
-        col = [
-            _score_to_float(row[j])
-            for row in per_problem_scores
-            if j < len(row)
-        ]
+        col = [_score_to_float(row[j]) for row in per_problem_scores if j < len(row)]
         means.append(sum(col) / len(col) if col else 0.0)
     stats = PassKStats(
         n_problems=len(per_problem_scores),
@@ -718,7 +731,7 @@ def run_bucket(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+async def main() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     os.chdir(here)
 
@@ -810,6 +823,8 @@ def main() -> None:
         "--task_type", type=str, default="ALL",
         help="ALL | translation | fill_blanks | match_letters | text_to_num | num_to_text",
     )
+    parser.add_argument("--concurrency", type=int, default=32,
+                        help="Max concurrent async LLM calls (default: 32)")
 
     args = parser.parse_args()
 
@@ -880,9 +895,12 @@ def main() -> None:
         print(f"  Shot num    : {args.shot_num}  seed={args.shot_seed}  context={ctx_label}")
         print(f"  Shot pool   : { {tt: len(v) for tt, v in sorted(shot_pool.items())} }")
     print(f"  Num samples : {args.num_samples}  (pass@1/2/3)")
+    print(f"  Concurrency : {args.concurrency}")
     print(f"  Task type   : {args.task_type}")
     print(f"  Output      : {out_path}")
     print(f"{'='*60}\n")
+
+    semaphore = asyncio.Semaphore(args.concurrency)
 
     # ── Solve function ────────────────────────────────────────────────────────
     solve_fn = make_solve_fn(
@@ -916,7 +934,9 @@ def main() -> None:
             f"Evaluating bucket '{tt}' ({len(bucket_problems)} problems, "
             f"{n_pool} in shot pool) ..."
         )
-        stats, rows = run_bucket(tt, bucket_problems, solve_fn, args, results)
+        stats, rows = await run_bucket(
+            tt, bucket_problems, solve_fn, args, results, out_path, semaphore
+        )
         summary["buckets"][tt] = {
             "n": stats.n_problems,
             "pass@k": {f"pass@{k}": stats.pass_at[k] for k in sorted(stats.pass_at)},
@@ -943,4 +963,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

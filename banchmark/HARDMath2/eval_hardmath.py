@@ -84,8 +84,9 @@ logger = logging.getLogger(__name__)
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = _SCRIPT_DIR / "data"
-_AGENT_LIGHTNING = _SCRIPT_DIR.parent.parent / "agent-lightning"
-DEFAULT_PROMPT_DIR = _AGENT_LIGHTNING / "examples" / "strategy_extraction" / "prompt"
+# Repo root: .../agent-lightning (HARDMath2 lives under banchmark/HARDMath2).
+_REPO_ROOT = _SCRIPT_DIR.parent.parent
+DEFAULT_PROMPT_DIR = _REPO_ROOT / "examples" / "strategy_extraction" / "prompt"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

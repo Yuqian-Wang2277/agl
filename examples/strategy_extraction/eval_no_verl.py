@@ -255,6 +255,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "Each worker owns its own agent instance to avoid shared-state conflicts.",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="MIST",
+        choices=["few-shot", "MIST", "mist-inline"],
+        help=(
+            "Evaluation mode:\n"
+            "  few-shot    — ICL direct answer (no strategy generation)\n"
+            "  MIST        — separate strategy model + answer model (default)\n"
+            "  mist-inline — train-free single-model MIST: answer model extracts\n"
+            "                a two-layer strategy then solves the problem (two calls,\n"
+            "                same endpoint; suitable for closed-source APIs)"
+        ),
+    )
+    parser.add_argument(
+        "--inline-strategy-prompt-version",
+        type=str,
+        default="mist_inline_strategy",
+        help=(
+            "Prompt TOML name under answer_generation/ for inline strategy extraction "
+            "(mist-inline mode only). Default: 'mist_inline_strategy'."
+        ),
+    )
+    parser.add_argument(
         "--skip-strategy-generation",
         action="store_true",
         default=False,
@@ -415,9 +438,27 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     # Build per-worker agent instances to avoid shared-state conflicts under concurrency.
     # Each worker writes its own validation shard: validation_step0_worker{worker_id}.json
-    strategy_base_url = args.strategy_model_base_url or args.answer_model_base_url
     concurrency = max(1, int(args.concurrency or 1))
-    strategy_model_name = args.strategy_model_name or args.model_path
+
+    # Resolve mode-derived settings.
+    mode = getattr(args, "mode", "MIST")
+    _answer_model_name = args.answer_model_name or args.answer_model_path
+    if mode == "few-shot" or args.skip_strategy_generation:
+        _skip_strategy = True
+        _inline_strat_version = ""
+        strategy_base_url = args.answer_model_base_url
+        strategy_model_name = _answer_model_name
+    elif mode == "mist-inline":
+        _skip_strategy = False
+        _inline_strat_version = args.inline_strategy_prompt_version
+        # Both calls go to the same (answer) model endpoint.
+        strategy_base_url = args.answer_model_base_url
+        strategy_model_name = _answer_model_name
+    else:  # MIST (default)
+        _skip_strategy = args.skip_strategy_generation
+        _inline_strat_version = ""
+        strategy_base_url = args.strategy_model_base_url or args.answer_model_base_url
+        strategy_model_name = args.strategy_model_name or args.model_path
 
     def _make_worker(worker_idx: int) -> Tuple[StrategyGenerationAgent, agl.NamedResources]:
         agent = StrategyGenerationAgent(
@@ -435,11 +476,12 @@ async def _run_eval(args: argparse.Namespace) -> None:
             strategy_scorer_base_url="",  # disabled by default in this lightweight eval
             strategy_scorer_model="",
             answer_model_base_url=args.answer_model_base_url,
-            answer_model_name=args.answer_model_name or args.answer_model_path,
+            answer_model_name=_answer_model_name,
             use_strategy_for_answer=True,
-            skip_strategy_generation=args.skip_strategy_generation,
+            skip_strategy_generation=_skip_strategy,
             strategy_prompt_version=args.strategy_prompt_version,
             answer_prompt_version=args.answer_prompt_version,
+            inline_strategy_prompt_version=_inline_strat_version,
             reward_version=args.reward_version,
             strategy_no_think=args.strategy_no_think,
             strategy_repetition_penalty=strategy_repetition_penalty_effective,

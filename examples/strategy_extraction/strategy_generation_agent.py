@@ -133,6 +133,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # Prompt / reward versions (see prompt/ and reward/ packages)
         strategy_prompt_version: str = "v1",
         answer_prompt_version: str = "v1",
+        # mist-inline: single-model train-free MIST.  When set, the strategy
+        # prompt is loaded from answer_generation/<version>.toml and the
+        # answer model (same endpoint) is used for both calls.
+        inline_strategy_prompt_version: str = "",
         reward_version: str = "v2",
         # Incremental reward: R_delta = max(0, answer_soft - baseline_soft)
         baseline_cache: Optional[Dict[str, float]] = None,
@@ -184,11 +188,19 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self.answer_fallback_rollout_on_failure = answer_fallback_rollout_on_failure
 
         # Load TOML prompts and reward config
-        self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
+        self._inline_strategy_mode = bool(inline_strategy_prompt_version)
+        if self._inline_strategy_mode:
+            # Both prompts live in answer_generation/; same model handles both calls.
+            self.strategy_prompt = load_prompt("answer_generation", inline_strategy_prompt_version)
+        else:
+            self.strategy_prompt = load_prompt("strategy_generation", strategy_prompt_version)
         self.answer_prompt = load_prompt("answer_generation", answer_prompt_version)
         self.reward_config: RewardConfig = get_reward_config(reward_version)
 
-        self._strategy_prompt_version = strategy_prompt_version
+        self._strategy_prompt_version = (
+            f"answer_generation/{inline_strategy_prompt_version}"
+            if self._inline_strategy_mode else strategy_prompt_version
+        )
         self._answer_prompt_version = answer_prompt_version
         self._use_structured_format_reward = strategy_prompt_version == "strategy_structured_schema"
         self.debug_baseline = os.environ.get("AGL_DEBUG_BASELINE", "0") == "1"
@@ -419,6 +431,15 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             return 0.0
         return math.exp(sum(token_logprobs) / len(token_logprobs))
 
+    def _format_answer_user_prompt(self, strategy: str, problem: str, examples_text: str = "") -> str:
+        """Format the answer user prompt, supporting both {strategy}/{problem} and
+        {examples_text}/{problem} template styles."""
+        return self.answer_prompt["user"].format(
+            strategy=strategy,
+            examples_text=examples_text,
+            problem=problem,
+        )
+
     async def _post_answer_chat_completions_mist(
         self,
         base_url: str,
@@ -429,6 +450,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         temperature: float,
         max_tokens: int,
         seed: Optional[int] = None,
+        examples_text: str = "",
     ) -> tuple[str, List[float]]:
         """Single answer call with logprobs=True for MIST ICR computation.
 
@@ -442,7 +464,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             "model": model,
             "messages": [
                 {"role": "system", "content": self.answer_prompt["system"]},
-                {"role": "user", "content": self.answer_prompt["user"].format(strategy=strategy, problem=problem)},
+                {"role": "user", "content": self._format_answer_user_prompt(strategy, problem, examples_text)},
             ],
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -492,6 +514,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         temperature: float,
         max_tokens: int,
         seed: Optional[int] = None,
+        examples_text: str = "",
     ) -> str:
         """Single /chat/completions POST; returns message content or "" on any failure."""
         url = f"{self._normalize_openai_base_url(base_url)}/chat/completions"
@@ -499,7 +522,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             "model": model,
             "messages": [
                 {"role": "system", "content": self.answer_prompt["system"]},
-                {"role": "user", "content": self.answer_prompt["user"].format(strategy=strategy, problem=problem)},
+                {"role": "user", "content": self._format_answer_user_prompt(strategy, problem, examples_text)},
             ],
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -553,6 +576,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         max_tokens: int,
         seed: Optional[int] = None,
         *,
+        examples_text: str = "",
         rollout_fallback_base_url: Optional[str] = None,
         rollout_fallback_model: Optional[str] = None,
     ) -> tuple[str, str]:
@@ -586,6 +610,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     temperature,
                     max_tokens,
                     seed=seed,
+                    examples_text=examples_text,
                 )
                 if out:
                     return out
@@ -813,13 +838,23 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 )
                 traced_strategy_call = True
 
+                # mist-inline: use the answer model endpoint for strategy extraction.
+                if self._inline_strategy_mode:
+                    _strat_base_url = self.answer_model_base_url or base_url
+                    _strat_model = self.answer_model_name or llm.model
+                    _strat_no_think = self.answer_no_think
+                else:
+                    _strat_base_url = base_url
+                    _strat_model = llm.model
+                    _strat_no_think = self.strategy_no_think
+
                 client = AsyncOpenAI(
-                    base_url=base_url,
+                    base_url=_strat_base_url,
                     api_key=llm.api_key or "dummy-key",
                 )
 
                 _strategy_kwargs: Dict[str, Any] = {
-                    "model": llm.model,
+                    "model": _strat_model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -830,10 +865,11 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 if llm_request_seed is not None:
                     _strategy_kwargs["seed"] = llm_request_seed
                 extra_body: Dict[str, Any] = {}
-                if self.strategy_no_think:
+                if _strat_no_think:
                     extra_body["chat_template_kwargs"] = {"enable_thinking": False}
                 if (
-                    self.strategy_repetition_penalty is not None
+                    not self._inline_strategy_mode
+                    and self.strategy_repetition_penalty is not None
                     and self.strategy_repetition_penalty > 0
                 ):
                     extra_body["repetition_penalty"] = float(self.strategy_repetition_penalty)
@@ -914,6 +950,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     temperature=_ans_temp,
                     max_tokens=self._answer_max_tokens_for_llm(llm),
                     seed=llm_request_seed,
+                    examples_text=examples_text,
                 )
                 if not _token_logprobs:
                     logger.warning(
@@ -1006,6 +1043,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             temperature=_ans_temp,
                             max_tokens=self._answer_max_tokens_for_llm(llm),
                             seed=llm_request_seed,
+                            examples_text=examples_text,
                             rollout_fallback_base_url=base_url,
                             rollout_fallback_model=llm.model,
                         )
@@ -1165,6 +1203,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                         temperature=answer_temperature,
                                         max_tokens=self._answer_max_tokens_for_llm(llm),
                                         seed=llm_request_seed,
+                                        examples_text=examples_text,
                                         rollout_fallback_base_url=base_url,
                                         rollout_fallback_model=llm.model,
                                     )
@@ -1206,6 +1245,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                     temperature=answer_temperature,
                                     max_tokens=self._answer_max_tokens_for_llm(llm),
                                     seed=llm_request_seed,
+                                    examples_text=examples_text,
                                     rollout_fallback_base_url=base_url,
                                     rollout_fallback_model=llm.model,
                                 )
@@ -1258,6 +1298,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                 temperature=answer_temperature,
                                 max_tokens=self._answer_max_tokens_for_llm(llm),
                                 seed=llm_request_seed,
+                                examples_text=examples_text,
                                 rollout_fallback_base_url=base_url,
                                 rollout_fallback_model=llm.model,
                             )
@@ -1535,19 +1576,22 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                         f"[Rollout {attempted_rollout.rollout_id}] 未找到基线分（problem key={_key}），跳过 R_delta"
                     )
 
-            agl.emit_reward(
-                {
-                    "final": float(final_reward),
-                    "format": float(format_reward),
-                    "scorer": float(scorer_reward),
-                    "grounded_proxy": float(effective_proxy),
-                    "answer_soft": float(answer_soft_metric),
-                    "answer_hard": float(hard_correct_log),
-                    "r_delta": float(r_delta),
-                    "baseline_soft": float(baseline_soft_logged) if baseline_soft_logged is not None else -1.0,
-                },
-                primary_key="final",
-            )
+            try:
+                agl.emit_reward(
+                    {
+                        "final": float(final_reward),
+                        "format": float(format_reward),
+                        "scorer": float(scorer_reward),
+                        "grounded_proxy": float(effective_proxy),
+                        "answer_soft": float(answer_soft_metric),
+                        "answer_hard": float(hard_correct_log),
+                        "r_delta": float(r_delta),
+                        "baseline_soft": float(baseline_soft_logged) if baseline_soft_logged is not None else -1.0,
+                    },
+                    primary_key="final",
+                )
+            except RuntimeError:
+                pass  # no VERL tracer in eval_no_verl mode; validation_outputs already written
             # Return None so LitAgentRunner does not emit a second scalar reward span
             # (which would override multi-dimensional reward_dimensions in the daemon).
             return None
