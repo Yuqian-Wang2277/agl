@@ -835,6 +835,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 system_prompt = self.strategy_prompt["system"]
                 user_prompt = self.strategy_prompt["user"].format(
                     examples_text=examples_text,
+                    problem=task["problem"],
                 )
                 traced_strategy_call = True
 

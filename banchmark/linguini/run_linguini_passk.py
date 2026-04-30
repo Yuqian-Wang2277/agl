@@ -588,12 +588,12 @@ def make_solve_fn(
     elif mode == "mist-inline":
         # Train-free, single-model MIST.  The answer solver handles both:
         #   Step 1 — extract a two-layer strategy from few-shot examples
-        #            (mist_inline_strategy.toml, FIRST_ORDER + SECOND_ORDER)
+        #            (mist.toml)
         #   Step 2 — apply the strategy to solve the new problem
         #            (mist_inline_answer.toml)
         # No separate strategy_solver is used; designed for closed-source APIs.
         inline_strat_tmpl = load_toml_prompt(
-            prompt_dir / "answer_generation" / "mist_inline_strategy.toml"
+            prompt_dir / "answer_generation" / "mist.toml"
         )
         inline_strat_sys = inline_strat_tmpl["system"].strip()
         inline_strat_usr = inline_strat_tmpl["user"]
@@ -869,7 +869,7 @@ async def main() -> None:
         meta["strategy_model"] = args.strategy_model or args.model
         meta["strategy_api_base"] = args.strategy_api_base or args.api_base
     elif args.mode == "mist-inline":
-        meta["inline_strategy_prompt"] = "mist_inline_strategy"
+        meta["inline_strategy_prompt"] = "mist"
         meta["inline_answer_prompt"] = "mist_inline_answer"
 
     # ── Build solvers ────────────────────────────────────────────────────────
@@ -889,7 +889,7 @@ async def main() -> None:
         sm = args.strategy_model or args.model
         print(f"  Strategy mdl: {sm}  (T={args.strategy_temperature})")
     elif args.mode == "mist-inline":
-        print(f"  Strategy    : inline (mist_inline_strategy.toml → mist_inline_answer.toml)")
+        print(f"  Strategy    : inline (mist.toml → mist_inline_answer.toml)")
     if args.mode != "zero-shot":
         ctx_label = "diverse" if args.context_diversity_mode == "diverse" else "reproducible"
         print(f"  Shot num    : {args.shot_num}  seed={args.shot_seed}  context={ctx_label}")

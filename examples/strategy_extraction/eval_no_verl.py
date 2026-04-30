@@ -258,14 +258,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--mode",
         type=str,
         default="MIST",
-        choices=["few-shot", "MIST", "mist-inline"],
+        choices=["few-shot", "MIST", "mist-inline", "habit", "0-shot", "habit-0-shot"],
         help=(
             "Evaluation mode:\n"
-            "  few-shot    — ICL direct answer (no strategy generation)\n"
-            "  MIST        — separate strategy model + answer model (default)\n"
-            "  mist-inline — train-free single-model MIST: answer model extracts\n"
-            "                a two-layer strategy then solves the problem (two calls,\n"
-            "                same endpoint; suitable for closed-source APIs)"
+            "  few-shot     — ICL direct answer (no strategy generation)\n"
+            "  MIST         — separate strategy model + answer model (default)\n"
+            "  mist-inline  — train-free single-model MIST: answer model extracts\n"
+            "                 a two-layer strategy then solves the problem (two calls,\n"
+            "                 same endpoint; suitable for closed-source APIs)\n"
+            "  habit        — like mist-inline but the answer call receives both the\n"
+            "                 extracted strategy AND the original few-shot examples,\n"
+            "                 combining abstract strategy with concrete demonstrations\n"
+            "  0-shot       — no few-shot examples, direct answer only (infant baseline:\n"
+            "                 no meta-learning ability assumed)\n"
+            "  habit-0-shot — no few-shot examples; model first self-generates a two-layer\n"
+            "                 strategy from the problem alone (adult baseline: internalized\n"
+            "                 meta-inductive ability), then applies it to answer"
         ),
     )
     parser.add_argument(
@@ -443,15 +451,20 @@ async def _run_eval(args: argparse.Namespace) -> None:
     # Resolve mode-derived settings.
     mode = getattr(args, "mode", "MIST")
     _answer_model_name = args.answer_model_name or args.answer_model_path
-    if mode == "few-shot" or args.skip_strategy_generation:
+    if mode in ("few-shot", "0-shot") or args.skip_strategy_generation:
+        # No strategy generation: direct answer only.
+        # 0-shot differs from few-shot only in that it uses zero examples (fewshot-min/max=0)
+        # and a zero-shot answer prompt; the agent-level logic is identical.
         _skip_strategy = True
         _inline_strat_version = ""
         strategy_base_url = args.answer_model_base_url
         strategy_model_name = _answer_model_name
-    elif mode == "mist-inline":
+    elif mode in ("mist-inline", "habit", "habit-0-shot"):
+        # Inline strategy: same endpoint for both strategy extraction and answer.
+        # habit-0-shot uses a problem-only strategy prompt (habit_0shot_strategy.toml)
+        # and zero few-shot examples; the agent routing is otherwise identical.
         _skip_strategy = False
         _inline_strat_version = args.inline_strategy_prompt_version
-        # Both calls go to the same (answer) model endpoint.
         strategy_base_url = args.answer_model_base_url
         strategy_model_name = _answer_model_name
     else:  # MIST (default)

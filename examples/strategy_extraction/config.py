@@ -74,6 +74,36 @@ class StrategyConfig:
     answer_model_base_url: str = ""
 
 
+_ARCHITECTURE_TO_DECODER_LAYER: Dict[str, str] = {
+    "Qwen3ForCausalLM": "Qwen3DecoderLayer",
+    "Qwen2ForCausalLM": "Qwen2DecoderLayer",
+    "LlamaForCausalLM": "LlamaDecoderLayer",
+    "Gemma3ForCausalLM": "Gemma3DecoderLayer",
+    "Gemma3ForConditionalGeneration": "Gemma3DecoderLayer",
+    "MistralForCausalLM": "MistralDecoderLayer",
+}
+
+
+def _get_transformer_layer_cls(model_path: str) -> str:
+    """Infer the FSDP transformer layer class name from the model config.json."""
+    import json, os
+
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        architectures = cfg.get("architectures", [])
+        for arch in architectures:
+            if arch in _ARCHITECTURE_TO_DECODER_LAYER:
+                return _ARCHITECTURE_TO_DECODER_LAYER[arch]
+        raise ValueError(
+            f"Unknown model architecture {architectures}. "
+            f"Please add it to _ARCHITECTURE_TO_DECODER_LAYER in config.py."
+        )
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Model config.json not found at {config_path}")
+
+
 def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, resume_from_checkpoint: bool = False, resume_from_path: str | None = None, checkpoint_dir: str = "./checkpoints", n_gpus: int = 8) -> Dict[str, Any]:
     """Get VERL algorithm configuration.
     
@@ -88,6 +118,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
     Returns:
         VERL configuration dictionary.
     """
+    transformer_layer_cls = _get_transformer_layer_cls(model_path)
     config = {
         "algorithm": {
             "adv_estimator": "grpo",
@@ -124,9 +155,11 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },
             "actor": {
-                # With n=4 and train_batch_size=24: total_samples = 24*4=96, per_gpu=96/4=24.
-                # ppo_mini_batch_size must divide 24; 24 works. Previously 28 was set for n=8 (192/4=48).
-                "ppo_mini_batch_size": 28,
+                # ppo_mini_batch_size must be <= train_batch_size * rollout.n to avoid empty batches.
+                # With train_batch_size=8 and rollout.n=8: total=64, but some may be filtered by
+                # is_drop_mask (overlong prompt or format_ok=0). Setting to 8 ensures a valid batch
+                # is formed even when up to 7/8 problems in the step are filtered.
+                "ppo_mini_batch_size": 8,
                 "ppo_micro_batch_size_per_gpu": 2,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": False,
@@ -139,11 +172,24 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                     # saturating shared-node RAM (~10GB per FSDP worker when enabled).
                     "param_offload": True,
                     "optimizer_offload": True,
+                    # Explicitly specify the transformer layer to wrap for FSDP via wrap_policy.
+                    # Required because some models (e.g. Gemma3ForConditionalGeneration VLM) have
+                    # _no_split_modules that include vision classes absent in the text-only sub-module,
+                    # causing "Could not find the transformer layer class to wrap in the model."
+                    # The layer class is inferred dynamically from the model's config.json architecture.
+                    "wrap_policy": {
+                        "transformer_layer_cls_to_wrap": [transformer_layer_cls],
+                    },
                 },
             },
             "ref": {
                 "log_prob_micro_batch_size_per_gpu": 2,
-                "fsdp_config": {"param_offload": True},
+                "fsdp_config": {
+                    "param_offload": True,
+                    "wrap_policy": {
+                        "transformer_layer_cls_to_wrap": [transformer_layer_cls],
+                    },
+                },
             },
         },
         "trainer": {

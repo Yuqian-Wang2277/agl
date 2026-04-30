@@ -866,10 +866,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Strategy generation prompt TOML name under strategy_generation/ (MIST mode only).",
     )
     p.add_argument(
-        "--inline-strategy-prompt-version", default="mist_inline_strategy",
+        "--inline-strategy-prompt-version", default="mist",
         help=(
             "Strategy extraction prompt TOML name under answer_generation/ (mist-inline mode).\n"
-            "Default: 'mist_inline_strategy'  (semi-structured two-layer prompt)."
+            "Default: 'mist'."
         ),
     )
 

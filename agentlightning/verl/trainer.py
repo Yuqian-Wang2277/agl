@@ -448,6 +448,20 @@ class AgentLightningTrainer(RayPPOTrainer):
             batch = batch[list(range(n_remained_transition))]
             metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
 
+            # Guard: skip training step entirely if batch is empty after filtering.
+            # This can happen when all rollouts in a step are dropped due to overlong prompts
+            # or format_ok=0 (invalid strategy format), leaving fewer samples than ppo_mini_batch_size.
+            if n_remained_transition == 0:
+                logger.warning(
+                    f"[Step {self.global_steps}] Empty batch after filtering "
+                    f"(valid={n_transition}, ppo_mini_batch_size={mini_batch_size}). "
+                    f"Skipping training step."
+                )
+                metrics["training/n_triplets_skipped_empty_batch"] = (
+                    batch.batch["is_drop_mask"].shape[0] if hasattr(batch, "batch") else 0
+                )
+                return metrics
+
             # Agent mode note: Change the order of balance batch;
             #     1. first calculate advantage
             #     2. then drop the samples (too long prompt & floor to ppo minisize)

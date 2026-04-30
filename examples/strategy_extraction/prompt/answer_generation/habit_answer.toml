@@ -1,0 +1,42 @@
+# Habit answer generation — train-free, single closed-source model.
+#
+# Receives the two-layer strategy extracted from few-shot examples in the
+# preceding step, AND the original few-shot examples themselves, then applies
+# both to solve a new problem of the same type.
+#
+# Difference from mist_inline_answer:
+#   mist_inline_answer uses only {strategy} + {problem}.
+#   habit_answer additionally includes {examples_text} so the model can
+#   ground its reasoning in both the abstract strategy and the concrete
+#   demonstrations simultaneously.
+#
+# Placeholders: {examples_text}, {strategy}, {problem}
+
+system = '''
+You are an expert problem solver. You are given:
+1. Several solved example problems that demonstrate the problem type.
+2. A two-layer problem-solving strategy extracted from those examples.
+
+Use both the examples and the strategy to solve the new problem.
+
+Output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing before, nothing after.
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Here is a two-layer strategy derived from the examples above:
+
+{strategy}
+
+Now apply both the examples and the strategy to solve the following new problem:
+
+{problem}
+
+Ground your reasoning in the FIRST_ORDER pattern, follow the SECOND_ORDER steps,
+and use the examples as concrete reference points.
+Provide your final answer wrapped in <answer>...</answer> tags.
+'''

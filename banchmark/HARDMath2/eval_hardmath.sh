@@ -21,7 +21,7 @@
 #    同一模型先提取两层策略（FIRST_ORDER + SECOND_ORDER），
 #    再用策略回答新题。无需单独策略模型，适合闭源 API。
 #    只需启动答案模型（端口 8200）。
-#    prompt: answer_generation/mist_inline_strategy.toml
+#    prompt: answer_generation/mist.toml
 #            answer_generation/mist_inline_answer.toml
 #
 # ════════════════════════════════════════════════════════════════════
@@ -81,7 +81,7 @@
 #  STRATEGY_MODEL_NAME        策略模型名，仅 MIST（默认 Qwen3-4B）
 #  STRATEGY_MODEL_BASE_URL    策略模型 URL，仅 MIST（默认 http://localhost:8100/v1）
 #  INLINE_STRATEGY_PROMPT_VERSION  策略提取 prompt 版本，仅 mist-inline
-#                             （默认 mist_inline_strategy）
+#                             （默认 mist）
 #  FEWSHOT_K                  few-shot 示例数（默认 3）
 #  NUM_SAMPLES                每道题采样次数，用于 pass@k（默认 3）
 #  CONCURRENCY                并发 LLM 调用数（默认 32）
@@ -126,7 +126,7 @@ else
     ANSWER_PROMPT_VERSION="${ANSWER_PROMPT_VERSION:-v1}"
 fi
 STRATEGY_PROMPT_VERSION="${STRATEGY_PROMPT_VERSION:-repetition_controls_2026-04-01}"
-INLINE_STRATEGY_PROMPT_VERSION="${INLINE_STRATEGY_PROMPT_VERSION:-mist_inline_strategy}"
+INLINE_STRATEGY_PROMPT_VERSION="${INLINE_STRATEGY_PROMPT_VERSION:-mist}"
 
 # ── 构建模式专属参数 ───────────────────────────────────────────────────────────
 MODE_ARGS=()

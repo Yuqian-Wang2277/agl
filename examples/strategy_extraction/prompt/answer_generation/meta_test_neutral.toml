@@ -1,0 +1,28 @@
+# meta-test neutral instruction — internalization evidence probe
+#
+# Purpose: test whether a trained model spontaneously generates a strategy
+#          before answering, even when given NO instruction to do so.
+#          If the model still produces a <strategy> block unprompted, that
+#          is empirical evidence of internalized meta-inductive ability.
+#
+# Key contrast with other prompts:
+#   habit_0shot_strategy.toml  — explicitly asks for FIRST_ORDER / SECOND_ORDER strategy
+#   zero-shot.toml             — explicitly says "solve directly"
+#   meta_test_neutral.toml     — fully neutral: only asks the model to "think about
+#                                the problem"; neither elicits nor suppresses strategy
+#
+# Placeholders: {problem}   (no {examples_text}; fewshot-min/max=0)
+
+system = '''
+You are a helpful problem-solving assistant.
+Think carefully, then output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing outside the tags.
+'''
+
+user = '''
+Think about the following problem:
+
+{problem}
+
+Wrap your final answer in <answer>...</answer> tags.
+'''

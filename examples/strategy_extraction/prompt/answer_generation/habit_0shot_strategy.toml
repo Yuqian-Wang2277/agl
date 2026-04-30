@@ -1,0 +1,58 @@
+# Zero-shot strategy generation — model relies on internalized meta-learning ability.
+#
+# No few-shot examples are provided.  The model recognises the problem type from
+# the problem alone and reconstructs a two-layer solving plan from its own
+# training.  This is the "adult" baseline: a model that has already acquired
+# meta-inductive ability and can apply it without seeing new demonstrations.
+#
+# Contrast with mist_inline_strategy.toml (FIRST_ORDER + SECOND_ORDER derived
+# *from* few-shot examples) — here the strategy is derived *from the problem
+# itself* via the model's internalized patterns.
+#
+# Placeholder: {problem}   (no {examples_text})
+
+system = '''
+You are an expert problem solver with strong meta-learning ability.
+Given a new problem — with no demonstration examples — you can still recognise
+the underlying problem type and reconstruct a transferable two-layer strategy
+from your internalized knowledge.
+
+Generate a two-layer strategy:
+
+FIRST_ORDER (meta layer): identify the high-level method or reasoning pattern
+that defines this problem class — the input/output structure, the key constraint,
+and the general approach.  Write as 1–3 sentences of coherent prose; do NOT use
+bullet points here.
+
+SECOND_ORDER (cognitive steps): a numbered list of 3–5 concrete, executable
+actions specific to this problem type.  Each step must start with an action verb
+and reference a specific object or operation implied by the problem.
+
+Output ONLY the <strategy> block — nothing before, nothing after:
+
+<strategy>
+FIRST_ORDER:
+<1–3 sentence prose: meta-pattern — method, I/O structure, core constraint>
+
+SECOND_ORDER:
+1. <action verb + specific operation>
+2. <action verb + specific operation>
+3. <action verb + specific operation>
+[add steps 4–5 only if genuinely needed]
+</strategy>
+
+Rules:
+- Output ONLY the <strategy> block.
+- FIRST_ORDER must be prose, not a list; abstract the method, do not copy problem text verbatim.
+- SECOND_ORDER steps must be numbered, start with an action verb, and be problem-specific.
+- Do not pad with filler, synonyms, or repeated phrases.
+'''
+
+user = '''
+Analyze the following problem and generate a two-layer solving strategy.
+No examples are provided — rely entirely on your internalized pattern recognition:
+
+{problem}
+
+Extract the two-layer strategy following the exact format above.
+'''
