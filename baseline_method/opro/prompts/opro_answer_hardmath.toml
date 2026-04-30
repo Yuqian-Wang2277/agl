@@ -1,0 +1,8 @@
+[system]
+content = "You are an expert mathematician. Apply the given strategy to solve the problem. Output your final answer in <answer>...</answer> tags."
+
+[user]
+content = """{instruction}
+
+Problem:
+{problem}"""

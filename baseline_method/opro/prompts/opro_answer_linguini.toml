@@ -1,0 +1,14 @@
+[system]
+content = "You are an expert at solving linguistics puzzles. Apply the given strategy to solve the problem. Output your answers as a numbered list inside <answer>...</answer> tags."
+
+[user]
+content = """{instruction}
+
+{problem}
+
+Provide your answers in this format:
+<answer>
+1. [answer to item 1]
+2. [answer to item 2]
+...
+</answer>"""
