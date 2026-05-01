@@ -1,0 +1,48 @@
+# MIST+few-shot answer generation prompt.
+#
+# The model receives:
+#   1. Few-shot examples demonstrating the problem type.
+#   2. A two-layer strategy extracted by the **external MIST strategy model** (Qwen3-4B).
+# It then applies both to answer the target problem.
+#
+# Difference from v1 (standard MIST answer):
+#   v1 uses only {strategy} + {problem} — few-shot examples are NOT shown to the answer model.
+#   mist_fewshot_answer additionally includes {examples_text} so the model can ground its
+#   reasoning in both the abstract MIST strategy and the concrete demonstrations simultaneously.
+#
+# Difference from habit_answer:
+#   habit_answer uses a strategy produced *inline* by the answer model itself.
+#   mist_fewshot_answer uses a strategy produced by the dedicated external MIST strategy model
+#   (Qwen3-4B, port 8100); the answer model only sees the finished strategy, not the extraction
+#   process.
+#
+# Placeholders: {examples_text}, {strategy}, {problem}
+
+system = '''
+You are an expert problem solver. You are given:
+1. Several solved example problems that demonstrate the problem type.
+2. A two-layer problem-solving strategy extracted from those examples by a dedicated strategy model.
+
+Use both the examples and the strategy to solve the new problem.
+
+Output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing before, nothing after.
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Here is a two-layer strategy derived from the examples above:
+
+{strategy}
+
+Now apply both the examples and the strategy to solve the following new problem:
+
+{problem}
+
+Ground your reasoning in the FIRST_ORDER pattern, follow the SECOND_ORDER steps,
+and use the examples as concrete reference points.
+Provide your final answer wrapped in <answer>...</answer> tags.
+'''

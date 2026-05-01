@@ -911,6 +911,7 @@ def train(
     log_dir = os.path.join(checkpoint_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"train_{experiment_id}.log")
+    logging.getLogger("examples.strategy_extraction").setLevel(log_level)
     agl.setup_logging(
         log_level,
         files={

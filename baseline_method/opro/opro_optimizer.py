@@ -55,6 +55,7 @@ class OPROOptimizer:
         answer_model: str,
         scorer_fn: Callable[[str, str], tuple[bool, float]],
         meta_prompt: dict,
+        answer_prompt: dict,
         num_steps: int = 10,
         eval_batch_size: int = 5,
         history_top_k: int = 8,
@@ -69,6 +70,7 @@ class OPROOptimizer:
         self.answer_model = answer_model
         self.scorer_fn = scorer_fn
         self.meta_prompt = meta_prompt
+        self.answer_prompt = answer_prompt  # used in both optimization scoring and evaluation
         self.num_steps = num_steps
         self.eval_batch_size = eval_batch_size
         self.history_top_k = history_top_k
@@ -195,12 +197,18 @@ class OPROOptimizer:
     # ── Answer model call ─────────────────────────────────────────────────────
 
     async def _call_answer_model(self, instruction: str, item: dict) -> str:
-        """Call answer model with the given instruction prepended to the problem."""
+        """Call answer model using the same prompt format as the final evaluation."""
         problem = item.get("problem", item.get("prompt", ""))
-        user_content = f"{instruction}\n\nProblem:\n{problem}" if instruction else f"Problem:\n{problem}"
+        user_content = self.answer_prompt["user"]["content"].format(
+            instruction=instruction,
+            problem=problem,
+        )
         resp = await self.answer_client.chat.completions.create(
             model=self.answer_model,
-            messages=[{"role": "user", "content": user_content}],
+            messages=[
+                {"role": "system", "content": self.answer_prompt["system"]["content"]},
+                {"role": "user", "content": user_content},
+            ],
             temperature=self.answer_temperature,
             max_tokens=1024,
             seed=42,

@@ -1,0 +1,52 @@
+# MetaICL-CoT SFT — Qwen3-4B training configuration
+# Same as MetaICL but adds a "Think:" field before the final "Output:".
+# Loss is still only computed on the final answer (after last "\nOutput:").
+#
+# Think label source (think_source):
+#   empty  — Think field is blank; model learns format, not reasoning content.
+#   file   — Pre-generated labels from a JSONL file (set think_file below).
+# -------------------------------------------------------------------------
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model_name_or_path: /home/test/test16/chenlu/model/Qwen3-4B
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data_dir: ../../data/train_all_project_suitable
+
+k_shot: 4
+samples_per_task: 2000
+val_ratio: 0.05
+data_seed: 42
+
+# Think label source: "empty" or "file"
+think_source: empty
+# think_file: /path/to/think_labels.jsonl   # only needed when think_source=file
+
+# ── Output ────────────────────────────────────────────────────────────────
+output_dir: ./checkpoints/metaicl-cot-qwen3-4b
+
+# ── Training schedule ─────────────────────────────────────────────────────
+max_steps: 10000
+
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_steps: 100
+
+# CoT sequences are slightly longer (Think: field adds tokens)
+max_seq_length: 2560
+
+# ── Evaluation & checkpointing ────────────────────────────────────────────
+eval_steps: 500
+save_steps: 500
+save_total_limit: 3
+
+# ── Logging ───────────────────────────────────────────────────────────────
+logging_steps: 50
+report_to: none
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+seed: 42
+dataloader_num_workers: 4

@@ -1,0 +1,55 @@
+# MetaICL SFT — Qwen3-4B training configuration
+# Align key settings with MIST training for fair comparison.
+#
+# All values can be overridden via CLI args or environment variables:
+#   MAX_STEPS=500  python train_metaicl.py --config configs/train_qwen3_4b.yaml
+# -------------------------------------------------------------------------
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model_name_or_path: /home/test/test16/chenlu/model/Qwen3-4B
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data_dir: ../../data/train_all_project_suitable  # 44 task-type directories
+
+# k few-shot examples per training sample — match MIST eval fewshot_k
+k_shot: 4
+
+# Training samples generated per task type (44 tasks × 2000 = 88 000 total)
+samples_per_task: 2000
+
+# Fraction of each task's examples held out for val loss monitoring
+val_ratio: 0.05
+
+# Random seed for data sampling
+data_seed: 42
+
+# ── Output ────────────────────────────────────────────────────────────────
+output_dir: ./checkpoints/metaicl-qwen3-4b
+
+# ── Training schedule ─────────────────────────────────────────────────────
+# TODO: set to match MIST's actual gradient update count for fair comparison.
+# MIST trains for TOTAL_EPOCHS=3 with TRAIN_BATCH_SIZE=24.
+# Rough equivalence: fill in after confirming MIST step count.
+max_steps: 10000
+
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4   # effective batch = 4 × 4 × n_gpus
+
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_steps: 100
+
+max_seq_length: 2048             # covers k=4 few-shot + answer
+
+# ── Evaluation & checkpointing ────────────────────────────────────────────
+eval_steps: 500
+save_steps: 500
+save_total_limit: 3              # keep best + 2 recent
+
+# ── Logging ───────────────────────────────────────────────────────────────
+logging_steps: 50
+report_to: none                  # set to "wandb" to enable W&B logging
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+seed: 42
+dataloader_num_workers: 4

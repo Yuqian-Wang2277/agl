@@ -141,6 +141,7 @@ async def main(args: argparse.Namespace) -> None:
         answer_model=args.answer_model,
         scorer_fn=hardmath_score,
         meta_prompt=meta_prompt,
+        answer_prompt=answer_prompt,
         num_steps=args.num_steps,
         eval_batch_size=5,
         history_top_k=8,

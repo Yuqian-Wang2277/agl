@@ -942,11 +942,18 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                     if self.answer_temperature is not None
                     else llm.sampling_parameters.get("temperature", 0.7)
                 )
+                _MAX_STRATEGY_CHARS = 8000
+                _strategy_for_answer = strategy[:_MAX_STRATEGY_CHARS] if len(strategy) > _MAX_STRATEGY_CHARS else strategy
+                if len(strategy) > _MAX_STRATEGY_CHARS:
+                    logger.info(
+                        f"[Rollout {attempted_rollout.rollout_id}] MIST: strategy truncated "
+                        f"{len(strategy)} → {_MAX_STRATEGY_CHARS} chars for answer call"
+                    )
                 _ans_content, _token_logprobs = await self._post_answer_chat_completions_mist(
                     base_url=_ans_base_url,
                     api_key=_ans_api_key,
                     model=_ans_model,
-                    strategy=strategy,
+                    strategy=_strategy_for_answer,
                     problem=task["problem"],
                     temperature=_ans_temp,
                     max_tokens=self._answer_max_tokens_for_llm(llm),

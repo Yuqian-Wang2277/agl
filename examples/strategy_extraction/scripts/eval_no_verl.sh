@@ -19,6 +19,17 @@
 #                 answer_generation/v1.toml
 #    需要同时启动策略模型（Qwen3-4B，端口 8100）和答案模型（Qwen3-8B，端口 8200）。
 #
+#  MODE=MIST+few-shot（策略模型 + 含 few-shot 示例的答案模型）
+#    策略生成阶段：与 MIST 模式完全相同。
+#      prompt: strategy_generation/repetition_controls_2026-04-01.toml
+#      策略模型: Qwen3-4B  端口 8100  no-think  repetition_penalty=1.1
+#    答案生成阶段：在 MIST 的基础上，答案模型同时看到 few-shot 示例 + 策略，再回答新题。
+#      prompt: answer_generation/mist_fewshot_answer.toml（{examples_text}+{strategy}+{problem}）
+#      答案模型: Qwen3-8B  端口 8200  no-think
+#    与 habit 模式的核心区别：策略来自独立的外部策略模型（Qwen3-4B），而非答案模型内联生成。
+#    fewshot-min/max=3：提供 3 个 few-shot 示例给策略模型和答案模型。
+#    需要同时启动策略模型（端口 8100）和答案模型（端口 8200）。
+#
 #  MODE=mist-inline（单模型 train-free MIST）
 #    同一模型先提取两层策略（FIRST_ORDER + SECOND_ORDER），再用策略回答新题。
 #    无需单独策略模型，适合闭源 API（GPT-4o、Claude 等）。
@@ -76,6 +87,12 @@
 #              prompt_version=repetition_controls_2026-04-01
 #    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=v1
 #              grounded-proxy-k=1（每道题仅调用 answer model 1 次）
+#
+#  [模型 — MIST+few-shot 模式]
+#    策略模型: Qwen3-4B  端口 8100  no-think  repetition_penalty=1.1
+#              prompt_version=repetition_controls_2026-04-01（与 MIST 完全相同）
+#    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=mist_fewshot_answer
+#              （答案 prompt 包含 {examples_text}+{strategy}+{problem}）
 #
 #  [模型 — few-shot 模式]
 #    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=ICL(few-shot)
@@ -141,14 +158,15 @@
 #  [mist-inline 闭源 API] 无需本地 vLLM，配置 ANSWER_MODEL_BASE_URL 和 ANSWER_MODEL_NAME 即可。
 #
 # 运行示例：
-#   MODE=MIST          bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=few-shot      bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=mist-inline   bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=habit         bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=0-shot        bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=habit-0-shot  bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=meta-test     bash examples/strategy_extraction/scripts/eval_no_verl.sh
-#   MODE=few-shot      bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
+#   MODE=MIST           bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=MIST+few-shot  bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=few-shot       bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=mist-inline    bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=habit          bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=0-shot         bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=habit-0-shot   bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=meta-test      bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=few-shot       bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
 #
 # meta-test 自定义模型端口示例（已训练 4B 模型运行在 GPU 6,7，端口 8200）：
 #   MODE=meta-test \
@@ -184,8 +202,8 @@ cd "$REPO_ROOT"
 
 # --- 模式选择 ---
 MODE="${MODE:-MIST}"
-if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" && "$MODE" != "mist-inline" && "$MODE" != "habit" && "$MODE" != "0-shot" && "$MODE" != "habit-0-shot" && "$MODE" != "meta-test" ]]; then
-    echo "[ERROR] MODE 必须为 'few-shot'、'MIST'、'mist-inline'、'habit'、'0-shot'、'habit-0-shot' 或 'meta-test'（当前值: $MODE）"
+if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" && "$MODE" != "MIST+few-shot" && "$MODE" != "mist-inline" && "$MODE" != "habit" && "$MODE" != "0-shot" && "$MODE" != "habit-0-shot" && "$MODE" != "meta-test" ]]; then
+    echo "[ERROR] MODE 必须为 'few-shot'、'MIST'、'MIST+few-shot'、'mist-inline'、'habit'、'0-shot'、'habit-0-shot' 或 'meta-test'（当前值: $MODE）"
     exit 1
 fi
 echo "[INFO] 运行模式: $MODE"
@@ -284,6 +302,23 @@ elif [[ "$MODE" == "meta-test" ]]; then
         --answer-model-name "${META_TEST_MODEL_NAME:-${ANSWER_MODEL_NAME:-4b-trained}}"
         --answer-prompt-version "${ANSWER_PROMPT_VERSION:-meta_test_neutral}"
     )
+elif [[ "$MODE" == "MIST+few-shot" ]]; then
+    # MIST+few-shot：策略生成与 MIST 完全相同（外部 Qwen3-4B 策略模型）；
+    # 答案生成时，答案模型同时接收 few-shot 示例 + 策略，综合两者回答新题。
+    # 与 habit 模式的区别：策略由外部专用策略模型生成，而非答案模型内联生成。
+    MODE_ARGS+=(
+        --mode MIST
+        --model-path /home/test/test16/chenlu/model/Qwen3-4B
+        --strategy-model-base-url "${STRATEGY_MODEL_BASE_URL:-http://localhost:8100/v1}"
+        --strategy-model-name "${STRATEGY_MODEL_NAME:-Qwen3-4B}"
+        --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --strategy-no-think
+        --strategy-prompt-version repetition_controls_2026-04-01
+        --strategy-repetition-penalty 1.1
+        --answer-prompt-version "${ANSWER_PROMPT_VERSION:-mist_fewshot_answer}"
+    )
 else
     # MIST：策略模型（Qwen3-4B）+ 答案模型（Qwen3-8B）
     MODE_ARGS+=(
@@ -324,11 +359,12 @@ python -m examples.strategy_extraction.eval_no_verl \
 #    EXTRA_BENCHMARKS=0 bash eval_no_verl.sh
 #
 #  模式映射规则：
-#    MIST        → HARDMath2=MIST        Linguini=MIST
-#    few-shot    → HARDMath2=few-shot    Linguini=few-shot
-#    mist-inline → HARDMath2=mist-inline Linguini=mist-inline
-#    habit       → HARDMath2=mist-inline Linguini=mist-inline  (habit 本质同 mist-inline)
-#    0-shot      → HARDMath2=（跳过）    Linguini=zero-shot
+#    MIST          → HARDMath2=MIST        Linguini=MIST
+#    MIST+few-shot → HARDMath2=MIST        Linguini=MIST  (策略生成与 MIST 相同)
+#    few-shot      → HARDMath2=few-shot    Linguini=few-shot
+#    mist-inline   → HARDMath2=mist-inline Linguini=mist-inline
+#    habit         → HARDMath2=mist-inline Linguini=mist-inline  (habit 本质同 mist-inline)
+#    0-shot        → HARDMath2=（跳过）    Linguini=zero-shot
 #    habit-0-shot / meta-test → 两者均跳过（无对应模式）
 #
 #  fewshot 示例数：额外测评集使用 EXTRA_FEWSHOT_K（默认 3），
@@ -358,6 +394,11 @@ if [[ "${EXTRA_BENCHMARKS}" == "1" ]]; then
         MIST)
             _hardmath_mode="MIST"
             _linguini_mode="MIST"
+            ;;
+        MIST+few-shot)
+            _hardmath_mode="MIST"
+            _linguini_mode="MIST"
+            echo "[INFO] 额外测评集：MIST+few-shot 模式映射为 MIST（额外测评集不支持 few-shot 注入）"
             ;;
         few-shot)
             _hardmath_mode="few-shot"
