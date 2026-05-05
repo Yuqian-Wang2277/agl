@@ -1,0 +1,27 @@
+Please act as a professional strategy evaluator and compare the following two model-generated strategies across four dimensions.
+
+Task description: {task}
+
+Model A Strategy: {Model-A-generated strategy}
+
+Model B Strategy: {Model-B-generated strategy}
+
+Compare the two strategies on the following four dimensions:
+1. Correctness — Does the strategy accurately capture the task rules and produce correct solutions?
+2. Executability — Is the strategy clear and actionable enough for a model to follow step by step?
+3. Transferability — Is the strategy abstract and generalizable enough to apply to unseen tasks of the same type?
+4. Conciseness — Is the strategy expressed concisely without redundant or repetitive content?
+
+For each dimension, indicate which is better and provide a brief reason. Output in JSON format:
+{
+    "correctness_better": "Model A" / "Model B" / "tie",
+    "correctness_reason": "reason",
+    "executability_better": "Model A" / "Model B" / "tie",
+    "executability_reason": "reason",
+    "transferability_better": "Model A" / "Model B" / "tie",
+    "transferability_reason": "reason",
+    "conciseness_better": "Model A" / "Model B" / "tie",
+    "conciseness_reason": "reason",
+    "overall_better": "Model A" / "Model B" / "tie",
+    "overall_reason": "reason"
+}
