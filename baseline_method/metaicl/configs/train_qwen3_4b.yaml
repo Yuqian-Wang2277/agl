@@ -32,14 +32,19 @@ output_dir: ./checkpoints/metaicl-qwen3-4b
 # Rough equivalence: fill in after confirming MIST step count.
 max_steps: 10000
 
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4   # effective batch = 4 × 4 × n_gpus
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16  # effective batch = 1 × 16 × n_gpus (same as before)
 
 learning_rate: 1.0e-5
 lr_scheduler_type: cosine
 warmup_steps: 100
 
 max_seq_length: 2048             # covers k=4 few-shot + answer
+
+# ── Memory optimisation ───────────────────────────────────────────────────
+# Recompute activations on backward pass; trades ~20% extra compute for
+# ~40% less activation memory — essential to fit a 4B model on 80 GB GPUs.
+gradient_checkpointing: true
 
 # ── Evaluation & checkpointing ────────────────────────────────────────────
 eval_steps: 500
@@ -48,7 +53,8 @@ save_total_limit: 3              # keep best + 2 recent
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging_steps: 50
-report_to: none                  # set to "wandb" to enable W&B logging
+report_to: wandb
+run_name: metaicl-4shot-10k
 
 # ── Misc ──────────────────────────────────────────────────────────────────
 seed: 42

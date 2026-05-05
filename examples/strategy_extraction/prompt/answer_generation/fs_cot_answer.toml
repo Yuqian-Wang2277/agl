@@ -1,0 +1,46 @@
+# FS+CoT answer generation — Call 2 of FS+CoT mode (examples + free reasoning).
+#
+# Receives both the original few-shot examples AND the free chain-of-thought
+# reasoning derived from them in the preceding call, then applies both to solve
+# a new problem.  The original examples are NOT discarded during this answer call.
+#
+# Difference from cot_answer.toml (CoT mode):
+#   cot_answer.toml uses only {strategy} + {problem} — the few-shot examples are
+#   NOT shown to the model in the answer call.
+#   fs_cot_answer.toml additionally includes {examples_text} so the model can
+#   ground its reasoning in both the abstract free-form reasoning AND the concrete
+#   demonstrations simultaneously.
+#
+# Difference from habit_answer.toml:
+#   habit_answer uses a FIRST_ORDER + SECOND_ORDER structured strategy;
+#   fs_cot_answer uses a free-format chain-of-thought reasoning trace.
+#
+# Placeholders: {examples_text}, {strategy}, {problem}
+
+system = '''
+You are an expert problem solver. You are given:
+1. Several solved example problems that demonstrate the problem type.
+2. A free chain-of-thought reasoning analysis derived from those examples.
+
+Use both the examples and the reasoning to solve the new problem.
+
+Output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing before, nothing after.
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Here is a chain-of-thought reasoning analysis derived from the examples above:
+
+{strategy}
+
+Now apply both the examples and the reasoning to solve the following new problem:
+
+{problem}
+
+Return only:
+<answer>your final answer</answer>
+'''

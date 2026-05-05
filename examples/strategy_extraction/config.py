@@ -81,6 +81,7 @@ _ARCHITECTURE_TO_DECODER_LAYER: Dict[str, str] = {
     "Gemma3ForCausalLM": "Gemma3DecoderLayer",
     "Gemma3ForConditionalGeneration": "Gemma3DecoderLayer",
     "MistralForCausalLM": "MistralDecoderLayer",
+    "HunYuanDenseV1ForCausalLM": "HunYuanDenseV1DecoderLayer",
 }
 
 

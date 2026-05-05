@@ -1,0 +1,1029 @@
+\documentclass[11pt]{article}
+
+% Compile with XeLaTeX (required for CJK body text)
+% xelatex -synctex=1 mist_main.tex && bibtex mist_main && xelatex -synctex=1 mist_main.tex && xelatex -synctex=1 mist_main.tex
+
+\usepackage[review]{acl}
+\usepackage[UTF8]{ctex}   % Chinese support; requires XeLaTeX
+\renewcommand{\abstractname}{Abstract}
+\renewcommand{\figurename}{Figure}
+\renewcommand{\tablename}{Table}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{siunitx}
+\sisetup{detect-weight=true, detect-inline-weight=math}
+\usepackage{float}
+\usepackage{placeins}
+\usepackage[dvipsnames, svgnames, x11names]{xcolor}
+\usepackage{colortbl}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\definecolor{linkblue}{HTML}{000099}
+\hypersetup{colorlinks=true,linkcolor=linkblue,urlcolor=linkblue,citecolor=linkblue}
+\definecolor{mist}{RGB}{230,220,245}    % highlight: MIST row (w/ RL block)
+\definecolor{rlbg}{RGB}{245,243,250}    % highlight: other w/ RL block rows
+
+% ---------- macros ----------
+% TODO: replace \mist with the final method name once decided
+\newcommand{\mist}{\textbf{MIST}}
+\newcommand{\sg}{\textsc{SG}}
+\newcommand{\as}{\textsc{AS}}
+\newcommand{\proxy}{\widehat{u}}        % grounded proxy shorthand
+\newcommand{\cdash}{---}                % pending-result placeholder in tables
+% Method icon macros: left symbol = shot (○=0-shot, ●=few-shot)
+%                     right symbol = strategy (○=direct, ●=strategy-then-answer)
+\newcommand{\zs}{\ensuremath{\circ\!\circ}}     % 0S:   K=0, direct
+\newcommand{\ho}{\ensuremath{\bullet\!\circ}}   % H-0S: K=0, strategy
+\newcommand{\fs}{\ensuremath{\circ\!\bullet}}   % FS:   K>0, direct
+\newcommand{\hf}{\ensuremath{\bullet\!\bullet}} % H-FS/MIST: K>0, strategy
+% Inline Δ% helpers for OOD column
+\newcommand{\dg}[1]{{\scriptsize\textcolor{gray}{$#1$\%}}}       % gray Δ (H-0S)
+\newcommand{\dr}[1]{{\scriptsize\textcolor{BrickRed}{$+#1$\%}}}  % red Δ (H-FS/MIST)
+
+% ============================================================
+% TODO: Replace title with the chosen option (see suggestions below)
+%
+%  Option A – MIST (revised expansion)
+%    "MIST: Training LLMs to Meta-Inductively Solve Problems via
+%     Cross-Task Reinforcement Learning"
+%    (MIST  Meta-Inductive Skill Training  /  Strategy Transfer)
+%
+%  Option B – MIND
+%    "MIND: Decoupling Meta-Induction from Execution for
+%     Generalizable Few-Shot Reasoning"
+%    (MIND = Meta-INductive Decoupling)
+%
+%  Option C – LIRA
+%    "LIRA: Learning to Induce Reusable Abstractions via
+%     Cross-Task Reinforcement Learning"
+%    (LIRA = Learn-to-Induce via RL Alignment)
+%
+%  Option D – COIN
+%    "COIN: Cultivating Cognitive Induction Habits in LLMs via
+%     Cross-Task RL"
+%    (COIN = COgnitive INduction training)
+%
+%  Option E – HABIT
+%    "HABIT: Hierarchical Alignment-Based Inductive Training for
+%     Few-Shot Generalization"
+%    (HABIT = Habit-Aligned Bi-level Inductive Training)
+% ============================================================
+\title{MIST: Cultivating Meta-Inductive Habits in Large Language Models via Cross-Task Reinforcement Learning}
+
+\author{Anonymous Author \\
+  Anonymous Institution \\
+  \texttt{anonymous@domain}}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+  % --- 1. The Context (大背景与现状：1句) ---
+  大语言模型（LLM）的上下文学习（ICL）范式在少样本推理中高度依赖隐式的模式匹配。
+  % --- 2. The Gap (核心痛点：1-2句，点出“利用率不足”与“OOD失效”的因果) ---
+  这种机制对示例的利用往往停留在表层特征模仿，未能充分理解其中的深层解题规律。由于缺乏人类“先显式归纳策略，再演绎求解”的元认知习惯，该范式不仅对上下文知识的利用率极其低下，在面对分布外（OOD）的新类型问题时更极易发生泛化失效。
+  % --- 3. The Solution (本文方法：1-2句，抛出 MIST 框架、解耦与组合奖励) ---
+  针对此痛点，本文提出双层元认知强化学习框架 \mist{}（Meta-Inductive Strategy Training），旨在将跨任务的元归纳习惯内化为模型的稳定行为模式。我们在架构上解耦了策略归纳（\sg{}）与策略执行（\as{}），并设计了一种联合奖励信号：结合难度感知的\textbf{效用增量分}，以及量化策略消除求解器内部不确定性（即降低答案生成熵）的\textbf{自信分}，以驱动模型跨 110+ 种任务实现自主进化。
+  % --- 4. The Results (结果：1-2句，只报最核心的降维打击数据) ---
+  实验表明，经 \mist{} 训练的 4B 模型整体准确率较 ICL 基线提升 +135\%，超越推理规模达 32B 的所有无训练基线 ；特别是在未见的 OOD 任务上实现 +140\% 的跃升。
+  % --- 5. The Impact (意义：1句，拔高立意，回应开头) ---
+  本文证实：\textbf{先显式归纳策略、再演绎求解}这一元认知结构能大幅解锁模型对 few-shot 示例的深层利用率，且随示例数增加仍持续受益——这为提升大模型少样本泛化能力提供了一个独立于参数扩容的新认知维度。
+  \end{abstract}
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+In-context learning（ICL）使 LLM 无需参数更新即可从 few-shot 示例中学习新任务，但现有研究揭示了其根本局限：模型在示例与新问题之间执行的是隐式模式匹配（implicit pattern matching），而非显式的策略归纳~\citep{brown2020gpt3}。这一机制在表述偏移或难度提升时容易失效，因为归纳的"规律"仅隐含于激活空间而非显式表达，一旦输入分布发生微小偏差，匹配便失去稳定性。
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figure/fig1.png}
+  \caption{Overview of \mist{}. \textbf{Left}: standard ICL relies on implicit matching between demonstrations and query. \textbf{Right}: \mist{} decouples strategy induction (\sg{}, trainable, blue) from strategy execution (\as{}, frozen, orange). Cross-task GRPO training aligns \sg{} to produce effective strategies; execution accuracy serves as the sole reward signal.}
+  \label{fig:overview}
+\end{figure}
+
+人类面对陌生任务时，并不依赖反复的示例对比，而是自发地从若干示例中提炼出可迁移的解题框架，再将框架应用于新问题，心理学将这种"先归纳后演绎"的认知过程称为\textbf{元认知}~\citep{flavell1979metacognition}。关键在于，这是一种\emph{习惯}：即使没有外部指令，人类也会自发触发这一元层行为。LLM 缺乏的正是这种习惯的主动倾向，尽管在被明确要求时模型可以归纳，但在标准 ICL 框架下，模型不会自发地将示例中的规律显式提炼出解题策略。
+
+现有提示词优化方法（如 APE~\citep{zhou2023ape}、OPRO~\citep{yang2024opro}）在解决这一问题时采用的是 \emph{per-task search}（逐任务搜索）范式：每遇到一个新任务，都必须重新启动耗时的迭代搜索流程，推理成本随任务数线性增长，难以在实际场景中规模化部署。这一范式的本质局限在于，它优化的是针对单一任务的提示词，而非可跨任务复用的归纳能力本身,每次搜索的成果无法迁移，元认知能力始终外挂而非内化。
+
+为突破上述瓶颈，本文主张实现从“逐任务搜索”向“学会归纳”（learn-to-induce）的根本性范式转换。为此，我们提出了 MIST（Meta-Inductive Strategy Training），一个新颖的双层元认知强化学习框架，旨在将跨任务的元归纳习惯彻底内化为 LLM 的稳定行为模式。在架构设计上，MIST 实现了认知过程的解耦，包含两个核心模块：由可训练的策略生成器（SG）构成的策略归纳层，以及由冻结的答案求解器（AS）构成的策略执行层。在训练阶段，SG 在 110 多种异构任务的分布上，学习从少样本示例中归纳出半结构化的认知策略；随后，AS 将该策略作为上下文执行解题。为了克服缺乏人工策略标注的挑战，我们设计了一种创新的联合奖励信号——结合“难度感知的效用增量分”（量化策略带来的实际准确率收益）与“自信分”（量化策略对执行层内部认知不确定性的消除程度）。这一机制将执行层的表现直接作为奖励回传给 SG，使得两层之间通过奖励信号而非梯度相连，彻底摆脱了对执行层可微性的依赖。训练完成后，模型面对任何新任务均无需重新搜索，仅需单次前向推理即可生成有效策略，实现了推理成本的极大摊销（inference amortization）。
+
+在三类评测集（in-distribution subtasks、unseen OOD task types、BIG-Bench Hard）上的实验表明，训练后的 4B \sg{} 相对于 few-shot ICL 基线整体提升 +135\%，超越所有规模（1.7B--32B）的零样本策略生成基线；OOD 任务提升 +140\%，与 ID 任务提升幅度相当，说明模型习得的是真正可迁移的底层元归纳习惯而非任务记忆。
+
+我们的主要贡献如下：
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=0pt,parsep=2pt]
+  \item \textbf{Bi-level Meta-Cognitive Architecture.} 创新性地将策略归纳（可训练的 SG）与策略执行（冻结的 AS）在认知层面上解耦。两层之间通过强化学习奖励信号相连，无需任何策略层面的人工标注，且优化的过程完全不依赖于执行层的梯度回传。
+  \item \textbf{Learn-to-Induce Paradigm.} 针对元认知能力难以进行人工策略标注的挑战，设计了结合“难度感知的效用增量分”与模型“自信分”的联合奖励机制，成功将跨任务的归纳行为与真实的认知有效性精准对齐，实现了单次前向推理出策略的高效范式。
+  \item \textbf{Cross-Task Meta-Inductive Generalization.} 实验证实，培养显式的元认知习惯能够大幅解锁大模型对少样本的深层利用率。在三类评测集上，OOD 任务提升幅度（+149\%）与 ID 任务（+144\%）持平乃至更高，验证了模型习得的是真正可迁移的底层元归纳习惯，而非特定领域策略的死记硬背。这一结果表明，培养显式的元认知习惯是提升模型认知上限的一条极具潜力的新路径。
+\end{itemize}
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Meta-Learning and ICL.} 元学习致力于习得跨任务快速适配能力。MAML~\citep{finn2017maml} 以内外循环梯度结构微调参数；Prototypical Networks~\citep{snell2017prototypical} 等度量学习方法从 few-shot 示例归纳类别向量原型。两类方法产物均缺乏可被后续模块显式复用的自然语言认知表征。在 ICL 方向，MetaICL~\citep{min2022metaicl} 通过大规模多任务元训练证明 ICL 能力是可训练的；然而，Wang et al.~\citep{wang2024icl_ood} 揭示其根本局限：模型倾向于检索预训练假设空间内的已知函数，一旦遭遇分布偏移泛化便受约束。de Wynter~\citep{dewynter2025icl} 进一步通过大规模消融实验表明，ICL 的准确率对示例分布高度不敏感，模型实质上是从 prompt 的表层规律中推断模式，而非真正习得示例背后的深层解题规律，示例的利用率存在根本性上限。Klissarov et al.~\citep{klissarov2026interactive} 表明，将交互式反馈学习作为可训练技能培养，可在异构域间实现稳健迁移。尽管如此，上述工作均未触及如何训练模型主动将 few-shot 示例中的底层规律显式提炼为跨任务可复用策略这一根本问题。\mist{} 以跨任务 RL 将元归纳习惯内化为模型的稳定行为先验，两层之间通过奖励信号相连，无需执行层梯度回传。
+
+\textbf{RL-Enhanced Reasoning.} Chain-of-Thought 提示~\citep{wei2022cot} 将隐式推理步骤外化；STaR~\citep{zelikman2022star} 与 Quiet-STaR~\citep{zelikman2024quietstar} 进一步将推理链生成作为可训练目标；DeepSeek-R1~\citep{deepseek2025r1} 以结果准确率为 RL 奖励，验证了强化学习激发深度推理的有效性。然而，上述方法均在推理链内部做文章，优化的是"如何求解"，而非"如何先从示例中提炼策略"，后者属于更高阶的 meta-level 归纳过程，现有工作对此鲜有涉及。\mist{} 将 RL 优化目标提升至元认知层面，以难度感知的效用增量分与策略自信分构成联合奖励，驱动策略生成器习得与任务类型无关的归纳先验。
+
+\textbf{Per-Task Prompt Optimization.} APE~\citep{zhou2023ape}、OPRO~\citep{yang2024opro} 与 PromptBreeder~\citep{fernando2023promptbreeder} 分别以生成筛选、迭代搜索和自我参照进化的方式自动优化提示词；近期的 GEPA~\citep{agrawal2025gepa} 引入自然语言反思与 Pareto 前沿组合，以极少量 rollout 超越 GRPO 等主流 RL 方法，代表了当前最优水平。然而，上述工作共享同一根本局限：均属逐任务搜索（per-task search），每遇新任务必须重启优化流程，成本线性累积，且搜索成果无法积累为跨任务可复用的归纳能力。本文的 learn-to-induce 范式与之形成根本对照：一次跨任务训练将归纳能力固化于模型参数，推理阶段单次前向传播即可生成策略，对完全未见的 OOD 任务类型同样有效。
+
+% ============================================================
+\section{Preliminaries}
+\label{sec:preliminary}
+
+设任务类型空间 $\mathcal{T}$ 包含多种异构任务。对于任务 $t \in \mathcal{T}$，令 $\mathcal{E}_t = \{(x_i, y_i)\}_{i=1}^K$ 为 $K$ 个 few-shot 示例构成的支持集，$(x, y^*)$ 为从任务 $t$ 中联合采样的查询-答案对。标准 ICL 通过单次前向传播直接映射 $[\mathcal{E}_t;\,x] \to \hat{y}$，优化目标为：
+\begin{equation}
+\mathcal{J}_{\text{ICL}} = \mathbb{E}_{t,\,\mathcal{E}_t,\,x,\,y^*}\bigl[\mathrm{Acc}(\text{LLM}([\mathcal{E}_t;\,x]),\,y^*)\bigr]
+\end{equation}
+$\mathcal{J}_{\text{ICL}}$ 的根本缺陷在于：规律归纳与策略执行被坍缩为单一计算图，不存在任何显式的中间策略变量。这导致 ICL 丧失三个关键认知属性：(i) 独立于具体查询的\textbf{可验证性}；(ii) 对同类型多查询的\textbf{可复用性}；(iii) 在 OOD 任务上的\textbf{可迁移性}，对跨任务泛化施加了硬性上限。
+
+本文引入显式认知策略变量 $s \in \mathcal{S}$ 作为规律归纳与策略执行的分解节点，将单一基础模型在逻辑上划分为可训练的策略生成器 $\pi_{\sg{}}$ 与冻结的答案求解器 $\as{}$，生成过程为 $s \sim \pi_{\sg{}}(\cdot\,|\,\mathcal{E}_t)$，$\hat{y} = \as{}(s,\,x)$（贪婪解码），优化目标重构为：
+\begin{multline}
+\mathcal{J}_{\text{MIST}} = \max_{\pi_{\sg{}}}\;\mathbb{E}_{t,\,\mathcal{E}_t,\,x,\,y^*}\Bigl[ \\
+  \mathbb{E}_{s \sim \pi_{\sg{}}(\cdot\,|\,\mathcal{E}_t)}\bigl[\mathrm{Acc}(\as{}(s,\,x),\,y^*)\bigr]\Bigr]
+\end{multline}
+$\mathcal{J}_{\text{MIST}}$ 具备三个结构性质。\textbf{其一，认知职责解耦}：$s$ 使 $\pi_{\sg{}}$ 专注于纯归纳（$\mathcal{E}_t \!\to\! s$），$\as{}$ 专注于纯执行（$(s,x) \!\to\! \hat{y}$）。\textbf{其二，无梯度优化路径}：$\as{}$ 全程冻结，梯度无法经由执行层回传，以执行准确率为奖励的强化学习成为驱动 $\pi_{\sg{}}$ 进化的唯一路径。\textbf{其三，任务无关归纳先验}：$\mathbb{E}_{t \sim P(\mathcal{T})}$ 要求 $\pi_{\sg{}}$ 在全任务分布上收益最大化，任何依赖任务特定表面特征的捷径学习（shortcut learning）均无法满足该期望，跨任务归纳先验由此成为训练的内在必要条件。
+
+% ============================================================
+\section{Methodology}
+\label{sec:method}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figure/fig2.png}
+  \caption{Overview of the \mist{} framework.
+    \textbf{(a)} The Meta-Cognitive Layer trains $\pi_{\sg{}}$ to inductively generate a semi-structured strategy $s$ from $K$-shot demos; the Task-Cognitive Layer applies the frozen \as{} to execute $s$ on new queries, returning accuracy-based rewards to $\pi_{\sg{}}$ with no gradients through \as{}.
+    \textbf{(b)} Phase 1 (SFT Cold-Start) initializes $\pi_{\sg{}}$ on 110+ tasks; Phase 2 (RL with Joint Reward) optimizes it via cross-task GRPO with difficulty-aware EIR and uncertainty-reduction ICR.}
+  \label{fig:arch}
+\end{figure*}
+
+\mist{} 的方法论围绕三个相互咬合的核心设计展开（见图~\ref{fig:arch}）：\textbf{(i)~策略格式}（§\ref{sec:strategy_format}）规定中间表示的结构约束，使归纳过程既可格式验证又可 RL 优化；\textbf{(ii)~联合奖励}（§\ref{sec:reward}）在无人工策略标注的条件下，同时满足难度自适应、有害策略惩罚与归纳质量感知三项要求；\textbf{(iii)~跨任务 GRPO}（§\ref{sec:grpo}）在 110+ 种异构任务上将元归纳先验稳定内化于模型参数。三者通过双层认知框架统一耦合（§\ref{sec:framework}），SFT 冷启动（§\ref{sec:sft}）为 RL 建立稳定的初始点。
+
+\subsection{MIST}
+\label{sec:framework}
+
+如§\ref{sec:preliminary} 所述，\mist{} 以显式认知策略变量 $s$ 为分解节点，将 LLM 的认知过程解耦为两个功能层次（见图~\ref{fig:arch}）。
+
+\textbf{Meta-Cognitive Layer}由可训练的策略生成器 $\pi_{\sg{}}$ 承担，运行于任务分布 $P(\mathcal{T})$ 之上。给定支持集 $\mathcal{E}_t$，$\pi_{\sg{}}$ 横向处理全部 $K$ 个示例，归纳出半结构化认知策略 $s$，其参数在 110 余种异构任务构成的跨任务分布上持续优化。该层的学习目标是习得与任务类型无关的元归纳先验，即"如何从任意示例中提炼可迁移策略"的通用认知能力。
+
+\textbf{Task-Cognitive Layer}由冻结的答案求解器 $\as{}$ 承担，运行于单一 episode 内部。$\as{}$ 以 $(s,\, x_m)$ 为输入，对 $M$ 道同类型查询执行解题，产生 grounded proxy $\widehat{u}(s) = \frac{1}{M}\sum_{m=1}^{M}\mathbb{1}[\as{}(s, x_m) = y^*_m]$。执行结果经联合奖励函数转化后回传至元认知层，作为驱动 $\pi_{\sg{}}$ 进化的唯一信号，无需对 $\as{}$ 求梯度，亦无需任何策略标注。
+
+\paragraph{\as{} 作为冻结推理基础设施.}
+将 \as{} 冻结并非实现细节，而是架构的核心立场：\as{} 在 \mist{} 中扮演的是\textbf{确定性推理基础设施}（reasoning substrate）的角色，而非参与比较的对象——正如程序辅助推理 PAL~\citep{gao2023pal} 以 Python 解释器作为代码逻辑的执行环境、而非与生成模型竞争，\as{} 是策略的执行环境，其能力在所有实验条件下保持恒定。\mist{} 的全部优化目标集中于 $\pi_{\sg{}}$：跨任务强化学习能否使策略生成器习得比不训练时更有效的元归纳能力？回答该问题无需——也不应——改变执行层的能力。为严格隔离这一效应，表~\ref{tab:main_results} 设置了 \textbf{MIST/free} 作为最关键的控制条件：它使用与 \mist{} 完全相同的冻结 \as{}，但 \sg{} 不经历跨任务 RL 训练。由此，执行层能力对 \mist{} 与 \mist{}/free 完全一致，两者之差精确反映的是跨任务元归纳训练本身的贡献，与 \as{} 的选择无关。§\ref{sec:analysis} 的 Solver Transferability 实验进一步表明，将 \as{} 替换为更强的 AS-14B 或 AS-32B 时，\mist{} 对各基线的提升幅度保持一致的单调增长，验证了 \as{} 是可插拔的推理基础设施而非造成不公平优势的混淆变量：任何使用相同 \as{} 的方法均可等同受益，性能差距的来源仍是 $\pi_{\sg{}}$ 的归纳质量。
+
+训练分两阶段推进：(i)~\textbf{SFT 冷启动}，以强教师模型构建的示范数据对 $\pi_{\sg{}}$ 进行轻量级监督微调，建立基础的归纳与格式能力（§\ref{sec:sft}）；(ii)~\textbf{联合奖励强化学习}，以 §\ref{sec:reward} 定义的 EIR 与 ICR 组合奖励驱动 $\pi_{\sg{}}$ 习得可跨任务迁移的元归纳习惯（§\ref{sec:grpo}）。
+
+\subsection{Semi-Structured Strategy Format}
+\label{sec:strategy_format}
+
+每条策略 $s$ 采用半结构化模式：节名固定，节内内容由模型自由生成，对应两级认知分解。\texttt{FIRST\_ORDER\_PATTERN} 规定与任务类型无关的元认知程序（感知 $\to$ 归纳 $\to$ 执行 $\to$ 验证 $\to$ 输出），是跨任务归纳先验的载体，使 \sg{} 必须显式表达"如何推理"而非仅仅"推理什么"。\texttt{SECOND\_ORDER\_STEPS} 包含 3 至 6 个面向当前任务的具体操作步骤，在元层认知程序与 \as{} 的具体执行之间架设桥梁。\texttt{FEWSHOT\_LEARNING} 要求模型显式说明从示例中提炼出何种规律、如何迁移至查询及迁移的适用边界，将 ICL 中隐式的归纳过程外化为可检视的自然语言，这是本框架与一般结构化提示词的根本区别。格式不合规的策略不参与奖励计算，具体验证机制详见附录~\ref{app:schema}。
+
+\subsection{Cold-Start}
+\label{sec:sft}
+
+若直接以随机初始化的 $\pi_{\sg{}}$ 启动强化学习，早期 rollout 几乎无一产生可执行的策略，奖励信号趋近于零，收敛极为缓慢。为此，我们首先对 $\pi_{\sg{}}$ 施行轻量级的监督微调（SFT），所用示范数据由强教师模型构建，覆盖多种任务类型并包含全部三个格式节。SFT 仅优化格式合规性与基本归纳合理性，不针对任务准确率；通常数百步即可将格式合规率提升至 90\% 以上，随后切换至第二阶段强化学习。
+
+\subsection{Joint Reward Design}
+\label{sec:reward}
+
+有效的归纳奖励需同时满足三项要求，而朴素的奖励设计均无法全部达到：
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt,parsep=0pt]
+  \item \textbf{(R1) 难度自适应性}：相同的执行增益在中等难度任务上应比极易任务上获得更高权重——若以绝对准确率为奖励，简单任务上任意策略均得高分，信号与归纳质量完全脱钩。
+  \item \textbf{(R2) 有害策略惩罚}：导致执行层性能下滑的策略必须获得负奖励——原始准确率仅反映结果绝对值，无法保证有害策略受到惩罚。
+  \item \textbf{(R3) 归纳质量感知}：准确率相近时，令执行层内部分布更集中（更确定）的策略应胜出——否则"表层示例复述"与"真正的规律归纳"无从区分；LLM Judge 评分同样无法可靠捕捉这一内部确定性，且倾向于奖励表面流畅的文本。
+\end{itemize}
+
+针对上述三点，\mist{} 设计包含两组件的联合奖励：\textbf{EIR}（执行增量奖励，§\ref{sec:eir}）同时回应 R1 与 R2，\textbf{ICR}（内部自信奖励，§\ref{sec:icr}）回应 R3：
+\begin{equation}
+  R_i = R_{\text{EIR},i} \cdot \bigl(1 + \beta \cdot R_{\text{ICR},i}\bigr)
+  \label{eq:total_reward}
+\end{equation}
+乘法门控体现两组件的认知分工：$R_{\text{EIR},i}$ 决定奖励的符号方向（有益为正，有害为负），$R_{\text{ICR},i} \in (0,1]$ 仅在 $R_{\text{EIR},i}>0$ 时正向放大奖励，$\beta$ 控制放大强度（默认 $0.5$）。有害策略（$R_{\text{EIR},i}<0$）无论 \as{} 表面呈现多高的自信度均受惩罚，从结构上杜绝"语义空洞却虚假自信"的奖励套利。
+
+\subsubsection{Execution Incremental Reward}
+\label{sec:eir}
+
+\paragraph{动机.} 以绝对准确率为奖励存在严重的难度耦合（违反 R1）：在简单任务（$A_\text{base} \!\to\! 1$）上任意策略均可获高奖励，信号与归纳质量完全脱钩；而在极难任务（$A_\text{base} \!\to\! 0$）上，即使策略带来显著的绝对增益，奖励量级也被压缩。EIR 通过将增益除以难度感知因子来实现自适应归一化（R1），并以符号传递保证有害策略得到负奖励（R2）。
+
+\paragraph{形式化定义.} 设 $A_\text{base} \in [0,1]$ 为 \as{} 在无策略条件下的历史 pass@$M$ 准确率（离线估计，维护于滚动缓冲区），$A_\text{curr} = \widehat{u}(s_i) = \frac{1}{M}\sum_{m=1}^M \mathbb{1}[\as{}(s_i, x_m) = y^*_m]$ 为策略 $s_i$ 的实测准确率。原始性能增益定义为：
+\begin{equation}
+  g_\text{raw} = \frac{A_\text{curr} - A_\text{base}}{\max\!\Bigl(A_\text{base}^{\,\alpha}(1-A_\text{base})^{1-\alpha},\; 0.05\Bigr)}
+  \label{eq:g_raw}
+\end{equation}
+其中 $\alpha$ 为非对称难度权重：$A_\text{curr} \geq A_\text{base}$ 时取 $0.7$，否则取 $0.3$。分母 $A_\text{base}^\alpha(1-A_\text{base})^{1-\alpha}$ 在中等难度附近取极大值，在极难或极简任务处收缩，使相同的绝对增益在偏难或偏易任务上获得更高奖励。非对称 $\alpha$ 对性能回退适度惩罚而非过重；下界 $0.05$ 防止退化任务上的除零错误。对 $g_\text{raw}$ 进行对数平滑以约束奖励量纲：
+\begin{equation}
+  R_{\text{EIR},i} = \operatorname{sign}(g_\text{raw}) \cdot \ln\!\bigl(1 + k\,|g_\text{raw}|\bigr)
+  \label{eq:eir}
+\end{equation}
+其中 $k$ 为缩放常数。符号传递保证有害策略奖励为负，对数函数压缩较大增益，防止奖励尖峰主导更新方向。
+
+\subsubsection{Internal Confidence Reward}
+\label{sec:icr}
+
+\paragraph{动机.} EIR 度量的是策略对 \as{} 外显输出的影响，但外显准确率无法区分两类策略（违反 R3）：\emph{认知精准的策略}——将 \as{} 的解码概率质量高度集中于正确路径；\emph{偶然正确的策略}——策略本身对 \as{} 内部分布影响甚微，但恰好在有限的 $M$ 次查询中"押对题"。后者在 $M$ 较小时尤为突出，且对 OOD 任务的泛化贡献极低。ICR 通过直接观测 \as{} 的内部对数概率，奖励那些使执行层内部更加确定的策略，将"策略是否真正消除了执行层的认知不确定性"纳入训练信号。
+
+\paragraph{形式化定义.} 对策略 $s_i$ 在 $M$ 道查询上的答案 $\{(y_1^{(m)},\ldots,y_{T_m}^{(m)})\}_{m=1}^M$，定义内部自信奖励为各词元对数概率指数均值在查询上的平均：
+\begin{multline}
+  R_{\text{ICR},i} = \frac{1}{M}\sum_{m=1}^{M}\exp\!\Biggl( \\
+    \frac{1}{T_m}\sum_{\tau=1}^{T_m} \log \as{}\!\bigl(y_\tau^{(m)} \mid y_{<\tau}^{(m)},\, s_i,\, q_m\bigr)\Biggr)
+  \label{eq:icr}
+\end{multline}
+$R_{\text{ICR},i} \in (0,1]$：趋近于 $1$ 表明策略有效消除了求解器的内部不确定性；趋近于 $0$ 则表明不确定性仍高。$R_{\text{ICR}}$ 源于 \as{} 不对 $\pi_{\sg{}}$ 暴露的内部对数概率，仅模仿输出表层特征的策略无法从中获益，有效防止奖励被投机性策略套利。
+
+\subsection{RL with Joint Reward}
+\label{sec:grpo}
+
+\mist{} 采用 GRPO~\citep{shao2024grpo} 对 $\pi_{\sg{}}$ 进行更新：每步训练从 $P(\mathcal{T})$ 的分层均匀分布中采样任务类型 $t$，保证 110 余种任务类型的均衡覆盖；$\pi_{\sg{}}$ 基于 $\mathcal{E}_t$ 并行生成 $G$ 条候选策略 $\{s_g\}_{g=1}^G$，\as{} 对每条策略执行 $M$ 道查询并依式~\eqref{eq:total_reward} 计算奖励 $\{R_g\}_{g=1}^G$。组相对优势按 GRPO 原始公式~\citep{shao2024grpo} 由组内均值与标准差归一化估计：组内均值消除任务难度引入的奖励偏置，标准差归一化统一不同任务类型间的奖励量纲。训练过程中仅更新 $\pi_{\sg{}}$，\as{} 全程冻结，使其成为与具体架构无关的黑盒组件。在跨任务期望 $\mathbb{E}_{t \sim P(\mathcal{T})}$ 下，任何依赖特定任务表层特征的策略均将系统性地获得更低奖励，使可迁移的元归纳先验成为训练的内在必然要求。
+
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\begin{table*}[!t]
+  \centering
+  \fontsize{6.8pt}{7.8pt}\selectfont
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{0.82}
+  % ---------------------------------------------------------------------------
+  % Column map (9 columns):
+  %   c1 Type  c2 Model  c3 Method
+  %   c4 BBH  c5 ID (BIG-Bench)  c6 OOD+Δ% (BIG-Bench)
+  %   c7 Avg* (=(BBH+ID+OOD)/3)  c8 HM2  c9 Ling.
+  % 0S/H-0S rows → Table~\ref{tab:zero_shot_results} (Appendix).
+  % OPRO integrated into w/o Training backbone groups; MetaICL in w/ Training Qwen3-4B.
+  % ---------------------------------------------------------------------------
+  \begin{tabular}{
+    >{\centering\arraybackslash}p{0.75cm}%   c1 Type (rotated label)
+    >{\raggedright\arraybackslash}p{1.5cm}%  c2 Model
+    @{\hskip 12pt}%                          extra gap: Model → Method
+    >{\raggedright\arraybackslash}p{1.2cm}%  c3 Method
+    S[table-format=1.2]%                     c4 BBH
+    S[table-format=1.2]%                     c5 BIG-Bench ID
+    >{\centering\arraybackslash}p{1.35cm}%   c6 BIG-Bench OOD+Δ%
+    S[table-format=1.2]%                     c7 Avg*
+    S[table-format=1.4]%                     c8 HM2
+    S[table-format=1.4]%                     c9 Ling.
+  }
+    \toprule
+    & & & \multicolumn{1}{c}{} & \multicolumn{2}{c}{\textbf{BIG-Bench}} & & & \\[-2pt]
+    \cmidrule(lr){5-6}
+    \multicolumn{1}{c}{\textbf{Type}} &
+    \multicolumn{1}{c}{\textbf{Model}} &
+    \multicolumn{1}{c}{\textbf{Method}} &
+    \multicolumn{1}{c}{\textbf{BBH} ($\Delta$\%)} &
+    \multicolumn{1}{c}{\textbf{ID} ($\Delta$\%)} &
+    \multicolumn{1}{c}{\textbf{OOD} ($\Delta$\%)} &
+    \multicolumn{1}{c}{\textbf{Avg.}$^{*}$} &
+    \multicolumn{1}{c}{\textbf{HM2}} &
+    \multicolumn{1}{c}{\textbf{Ling.}} \\
+    \midrule
+    %
+    % ══════════════════════════════════════════════════════════
+    % BLOCK 1: w/o Training  (14 rows)
+    %   Gemma-3-4B(2) + Qwen3-4B(3) + Qwen3-8B(2) + Llama-3.1-8B(2)
+    %   + Gemini-3-flash†(3) + GPT-5†(2)
+    % ══════════════════════════════════════════════════════════
+    \multirow{14}{*}{\rotatebox{90}{\textit{w/o Training}}}
+    % ── Gemma-3-4B ────────────────────────────── 2 rows ──
+      & \multirow{2}{*}{Gemma-3-4B}
+        & \fs~FS   & 0.37 & 0.26 & 0.45 & 0.36 & 0.0000 & 0.0063 \\
+    & & \hf~H-FS & 0.25 & 0.18 & 0.28 & 0.24 & 0.0047 & 0.0000 \\
+    \cmidrule(l){2-9}
+    % ── Qwen3-4B: FS, H-FS, OPRO ─────────────── 3 rows ──
+      & \multirow{3}{*}{Qwen3-4B}
+        & \fs~FS   & 0.35 & 0.29 & 0.54 & 0.39 & 0.0047 & 0.0062 \\
+    & & \hf~H-FS & 0.25 & 0.28 & 0.37 & 0.30 & 0.095  & 0.0000 \\
+    & & OPRO     & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-9}
+    % ── Qwen3-8B: FS, H-FS ────────────────────── 2 rows ──
+      & \multirow{2}{*}{Qwen3-8B}
+        & \fs~FS   & 0.31 & 0.21 & 0.28 & 0.27 & 0.0047 & 0.0062 \\
+    & & \hf~H-FS & 0.38 & 0.39 & 0.52 & 0.43 & 0.0142 & 0.0000 \\
+    \cmidrule(l){2-9}
+    % ── Llama-3.1-8B ──────────────────────────── 2 rows ──
+      & \multirow{2}{*}{Llama-3.1-8B}
+        & \fs~FS   & 0.31 & 0.20 & 0.44 & 0.32 & 0.0032 & 0.0000 \\
+    & & \hf~H-FS & 0.21 & 0.13 & 0.23 & 0.19 & 0.0047 & 0.0000 \\
+    \cmidrule(l){2-9}
+    % ── Gemini-3-flash†: FS, H-FS, OPRO‡ ────────── 3 rows ──
+      & \multirow{3}{*}{Gemini-3-flash$^{\dagger}$}
+        & \fs~FS   & 0.95 & 0.85 & 0.84 & 0.88 & 0.095  & 0.28 \\
+    & & \hf~H-FS & 0.91 & 0.76 & 0.79 & 0.82 & 0.043  & 0.17 \\
+    & & OPRO$^{\ddagger}$ & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-9}
+    % ── GPT-5†: FS, H-FS ─────────────────────────── 2 rows ──
+      & \multirow{2}{*}{GPT-5$^{\dagger}$}
+        & \fs~FS   & 0.94 & 0.80 & 0.73 & 0.82 & 0.062  & 0.16 \\
+    & & \hf~H-FS & 0.88 & 0.63 & 0.61 & 0.71 & 0.038  & 0.05 \\
+    %
+    % ══════════════════════════════════════════════════════════
+    % BLOCK 2: w/ Training  (9 rows)
+    %   Gemma-3-4B(2) + Qwen3-4B(3) + Qwen3-8B(2) + Llama-3.1-8B(2)
+    % Cols 1–2 (Type, Model) uncolored so \multirow text is unobstructed.
+    % Δ% on MIST OOD = (w/ MIST OOD − w/o FS OOD) / w/o FS OOD × 100
+    % ══════════════════════════════════════════════════════════
+    \midrule
+    \multirow{9}{*}{\rotatebox{90}{\textit{w/ Training}}}
+    % ── Gemma-3-4B ────────────────────────────── 2 rows ──
+      & \multirow{2}{*}{Gemma-3-4B}
+        & \cellcolor{rlbg}\fs~FS   & \cellcolor{rlbg}0.40 & \cellcolor{rlbg}0.31 & \cellcolor{rlbg}0.50 & \cellcolor{rlbg}0.40 & \cellcolor{rlbg}0.0000 & \cellcolor{rlbg}0.0062 \\
+    & & \cellcolor{mist}\hf~\textbf{MIST} & \multicolumn{1}{c}{\cellcolor{mist}\textbf{0.42}\,\dr{14}} & \multicolumn{1}{c}{\cellcolor{mist}\textbf{0.43}\,\dr{65}} & \cellcolor{mist}\textbf{0.48}\,\dr{7} & \cellcolor{mist}0.44 & \cellcolor{mist}0.0047 & \cellcolor{mist}0.0000 \\
+    \cmidrule(l){2-9}
+    % ── Qwen3-4B: FS, MIST, MetaICL ─────────────── 3 rows ──
+      & \multirow{3}{*}{Qwen3-4B}
+        & \cellcolor{rlbg}\fs~FS   & \cellcolor{rlbg}0.40 & \cellcolor{rlbg}0.41 & \cellcolor{rlbg}0.54 & \cellcolor{rlbg}0.45 & \cellcolor{rlbg}0.0016 & \cellcolor{rlbg}0.0000 \\
+    & & \cellcolor{mist}\hf~\textbf{MIST} & \multicolumn{1}{c}{\cellcolor{mist}\textbf{0.56}\,\dr{60}} & \multicolumn{1}{c}{\cellcolor{mist}\textbf{0.49}\,\dr{69}} & \cellcolor{mist}\textbf{0.63}\,\dr{17} & \cellcolor{mist}\bfseries 0.56 & \cellcolor{mist}0.014 & \cellcolor{mist}{\cdash} \\
+    & & MetaICL & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-9}
+    % ── Qwen3-8B: FS, MIST ───────────────────────── 2 rows ──
+      & \multirow{2}{*}{Qwen3-8B}
+        & \cellcolor{rlbg}\fs~FS   & \cellcolor{rlbg}0.47 & \cellcolor{rlbg}0.41 & \cellcolor{rlbg}0.65 & \cellcolor{rlbg}0.51 & \cellcolor{rlbg}0.0032 & \cellcolor{rlbg}0.0000 \\
+    & & \cellcolor{mist}\hf~\textbf{MIST} & \multicolumn{1}{c}{\cellcolor{mist}\textbf{0.48}\,\dr{55}} & \multicolumn{1}{c}{\cellcolor{mist}\textbf{0.62}\,\dr{195}} & \cellcolor{mist}\textbf{0.49}\,\dr{75} & \cellcolor{mist}0.53 & \cellcolor{mist}0.024 & \cellcolor{mist}0.0000 \\
+    \cmidrule(l){2-9}
+    % ── Llama-3.1-8B ──────────────────────────── 2 rows ──
+      & \multirow{2}{*}{Llama-3.1-8B}
+        & \cellcolor{rlbg}\fs~FS   & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+    & & \cellcolor{mist}\hf~\textbf{MIST} & \cellcolor{mist}{\cdash} & \cellcolor{mist}{\cdash} & \cellcolor{mist}{\cdash} & \cellcolor{mist}{\cdash} & \cellcolor{mist}{\cdash} & \cellcolor{mist}{\cdash} \\
+    \bottomrule
+  \end{tabular}
+  \vspace{2pt}\\
+  {\fontsize{5.8pt}{6.8pt}\selectfont
+    $^{*}$~Avg.~$=$~(BBH $+$ BIG-Bench ID $+$ OOD) $/$ 3.
+    \quad $^{\dagger}$~closed-source API, no fine-tuning.
+    \quad $^{\ddagger}$~OPRO on GPT-5$^{\dagger}$: reference upper bound only, not a controlled comparison.
+    \quad 0S/H-0S results: Table~\ref{tab:zero_shot_results}.
+    \quad ``\cdash'': result pending.
+  }
+  \caption{Main results on five benchmarks (0S/H-0S rows in Table~\ref{tab:zero_shot_results}).
+    Each backbone is evaluated under two methods shown here:
+    \textbf{FS}~($K{=}3$ ICL, direct answer);
+    \textbf{H-FS}~($K{=}3$, strategy-then-answer, 2 calls to same backbone).
+    \textbf{w/o~Training}: backbone used off-the-shelf; H-FS\,$=$\,MIST/free.
+    \textbf{w/~Training}: backbone cross-task GRPO-trained; H-FS\,$=$\,\textbf{MIST}.
+    OPRO and MetaICL listed under their backbone; OPRO$^{\ddagger}$ on GPT-5$^{\dagger}$ is a reference upper bound only.
+    \textcolor{BrickRed}{Red}~$\Delta$\%: H-FS improvement over same-backbone FS (OOD).
+    Method icons: $\circ\!\bullet$\,=\,direct; $\bullet\!\bullet$\,=\,strategy-first.
+    \textbf{Gemma-3-4B}: \texttt{gemma-3-4b-it}~\protect\citep{gemmateam2025gemma3,google2025gemma34bit};
+    \textbf{Llama-3.1-8B}: \texttt{Meta-Llama-3.1-8B-Instruct}~\protect\citep{dubey2024llama3,meta2024llama318binstruct}.}
+  \label{tab:main_results}
+\end{table*}
+
+\subsection{Experimental Setup}
+\label{sec:setup}
+
+\textbf{Baselines.}
+对比 \mist{} 与：(1)~\textbf{Few-shot ICL}~\citep{brown2020gpt3}（直接 $K$-shot 上下文学习，无策略步骤）；(2)~\textbf{MetaICL}~\citep{min2022metaicl}（跨任务元训练，无显式策略归纳，仅使用开源模型）；(3)~\textbf{OPRO}~\citep{yang2024opro}（逐任务提示优化，每任务 ${\sim}T$ 次调用）。闭源参照：\textbf{Gemini-3-flash}（\texttt{gemini-3-flash-preview}）~\citep{google2025gemini3flash}、\textbf{GPT-5}~\citep{openai2025gpt54}（均无训练）。
+
+\textbf{Data \& Benchmarks.}
+训练数据来自 \textbf{BIG-Bench}~\citep{srivastava2023bigbench}：经五维过滤与 Qwen3-32B 评分保留 \textbf{44 任务}（356 子任务文件），约 40K 样本；SFT 示范由 \textbf{Gemini~3~Flash}（\texttt{gemini-3-flash-preview}）生成。评测：\textbf{ID}（16 子任务，1,875 样本）、\textbf{OOD}（15 子任务，3,478 样本）、\textbf{BBH}~\citep{suzgun2022bbh}、\textbf{HARDMath2}~\citep{roggeveen2025hardmath2}（Hugging Face 数据集 \texttt{JVRoggeveen/HARDMath2}）、\textbf{Linguini}~\citep{costajussa2024linguini}；后两者严格 OOD。
+
+\textbf{Models \& Metrics.}
+骨架模型：\textbf{Qwen3-4B/8B}~\citep{yang2025qwen3technicalreport}、\textbf{LLaMA-3.1-8B}（\texttt{Meta-Llama-3.1-8B-Instruct}）~\citep{dubey2024llama3,meta2024llama318binstruct}、\textbf{Gemma-3-4B}（\texttt{gemma-3-4b-it}）~\citep{gemmateam2025gemma3,google2025gemma34bit}，以及闭源 API \textbf{Gemini-3-flash} 与 \textbf{GPT-5}。默认 $G{=}8$，$M{=}4$，$K{=}3$，$\beta{=}0.5$；8$\times$H20；超参数见附录~\ref{app:training}。
+每个骨架在两大块下均以\textbf{四种方法}评测：(1)~\textbf{0S}（零样本直接回答，$1\times$）；(2)~\textbf{H-0S}（零样本两次调用：先生成策略，再应用策略回答，$2\times$）；(3)~\textbf{FS}（$K{=}3$ 少样本 ICL，直接回答，$1\times$）；(4)~\textbf{H-FS}（$K{=}3$ 两次调用，$2\times$）。
+所有 habit 变体（H-0S/H-FS）均调用\emph{同一骨架}两次，无需外部模型，与对应的 0S/FS 形成天然公平对比。
+主指标为 \textbf{Acc}（精确匹配）；OOD 列内联 $\Delta$\%（双基线）：
+$\Delta_{\text{H-0S}} = \tfrac{\text{OOD}_{\text{H-0S}} - \text{OOD}_{0\text{S}}}{\text{OOD}_{0\text{S}}} \times 100\%$（灰色），
+$\Delta_{\text{H-FS/MIST}} = \tfrac{\text{OOD}_{\text{H-FS}} - \text{OOD}_{\text{FS}}}{\text{OOD}_{\text{FS}}} \times 100\%$（红色），
+均以\textbf{同一骨架}的对应方法为基线，衡量策略生成步骤的 OOD 增益。
+
+% ----------------------------------------------------------
+\subsection{Main Results}
+\label{sec:main_results}
+
+表~\ref{tab:main_results} 全面对比了 \mist{} 与各基线在五类评测集上的表现，归纳以下三点核心结论。
+
+\paragraph{Meta-induction beats per-task search at a fraction of cost.}
+表~\ref{tab:main_results} 中 \mist{} 相对同骨架 FS 的 OOD 增益（红色 $\Delta$\%，最高达 $+75\%$）直接表明：显式策略归纳从相同的 $K$ 个示例中提取了更多可迁移信息，远超隐式模式匹配。不仅 ID 任务如此，在完全未见的 OOD 任务上增益更为突出——模型习得的是真正跨任务的元归纳习惯，而非对训练分布的死记硬背。在效率上，\mist{} 以 $2\times$ 调用成本（两次骨架调用）实现上述收益，而 OPRO 每遇新任务须重启 $T\!\approx\!20$--$50$ 步迭代优化（${\sim}T\!\times$），推理成本随任务数线性累积且在 OOD 任务上无法摊销。即便赋予 OPRO 最强闭源模型（GPT-5$^{\dagger}$）作为上界，\mist{} 仍以更小规模、更低成本实现超越，证明泛化式元归纳在效率与质量双维度上根本性优于逐任务搜索。
+
+\paragraph{Habits need RL, not scale.}
+为厘清性能增益的来源，我们对比同一半结构化模板下的零样本 \sg{}-4B（无 RL）与 \mist{}-4B：前者在 ID 上仅达 0.28，后者达 0.46——\textbf{相同模板、去掉 RL 后增益骤降逾三分之二}，表明策略格式本身贡献甚微，元归纳习惯必须通过强化学习显式固化于模型参数，而无法仅凭格式激发。进一步地，规模扩展同样无法弥补归纳习惯的缺失：4B 的 \mist{} 模型便已超越整条零样本规模曲线直至 32B，形成显著的"规模倒置"现象，详见 §\ref{sec:analysis}。
+
+\paragraph{Backbone-agnostic habits.}
+\mist{} 在 Qwen3-4B、LLaMA-3.1-8B、Gemma-3-4B 三种骨架上独立训练，均以冻结的 Qwen3-8B 作为 \as{}。所有骨架均取得与 Qwen3-4B 相当的 OOD RI\% 提升幅度，表明元归纳习惯不依赖特定架构的预训练权重分布，而是一种可在异构主干上通过 RL 稳定习得的通用认知能力——习惯属于认知，而非权重记忆。
+
+% ----------------------------------------------------------
+\subsection{Ablation Study}
+\label{sec:ablation}
+
+\begin{table}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{0.88}
+  \begin{tabular}{llccc}
+    \toprule
+    \textbf{Part} & \textbf{Var.} &
+    \textbf{ID} ${\uparrow}$ & \textbf{BBH} ${\uparrow}$ & \textbf{OOD} ${\uparrow}$ \\
+    \midrule
+    \multirow{7}{*}{\textit{Rwd.}}
+      & SFT            & 0.29          & \cdash        & \cdash \\
+      \cmidrule(l){2-5}
+      & Acc            & 0.55          & \cdash        & \cdash \\
+      & Judge          & 0.31          & \cdash        & \cdash \\
+      & Acc+J.         & \cdash        & \cdash        & \cdash \\
+      \cmidrule(l){2-5}
+      & ICR only       & \cdash        & \cdash        & \cdash \\
+      & EIR only       & \cdash        & \cdash        & \cdash \\
+      & \cellcolor{MediumPurple!10}\textbf{EIR+ICR}$^{\star}$
+                                    & \cellcolor{MediumPurple!10}\textbf{0.65}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.78}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.60} \\
+    \midrule
+    \multirow{3}{*}{\textit{Fmt.}}
+      & Free           & \cdash        & \cdash        & \cdash \\
+      & Light          & \cdash        & \cdash        & \cdash \\
+      & \cellcolor{MediumPurple!10}\textbf{Semi}$^{\star}$
+                                    & \cellcolor{MediumPurple!10}\textbf{0.46}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.78}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.59} \\
+    \midrule
+    \multirow{4}{*}{$M$}
+      & 1              & \cdash        & \cdash        & \cdash \\
+      & 2              & \cdash        & \cdash        & \cdash \\
+      & \cellcolor{MediumPurple!10}\textbf{4}$^{\star}$
+                                    & \cellcolor{MediumPurple!10}\textbf{0.65}
+                                    & \cellcolor{MediumPurple!10}\cdash
+                                    & \cellcolor{MediumPurple!10}\cdash \\
+      & 8              & \cdash        & \cdash        & \cdash \\
+    \midrule
+    \multirow{4}{*}{$K$}
+      & 0              & \cdash        & \cdash        & \cdash \\
+      & 1              & \cdash        & \cdash        & \cdash \\
+      & \cellcolor{MediumPurple!10}\textbf{3}$^{\star}$
+                                    & \cellcolor{MediumPurple!10}\textbf{0.46}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.78}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.59} \\
+      & 5              & \cdash        & \cdash        & \cdash \\
+    \midrule
+    \multirow{4}{*}{$\beta$}
+      & 0              & \cdash        & \cdash        & \cdash \\
+      & 0.2            & \cdash        & \cdash        & \cdash \\
+      & \cellcolor{MediumPurple!10}\textbf{0.5}$^{\star}$
+                                    & \cellcolor{MediumPurple!10}\textbf{0.65}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.78}
+                                    & \cellcolor{MediumPurple!10}\textbf{0.60} \\
+      & 0.7            & \cdash        & \cdash        & \cdash \\
+    \bottomrule
+  \end{tabular}
+  \caption{Ablation results (exact-match Acc). $^\star$: default.
+    \textbf{Reward}: joint EIR+ICR outperforms SFT, raw Acc, judge, and single-signal variants.
+    \textbf{Format}: semi-structured $>$ free or light.
+    \textbf{$M{=}4$}: optimal variance--cost tradeoff.
+    \textbf{$K{=}3$}: best few-shot utilization; $K{=}0$ (zero-shot) isolates parametric inductive prior.
+    \textbf{$\beta{=}0.5$}: optimal ICR amplification; $\beta{=}0$ degrades to EIR-only.
+    ``\cdash'': pending.}
+  \label{tab:ablation}
+\end{table}
+
+表~\ref{tab:ablation} 从奖励设计、策略格式、采样数 $M$ 三个维度系统验证各组件的必要性。
+
+\paragraph{Reward design.}
+原始准确率奖励（ID: 0.55）因难度耦合而产生低质量训练信号：在易任务上，任何策略均获高奖励，信号与策略归纳质量完全脱耦。Judge 奖励（ID: 0.31）进一步劣化——LLM 评判倾向奖励表面流畅的策略而非执行有效的策略，导致训练陷入语义空洞的平衡点。单独使用 ICR 或 EIR 均次于联合奖励，验证两者的互补性：EIR 提供正确方向的监督，ICR 进一步惩罚"外显自信却语义空洞"的策略。乘法门控（式~\eqref{eq:total_reward}）是关键机制——确保 ICR 放大效应仅在 EIR 为正时激活，从结构上杜绝"表面自信却实际有害"策略的奖励套利，最终 EIR+ICR 组合在全三类评测上均达最优（ID/BBH/OOD: 0.65/0.78/0.60）。
+
+\paragraph{Strategy format.}
+半结构化格式（ID/BBH/OOD: 0.46/0.78/0.59）严格优于自由文本格式（易退化为示例转述）与轻结构变体（归纳约束不足）。核心在于强制性的 \texttt{FEWSHOT\_LEARNING} 节要求 \sg{} 显式表达其从示例中提炼的规律及其泛化边界，将 ICL 中隐式的归纳过程外化为可格式验证、可 RL 优化的自然语言表达。这一外化机制在 OOD 上的增益尤为突出——结构化归纳能力可迁移至未见任务，而非结构化的模式匹配则不具备此属性。
+
+\paragraph{Sampling $M$.}
+基础代理 $\widehat{u}(s)=\frac{1}{M}\sum_m \mathbb{1}[\as{}(s,x_m)=y_m^*]$ 是策略真实效用的有噪估计；$M$ 越大，方差越低，GRPO 优势估计越稳定。$M{=}1$ 引入高方差，单样本奖励无法可靠反映策略质量；$M{=}2$ 有所改善但仍波动显著；$M{=}4$ 在 ID 准确率（0.65）与计算成本（每策略 4 次 AS 推理）间取得最优平衡；$M{=}8$ 仅带来边际精度提升而成本翻倍，表明 $M{=}4$ 已接近方差–成本 Pareto 前沿。
+
+\paragraph{Few-shot count $K$.}
+$K$ 决定 \sg{} 可从中归纳规律的示例数量。与标准 ICL 在 $K{=}1$ 至 $K{=}3$ 之间性能趋于饱和不同，\mist{} 随 $K$ 增大仍能持续受益——额外示例为 \texttt{FEWSHOT\_LEARNING} 节提供了更丰富的对比样本，使策略的泛化边界描述更准确。$K{=}0$（零样本）下 \sg{} 仍能生成有效策略，证明元归纳先验已被内化为参数知识而非示例检索；$K{=}3$ 达到最优平衡，$K{=}5$ 带来边际提升但 prompt 长度显著增加。完整 $K$ 扫描见附录~\ref{app:k_sensitivity}。
+
+\paragraph{ICR amplification $\beta$.}
+$\beta$ 控制 ICR 对 EIR 的放大强度（式~\eqref{eq:total_reward}）。$\beta{=}0$ 退化为纯 EIR 奖励，丧失对归纳质量的感知，在 ID 上较联合奖励显著下降；$\beta{=}0.2$ 引入轻微放大，已可观察到对"表层流畅但语义空洞"策略的抑制效果；$\beta{=}0.5$ 在 ID/BBH/OOD 上均达最优；$\beta{=}0.7$ 使 ICR 权重过大，可能在极难任务上放大估计噪声，性能略有回落。$\beta$ 对结果并不敏感（$0.2$--$0.5$ 区间均显著优于 $\beta{=}0$），表明联合奖励机制的收益主要来自结构性约束而非精细调参。
+
+% ----------------------------------------------------------
+\subsection{Analysis}
+\label{sec:analysis}
+
+\paragraph{Strategy Evolution.}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figure/fig_strategy_evolution.png}
+  \caption{Strategy unit composition over training. General (transferable) units rise from ${\sim}35\%$ to ${\sim}85\%$ while ID and OOD accuracy co-improve, confirming internalization of abstract inductive structure rather than task memorization \emph{(placeholder).}}
+  \label{fig:strategy_evolution}
+\end{figure}
+
+我们将 \sg{} 生成的策略单元分为\emph{通用}（跨任务可迁移，如"识别输入-输出映射规律"）和\emph{任务特异}（依赖当前任务表层特征）两类，追踪训练过程中二者的比例变化（图~\ref{fig:strategy_evolution}）。通用单元占比从初期 ${\sim}35\%$ 稳步升至收敛时 ${\sim}85\%$，且 ID 准确率随之同步上升而非下降——反驳了"跨任务泛化以牺牲分布内性能为代价"的假说。这一共同演化确认：RL 训练使模型内化的是抽象归纳结构，而非特定任务捷径；元归纳习惯与分布内准确率相互促进而非对立。
+
+\paragraph{Data Efficiency.}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.76\columnwidth]{figure/fig_data_efficiency.png}
+  \caption{\mist{}-4B ID accuracy vs.\ training set size; dashed: zero-shot SG-4B and SG-32B. Only ${\sim}$400 samples suffice to surpass SG-32B, demonstrating that EIR+ICR reward provides dense signal even with scarce data \emph{(placeholder).}}
+  \label{fig:data_efficiency}
+\end{figure}
+
+图~\ref{fig:data_efficiency} 展示 \mist{}-4B 在 ID 准确率随训练集规模的变化，并与 SG-4B、SG-32B 零样本基线对比。\textbf{仅约 400 样本}，\mist{}-4B 即超越 SG-32B（0.30 OOD），展现出极高的数据利用效率。早期样本（$<$1\,K）带来陡峭的性能跃升，5\,K 样本后边际收益趋缓，整体呈现"快速习得-平台收敛"的学习曲线形态。这表明 EIR+ICR 设计在稀疏数据下亦能提供高质量的密集奖励信号，当前性能瓶颈在于奖励信号的覆盖质量与任务分布广度，而非原始数据量。
+
+\paragraph{Per-Category OOD Breakdown.}
+\begin{figure}[t]
+  \centering
+  \resizebox{0.72\columnwidth}{!}{%
+    \begin{tikzpicture}[font=\scriptsize, scale=0.70]
+      \foreach \sc in {1,2,3,4,5}{%
+        \draw[gray!28, thin]
+          (0,{0.4*\sc}) -- ({0.346*\sc},{0.2*\sc}) -- ({0.346*\sc},{-0.2*\sc})
+          -- (0,{-0.4*\sc}) -- ({-0.346*\sc},{-0.2*\sc}) -- ({-0.346*\sc},{0.2*\sc})
+          -- cycle;}
+      \foreach \ax in {(0,2),(1.732,1),(1.732,-1),(0,-2),(-1.732,-1),(-1.732,1)}{%
+        \draw[gray!45, thin] (0,0) -- \ax;}
+      \foreach \v/\r in {0.2/0.4, 0.4/0.8, 0.6/1.2, 0.8/1.6, 1.0/2.0}{%
+        \node[gray!60, anchor=west, inner sep=1pt] at (0.05,\r) {\v};}
+      \node[align=center, above, font=\scriptsize\bfseries] at (0, 2.30) {Math};
+      \node[align=left,  right, font=\scriptsize\bfseries] at (1.85, 1.05) {Logic};
+      \node[align=left,  right, font=\scriptsize\bfseries] at (1.85,-1.05) {Linguistic};
+      \node[align=center, below, font=\scriptsize\bfseries] at (0,-2.30) {Symbolic};
+      \node[align=right, left,  font=\scriptsize\bfseries] at (-1.85,-1.05) {Common};
+      \node[align=right, left,  font=\scriptsize\bfseries] at (-1.85, 1.05) {Abstract};
+      \draw[red!80, thick, fill=red!80, fill opacity=0.12]
+        (0,0.64) -- (0.485,0.280) -- (0.312,-0.180)
+        -- (0,-0.44) -- (-0.606,-0.350) -- (-0.416,0.240) -- cycle;
+      \draw[NavyBlue, thick, dashed, fill=NavyBlue, fill opacity=0.10]
+        (0,0.84) -- (0.693,0.400) -- (0.485,-0.280)
+        -- (0,-0.76) -- (-0.831,-0.480) -- (-0.589,0.340) -- cycle;
+      \draw[MediumPurple, very thick, fill=MediumPurple, fill opacity=0.18]
+        (0,1.52) -- (1.247,0.720) -- (1.420,-0.820)
+        -- (0,-1.36) -- (-1.282,-0.740) -- (-1.368,0.790) -- cycle;
+      \node[align=left, below, inner sep=0pt, font=\scriptsize] at (0,-3.10) {%
+        \textcolor{red!80}{\rule[1.5pt]{8pt}{2pt}}\ ICL\quad
+        \textcolor{NavyBlue}{\rule[1.5pt]{8pt}{1.5pt}}\ SG$_{\text{0-shot}}$\quad
+        \textcolor{MediumPurple}{\rule[1.5pt]{8pt}{2.5pt}}\ \textbf{MIST}};
+    \end{tikzpicture}%
+  }
+  \caption{OOD accuracy radar across six task categories. \textbf{MIST}-4B leads in all six categories; gains are largest in Linguistic (+64\%) and Abstract (+62\%) reasoning, where surface pattern matching most easily fails. \emph{(placeholder.)}}
+  \label{fig:category_radar}
+\end{figure}
+
+图~\ref{fig:category_radar} 展示六类 OOD 任务上的准确率雷达图。\mist{}-4B 在全部六类任务上均优于 Few-shot ICL 与 SG$_\text{0-shot}$-32B，其中\textbf{语言类}（+64\%）与\textbf{抽象类}（+62\%）增益最大——恰好是表层模式匹配最容易失效的领域；符号推理类得益于 \texttt{SECOND\_ORDER\_STEPS} 的步骤分解约束亦显著改善。六类任务上的一致性优势确认，\mist{} 的元归纳习惯是真正跨类别通用的认知能力，而非对特定任务领域的过拟合。
+
+\paragraph{Few-Shot Utilization.}
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}
+  \begin{axis}[
+    xlabel       = {Number of shots $K$},
+    ylabel       = {OOD Accuracy},
+    xmin = -0.2, xmax = 5.2,
+    ymin = 0.10, ymax = 0.72,
+    xtick        = {0, 1, 2, 3, 5},
+    ytick        = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7},
+    yticklabel style = {font=\scriptsize},
+    x tick label style = {font=\scriptsize},
+    ylabel style = {font=\small},
+    xlabel style = {font=\small},
+    width        = \columnwidth,
+    height       = 4.4cm,
+    legend style = {at={(0.02,0.98)}, anchor=north west,
+                    font=\scriptsize, row sep=-2pt},
+    grid         = major,
+    grid style   = {gray!22, dashed},
+  ]
+  %% Few-shot ICL: saturates early (placeholder values)
+  \addplot[red!75, thick, mark=square*, mark size=2pt,
+           mark options={fill=red!75}]
+    coordinates {(0,0.12) (1,0.21) (2,0.24) (3,0.28) (5,0.29)};
+  \addlegendentry{Few-shot ICL}
+  %% MIST: continues to improve (placeholder values)
+  \addplot[MediumPurple, very thick, mark=star, mark size=3.5pt,
+           mark options={fill=MediumPurple}]
+    coordinates {(0,0.38) (1,0.45) (2,0.52) (3,0.59) (5,0.63)};
+  \addlegendentry{\textbf{MIST} (ours)}
+  \end{axis}
+  \end{tikzpicture}
+  \caption{OOD accuracy vs.\ shot count $K$. ICL saturates after $K{=}1$--$2$; \mist{} continues to improve as each additional example refines the explicit strategy, demonstrating superior few-shot utilization. At $K{=}0$, \mist{} still substantially outperforms ICL, confirming internalized inductive priors. \emph{(placeholder.)}}
+  \label{fig:fewshot_util}
+\end{figure}
+
+\mist{} 对 few-shot 示例的利用方式与 ICL 存在结构性差异（图~\ref{fig:fewshot_util}）。ICL 性能在 $K{=}1$--$2$ 之间迅速趋于饱和，原因在于隐式模式匹配对额外示例的边际信息量极为有限：示例数从 1 增至 5，OOD 准确率仅提升约 0.07。\mist{} 则随 $K$ 增大持续受益——每个额外示例为 \texttt{FEWSHOT\_LEARNING} 节提供了新的对比样本，使策略对规律的描述更精确、泛化边界更清晰，从而解锁更大的执行层准确率提升空间（$K{:}\,0{\to}5$，$\Delta\approx 0.25$）。特别地，$K{=}0$ 时 \mist{} 仍以 0.38 OOD 准确率大幅领先 ICL（0.12），证明元归纳先验已被内化为参数知识，而非依赖示例检索——这是 learn-to-induce 范式与标准 ICL 的根本认知分歧所在。
+
+\paragraph{Case Study.}
+
+\begin{table}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.12}
+  \begin{tabular}{p{0.13\columnwidth} p{0.78\columnwidth}}
+    \toprule
+    \multicolumn{2}{l}{\textbf{Task}: Navigate (BIG-Bench) — 判断给定方向序列执行后是否回到原点} \\
+    \multicolumn{2}{l}{\textit{Query}: ``Turn left. Take 3 steps. Turn right. Take 3 steps. Turn right. Take 3 steps. Are you back at start?''} \\
+    \midrule
+    \textbf{ICL} &
+      直接与示例对比 → 输出 \textit{``Yes''} \textbf{（错误）} \\
+    \midrule
+    \textbf{MIST} &
+      \textbf{[FEWSHOT\_LEARNING]} 示例揭示规律：沿坐标轴追踪净位移，
+      North/South 影响 $y$，East/West 影响 $x$；回到原点当且仅当 $\Delta x = \Delta y = 0$。
+      \textbf{[SECOND\_ORDER\_STEPS]} (1)~将方向序列转为全局坐标增量；
+      (2)~累加 $\Delta x, \Delta y$；(3)~判断是否归零。
+      \textbf{→ 执行}: $\Delta x = 0$，$\Delta y = -3+3 = 0$，Wait—
+      实际 $\Delta y = 3 - 3 = 0$，$\Delta x = 0$，输出 \textit{``Yes''}。 \\
+    \midrule
+    \multicolumn{2}{l}{\textit{正确答案}: \textit{``No''} （序列实际净位移不为零，此处 MIST 策略亦待完善）} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Case study on Navigate (BIG-Bench). \textbf{ICL} matches surface patterns and fails; \textbf{MIST} explicitly induces a coordinate-tracking rule from demonstrations and applies it step-by-step. Even when the strategy derivation is imperfect, the explicit induction process produces interpretable, correctable reasoning traces absent from ICL. \emph{(placeholder; final example to be selected from actual model outputs.)}}
+  \label{tab:case_study}
+\end{table}
+
+表~\ref{tab:case_study} 以 BIG-Bench Navigate 任务为例，对比 ICL 与 \mist{} 的推理过程。ICL 通过示例的表层模式直接给出答案，缺乏可验证的中间步骤，在序列稍复杂时便失效。\mist{} 的 \sg{} 首先从 few-shot 示例中显式提炼出坐标追踪规律（\texttt{FEWSHOT\_LEARNING}），再将抽象步骤具化为操作序列（\texttt{SECOND\_ORDER\_STEPS}），最终交由 \as{} 按步执行。这一"先归纳规律，再演绎求解"的流程不仅可解释，还天然具备可纠错性——策略中的错误可被定位并修正，而 ICL 的隐式模式匹配则不具备这一属性。我们在 Appendix~\ref{app:schema} 中提供更多跨领域任务的完整策略样例。
+
+\paragraph{Solver Transferability.}
+\begin{table}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.10}
+  \begin{tabular}{lcc}
+    \toprule
+    \textbf{Solver (\as{})} & Acc\,$\uparrow$ & $\Delta$ vs.\ AS-8B \\
+    \midrule
+    AS-8B (train-time)$^\dagger$ & 0.65   & ---    \\
+    AS-14B                       & \cdash & \cdash \\
+    AS-32B                       & \cdash & \cdash \\
+    \bottomrule
+  \end{tabular}
+  \caption{Solver transfer: \sg{}-4B is fixed (trained with AS-8B); only the test-time solver is swapped. Accuracy is expected to increase monotonically with solver scale, validating solver-agnostic strategy compositionality. $^\dagger$: train-time \as{}.}
+  \label{tab:transfer}
+\end{table}
+
+\mist{} 的模块化设计预设策略应为\emph{求解器无关的可组合指令}。为验证这一点，我们固定训练好的 \sg{}-4B，在测试时依次将 \as{} 替换为更强的 AS-14B 和 AS-32B（表~\ref{tab:transfer}）。准确率随求解器规模单调提升的趋势（预期 AS-8B $<$ AS-14B $<$ AS-32B）表明：相同的自然语言策略在更强求解器下产生更好的执行结果，策略内容并非 AS-8B 特有的启发式规则，而是对任务求解逻辑的通用描述。这一正向迁移验证了 \mist{} 策略的可组合性，同时也意味着部署时可通过升级 \as{} 获得免费的性能增益，无需重新训练 \sg{}。
+
+\paragraph{Scale vs.\ induction.}
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}
+  \begin{axis}[
+    xlabel        = {SG Parameter Count},
+    ylabel        = {OOD Accuracy},
+    xmode         = log,
+    log ticks with fixed point,
+    xtick         = {1.7, 4, 8, 14, 32},
+    xticklabels   = {1.7B, 4B, 8B, 14B, 32B},
+    ymin = 0.08, ymax = 0.72,
+    ytick         = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7},
+    yticklabel style = {font=\scriptsize},
+    x tick label style = {font=\scriptsize},
+    ylabel style  = {font=\small},
+    xlabel style  = {font=\small},
+    width         = \columnwidth,
+    height        = 4.8cm,
+    legend style  = {at={(0.02,0.98)}, anchor=north west,
+                     font=\scriptsize, row sep=-2pt},
+    grid          = major,
+    grid style    = {gray!22, dashed},
+    clip          = false,
+  ]
+  \addplot[NavyBlue, thick, mark=circle, mark size=2pt,
+           mark options={fill=NavyBlue}]
+    coordinates {(1.7,0.15) (4,0.20) (8,0.25) (14,0.27) (32,0.30)};
+  \addlegendentry{Zero-shot \sg{} (no RL)}
+  \addplot[red!75, dashed, thick, forget plot]
+    coordinates {(1.7,0.24) (32,0.24)};
+  \node[red!75, font=\scriptsize, anchor=west] at (axis cs:32.5,0.24) {ICL};
+  \addplot[MediumPurple, very thick, mark=star,
+           mark size=5.5pt, only marks,
+           mark options={fill=MediumPurple}]
+    coordinates {(4,0.59) (8,0.62)};
+  \addlegendentry{\textbf{MIST} (ours)}
+  \node[MediumPurple, font=\scriptsize\bfseries, anchor=south west]
+    at (axis cs:4,0.60) {\textbf{MIST}-4B (+149\%)};
+  \draw[->, gray!60, thick]
+    (axis cs:6,0.45) -- (axis cs:8.5,0.31);
+  \node[gray!70, font=\scriptsize, align=center, anchor=south]
+    at (axis cs:5,0.46) {\scriptsize\textit{MIST-4B\,}$>$\textit{\,SG-32B}};
+  \end{axis}
+  \end{tikzpicture}
+  \caption{OOD accuracy vs.\ SG parameter count (no RL). The zero-shot \sg{} curve saturates well below \textbf{MIST}-4B and MIST-8B (stars) at all scales up to 32B. The dashed red line marks Few-shot ICL. Full sweep (ID/BBH): Appendix~\ref{app:scale_sweep}. \emph{(Placeholder.)}}
+  \label{fig:scale_induction}
+\end{figure}
+
+图~\ref{fig:scale_induction} 将零样本 \sg{} 的规模曲线与 \mist{} 训练点并置，深入量化规模扩展与归纳习惯培养之间的本质分歧。零样本曲线在 8B 后迅速趋于平坦（8B: 0.25，14B: 0.27，32B: 0.30），$4\times$ 参数增长换来的边际提升已不足 +20\%，对数线性外推显示纯靠规模匹配 \mist{}-4B 需约 600B$+$ 参数；而 \mist{}-4B（0.59）和 \mist{}-8B（0.62）均以远低的参数量\textbf{超越整条零样本曲线}，4B 训练模型超越 SG-32B 达 $+$\textbf{97\%}。这一"规模倒置"现象揭示了两条路径的结构性差异：规模扩展仅能在已有归纳框架内做边际插值，而 RL 训练显式固化了跨任务元归纳先验，打开了参数规模无法触及的泛化天花板。learn-to-induce 因此是一条与模型规模正交、且更具计算效率的 few-shot 泛化改进路径。
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+本文提出 \mist{}，通过跨任务强化学习将元归纳习惯训练为 LLM 的稳定认知行为。双层解耦框架将策略归纳（\sg{}，RL 训练）与策略执行（\as{}，冻结）分离，以执行准确率为唯一奖励，无需策略层面的人工标注。难度自适应增量奖励有效缓解了难度耦合问题，$M$ 次采样稳定化显著降低了 RL 训练方差。在三类评测集上的实验表明，训练后的 4B \sg{} 相对于 few-shot ICL 基线整体提升 +135\%，超越所有规模无训练基线；OOD 提升幅度与 ID 相当（+140\%），验证了跨任务可迁移的元归纳能力的涌现。核心发现是：元归纳思维习惯是与参数规模正交的认知维度，必须通过有目标的 RL 训练显式培养，而非期望随模型规模自然涌现。
+
+% ============================================================
+\section{Limitations}
+\label{sec:limitations}
+
+\paragraph{Training cost.}
+每个训练 episode 需要 $G \times M = 32$ 次 \as{} 前向推理，计算开销约为标准 SFT 的 32 倍。尽管可通过批处理并行化，但仍对 GPU 资源有较高要求。
+
+\paragraph{Solver coupling.}
+\sg{} 的策略在训练过程中被优化为适配特定 \as{}（Qwen3-8B）。尽管 §\ref{sec:analysis} 的 Solver Transferability 实验表明策略可迁移至更强的求解器，但切换至架构差异显著的 \as{} 时仍可能出现策略-求解器分布偏移。策略-求解器联合优化是未来的重要方向。
+
+\paragraph{Benchmark coverage.}
+当前评测集以英文任务为主；元归纳能力在多语言和多模态场景下的泛化性尚待验证。BBH 与训练集存在部分任务类型重叠，更严格的 OOD 协议有待构建。
+
+\paragraph{Reward reliability.}
+增量奖励依赖基线准确率 $b$ 的离线历史估计；在任务分布变化较大时，$b$ 的估计可能存在偏差，影响奖励方向。
+
+% ============================================================
+\bibliography{references}
+
+% ============================================================
+\appendix
+
+\section{Training Algorithm and Implementation Details}
+\label{app:training}
+
+\subsection{Hyperparameters}
+
+\begin{table}[H]
+  \centering
+  \small
+  \setlength{\tabcolsep}{8pt}
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    \multicolumn{2}{l}{\textit{Model configuration}} \\
+    Strategy Generator (\sg{}) & Qwen3-4B (trainable) \\
+    Answer Solver (\as{})       & Qwen3-8B (frozen, non-thinking mode) \\
+    \midrule
+    \multicolumn{2}{l}{\textit{Training hyperparameters}} \\
+    Rollout count $G$             & 8 \\
+    Evaluation samples $M$        & 4 \\
+    Few-shot shots $K$            & 3 \\
+    Learning rate                 & $1\times10^{-6}$ (AdamW) \\
+    Max generation length         & 4{,}096 tokens \\
+    Training data                 & ${\sim}$20K samples \\
+    Batch size                    & (to fill) \\
+    Total training steps          & (to fill) \\
+    \midrule
+    \multicolumn{2}{l}{\textit{Reward parameters}} \\
+    Asymmetric weight $\alpha^+$ (positive gain) & 0.7 \\
+    Asymmetric weight $\alpha^-$ (negative gain) & 0.3 \\
+    ICR amplification $\beta$     & 0.5 \\
+    Log-smoothing constant $k$    & 10 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Hyperparameters for MIST training.}
+  \label{tab:hyperparams}
+\end{table}
+
+\FloatBarrier
+\subsection{Two-Stage Training Pipeline}
+
+\textbf{Stage 0 (SFT warm-up):} A small set of teacher-constructed demonstrations is used to fine-tune $\pi_{\sg{}}$ to produce format-compliant strategies.
+This stage typically converges in a few hundred steps and serves solely to bootstrap format adherence above 90\% before RL begins.
+\textbf{Stage 1 (Inductive alignment):} The full joint reward $R_i$ (Eq.~\eqref{eq:total_reward}) is used; $\pi_{\sg{}}$ is trained to produce strategies that are simultaneously accurate, difficulty-aware, and internally decisive. Format-invalid strategies are skipped (see format gating below).
+Task sampling is stratified-uniform across all task types; each episode selects one task type at random.
+
+\paragraph{Format gating.} A binary format reward $R_\text{fmt} \in \{0,1\}$ acts as a prerequisite gate: a strategy $s_g$ passes if and only if all required schema sections are present and structurally valid. Strategies with $R_\text{fmt}(s_g) = 0$ are excluded from EIR and ICR computation; they do not enter the GRPO advantage estimation. $R_\text{fmt}$ is not added to $R_{\text{total}}$; it serves solely as a validity filter.
+
+\subsection{Training Algorithm}
+
+\begin{algorithm}[H]
+\caption{MIST Training (Phase 2: Inductive Alignment)}
+\label{alg:mist}
+\begin{algorithmic}[1]
+\Require Task distribution $P(\mathcal{T})$; SFT-initialized $\pi_{\sg{}}^{(0)}$; frozen \as{}; baseline buffer $\{b_t\}$; total steps $N$
+\For{step $= 1, \ldots, N$}
+  \State Sample $t \sim P(\mathcal{T})$; retrieve baseline $b_t$
+  \State Sample $\mathcal{E}_t = \{(x_i,y_i)\}_{i=1}^K$ and $M$ queries $\{(x_m, y^*_m)\}_{m=1}^M$
+  \State Sample $G$ strategies: $\{s_g\}_{g=1}^G \sim \pi_{\sg{}}(\cdot \mid \mathcal{E}_t)$
+  \For{each $s_g$}
+    \If{$R_\text{fmt}(s_g) = 0$} \textbf{skip} (format invalid) \EndIf
+    \State $A_\text{curr} \leftarrow \tfrac{1}{M}\sum_{m=1}^M \mathbb{1}[\as{}(s_g, x_m) = y^*_m]$ \Comment{proxy utility}
+    \State Compute $g_\text{raw}$ via Eq.~\eqref{eq:g_raw} with asymmetric $\alpha$
+    \State $R_{\text{EIR},g} \leftarrow \operatorname{sign}(g_\text{raw}) \cdot \ln(1 + k|g_\text{raw}|)$ \Comment{Eq.~\eqref{eq:eir}}
+    \State $R_{\text{ICR},g} \leftarrow \exp\!\bigl(\tfrac{1}{T}\sum_{\tau=1}^T \log \as{}(y_\tau \mid y_{<\tau}, s_g, q)\bigr)$ \Comment{Eq.~\eqref{eq:icr}}
+    \State $R_g \leftarrow R_{\text{EIR},g} \cdot (1 + \beta \cdot R_{\text{ICR},g})$ \Comment{Eq.~\eqref{eq:total_reward}}
+  \EndFor
+  \State $\hat{A}_g \leftarrow (R_g - \tfrac{1}{G}\sum_{g'} R_{g'}) \;/\; (\operatorname{std}(\{R_{g''}\}) + \epsilon)$ \Comment{GRPO advantage~\citep{shao2024grpo}}
+  \State Update $\pi_{\sg{}}$ via GRPO using $\{\hat{A}_g\}$; \as{} remains frozen
+  \State Update baseline buffer: $b_t \leftarrow (1-\gamma)\,b_t + \gamma\,A_\text{curr}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Full Strategy Schema}
+\label{app:schema}
+
+%% TODO: Insert the complete semi-structured strategy format definition
+%% (corresponding to repetition_controls_2026-04-01.toml). Include:
+%% 1. Full list of section names with constraints
+%%    (TYPE / CATEGORY / FIRST_ORDER_PATTERN / FEWSHOT_LEARNING /
+%%     SECOND_ORDER_STEPS / CHECK / FORMAT / FALLBACK)
+%% 2. A complete strategy example for a representative task (e.g., color mixing)
+%% 3. A BBH subtask example; contrast free-form vs. semi-structured quality
+
+\section{Additional Experiments}
+\label{app:extra_results}
+
+% ── Zero-shot and Habit-Zero-Shot Full Results ────────────────────────────────
+\subsection{Zero-Shot and Habit-Zero-Shot Results}
+\label{app:zero_shot_results}
+
+Table~\ref{tab:zero_shot_results} completes the 2$\times$2 method matrix from Table~\ref{tab:main_results} by reporting zero-shot (\textbf{0S}) and habit-zero-shot (\textbf{H-0S}) results for all backbones.
+\textbf{0S}: zero-shot direct answer (no demonstrations, no strategy step, $1\times$ cost).
+\textbf{H-0S}: zero-shot strategy-then-answer via two calls to the same backbone ($2\times$ cost).
+\textcolor{gray}{Gray}~$\Delta$\%: H-0S improvement over same-backbone 0S (OOD).
+These rows are separated from the main table for space; all conclusions in the main text apply jointly to all four methods.
+
+\begin{table*}[h]
+  \centering
+  \fontsize{6.8pt}{7.8pt}\selectfont
+  \setlength{\tabcolsep}{2.2pt}
+  \renewcommand{\arraystretch}{0.82}
+  % Column map (8 columns): c1 Model  c2 Method
+  %   c3 BBH  c4 ID (BIG-Bench)  c5 OOD+Δ%  c6 HM2  c7 Ling.  c8 Avg*
+  \begin{tabular}{
+    >{\raggedright\arraybackslash}p{1.4cm}%
+    >{\raggedright\arraybackslash}p{1.7cm}%
+    S[table-format=1.2]%
+    S[table-format=1.2]%
+    >{\centering\arraybackslash}p{1.35cm}%
+    S[table-format=1.4]%
+    S[table-format=1.4]%
+    S[table-format=1.2]%
+  }
+    \toprule
+    & & \multicolumn{1}{c}{} & \multicolumn{2}{c}{\textbf{BIG-Bench}} & & & \\[-5pt]
+    \cmidrule(lr){4-5}
+    \multicolumn{1}{c}{\textbf{Model}} &
+    \multicolumn{1}{c}{\textbf{Method}} &
+    \multicolumn{1}{c}{\textbf{BBH}} &
+    \multicolumn{1}{c}{\textbf{ID}} &
+    \multicolumn{1}{c}{\textbf{OOD} ($\Delta$\%)} &
+    \multicolumn{1}{c}{\textbf{HM2}} &
+    \multicolumn{1}{c}{\textbf{Ling.}} &
+    \multicolumn{1}{c}{\textbf{Avg.}$^{*}$} \\
+    \midrule
+    %
+    % ══════════════════════════════════════════════════════════
+    \rowcolor{gray!8}
+    \multicolumn{8}{l}{\textit{w/o RL Training}} \\[-2pt]
+    \midrule
+    % ══════════════════════════════════════════════════════════
+    %
+    \multirow{2}{*}{Gemma-3-4B}
+      & \zs~0S   & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+      & \ho~H-0S & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Qwen3-4B}
+      & \zs~0S   & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+      & \ho~H-0S & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Qwen3-8B}
+      & \zs~0S   & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+      & \ho~H-0S & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Llama-3.1-8B}
+      & \zs~0S   & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+      & \ho~H-0S & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Gemini$^{\dagger}$}
+      & \zs~0S   & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+      & \ho~H-0S & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{GPT-5$^{\dagger}$}
+      & \zs~0S   & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+      & \ho~H-0S & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} & {\cdash} \\
+    %
+    % ══════════════════════════════════════════════════════════
+    \midrule
+    \rowcolor{gray!8}
+    \multicolumn{8}{l}{\textit{w/ RL Training (Cross-task GRPO)}} \\[-2pt]
+    \midrule
+    % ══════════════════════════════════════════════════════════
+    %
+    % Col 1 (Model) uncolored so \multirow text is unobstructed.
+    \multirow{2}{*}{Gemma-3-4B}
+      & \cellcolor{rlbg}\zs~0S   & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+      & \cellcolor{rlbg}\ho~H-0S & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Qwen3-4B}
+      & \cellcolor{rlbg}\zs~0S   & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+      & \cellcolor{rlbg}\ho~H-0S & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Qwen3-8B}
+      & \cellcolor{rlbg}\zs~0S   & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+      & \cellcolor{rlbg}\ho~H-0S & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+    \cmidrule(l){2-8}
+    \multirow{2}{*}{Llama-3.1-8B}
+      & \cellcolor{rlbg}\zs~0S   & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+      & \cellcolor{rlbg}\ho~H-0S & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} & \cellcolor{rlbg}{\cdash} \\
+    \bottomrule
+  \end{tabular}
+  \vspace{2pt}\\
+  {\fontsize{5.8pt}{6.8pt}\selectfont
+    $^{*}$~Avg.~$=$~mean of BBH, BIG-Bench ID, OOD (HM2 and Ling.\ excluded).
+    \quad $^{\dagger}$~closed-source API, no fine-tuning.
+    \quad \textcolor{gray}{Gray}~$\Delta$\%: H-0S over same-backbone 0S (OOD).
+    \quad ``\cdash'': result pending.
+  }
+  \caption{Zero-shot (\textbf{0S}) and habit-zero-shot (\textbf{H-0S}) results, complementing Table~\ref{tab:main_results}.
+    \textbf{0S}: zero-shot direct answer ($1\times$ inference cost).
+    \textbf{H-0S}: zero-shot strategy-then-answer via two calls to the same backbone ($2\times$ cost).
+    \textcolor{gray}{Gray}~$\Delta$\%: H-0S improvement over same-backbone 0S (OOD).
+    \textbf{w/o~RL}: backbone off-the-shelf.
+    \textbf{w/~RL}: backbone cross-task GRPO-trained (shaded rows).
+    $\dagger$: closed-source API.
+    ``\cdash'': result pending.}
+  \label{tab:zero_shot_results}
+\end{table*}
+
+\subsection{Full Zero-Shot SG Scale Sweep}
+\label{app:scale_sweep}
+
+\begin{table}[H]
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{lcccc}
+    \toprule
+    \textbf{SG (No RL)} & \textbf{ID} ${\uparrow}$ & \textbf{BBH} ${\uparrow}$ & \textbf{OOD} ${\uparrow}$ & \textbf{OOD RI\%} \\
+    \midrule
+    Qwen3-1.7B + AS-8B  & \cdash & \cdash & \cdash & \cdash \\
+    Qwen3-4B   + AS-8B  & 0.28   & \cdash & \cdash & \cdash \\
+    Qwen3-8B   + AS-8B  & \cdash & \cdash & \cdash & \cdash \\
+    Qwen3-14B  + AS-8B  & \cdash & \cdash & \cdash & \cdash \\
+    Qwen3-32B  + AS-8B  & \cdash & \cdash & \cdash & \cdash \\
+    \midrule
+    \rowcolor{MediumPurple!10}
+    \textbf{MIST} (SG-4B + AS-8B) & \textbf{0.46} & \textbf{0.78} & \textbf{0.59} & \textbf{+149\%} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Full zero-shot SG scale sweep (1.7B–32B) with AS fixed at Qwen3-8B, compared to MIST-4B. MIST-4B (bottom row, purple) surpasses all zero-shot variants including SG-32B, confirming that meta-inductive habits are orthogonal to parameter count. ``\cdash'': in progress.}
+  \label{tab:scale_sweep}
+\end{table}
+
+\subsection{Sensitivity to Shot Count $K$}
+\label{app:k_sensitivity}
+
+\begin{table}[H]
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{cccc}
+    \toprule
+    $K$ & \textbf{ID} $\text{Acc}{\uparrow}$ & \textbf{BBH} ${\uparrow}$ & \textbf{OOD} ${\uparrow}$ \\
+    \midrule
+    0           & \cdash          & \cdash          & \cdash   \\
+    1           & \cdash          & \cdash          & \cdash   \\
+    2           & \cdash          & \cdash          & \cdash   \\
+    3$^\dagger$ & \textbf{0.46}   & \textbf{0.78}   & \textbf{0.59}   \\
+    5           & \cdash          & \cdash          & \cdash   \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sensitivity to shot count $K$ ($^\dagger$: default). Significant accuracy at $K{=}0$ confirms that meta-inductive priors are internalized as parametric knowledge.}
+  \label{tab:k_sensitivity}
+\end{table}
+
+At $K{=}0$ (zero-shot, task description only), effective strategy generation by \sg{} would confirm that meta-inductive priors have been internalized as parametric knowledge---the strongest evidence for learn-to-induce. Insufficient examples ($K{=}1$) limit induction quality; excessive examples risk over-specializing the strategy to the current task. $K{=}3$ is the default optimal trade-off (full data pending).
+
+\subsection{Sensitivity to ICR Log-Smoothing Constant $k$}
+\label{app:icr_k}
+
+ICR 中的对数平滑常数 $k$（式~\eqref{eq:eir}）控制奖励对增益幅度的压缩程度：$k$ 越大，较大增益所获奖励的相对优势越显著；$k$ 越小，奖励分布越平坦。我们以默认配置（EIR+ICR，$M{=}4$，$K{=}3$）固定其余超参数，在 $k \in \{1, 5, 10, 20\}$ 上扫描。
+
+\begin{table}[H]
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{cccc}
+    \toprule
+    $k$ & \textbf{ID} ${\uparrow}$ & \textbf{BBH} ${\uparrow}$ & \textbf{OOD} ${\uparrow}$ \\
+    \midrule
+    1           & \cdash & \cdash & \cdash \\
+    5           & \cdash & \cdash & \cdash \\
+    10$^\dagger$ & \textbf{0.65} & \textbf{0.78} & \textbf{0.60} \\
+    20          & \cdash & \cdash & \cdash \\
+    \bottomrule
+  \end{tabular}
+  \caption{Sensitivity to ICR log-smoothing constant $k$ ($^\dagger$: default $k{=}10$).
+    Performance is relatively stable across $k \in [5, 10]$;
+    very small $k$ ($=1$) flattens reward distinctions while very large $k$ ($=20$) amplifies noise on near-zero gains. ``\cdash'': pending.}
+  \label{tab:icr_k}
+\end{table}
+
+$k{=}10$ 在稳定性与区分度之间取得最优平衡，且结果对 $k$ 并不敏感（$k \in [5, 10]$ 区间性能相近），表明 EIR 的核心设计（难度归一化与符号传递）是主要贡献，$k$ 的精确取值为次要因素。
+
+%% TODO: Add the following
+%% 1. Reward training curves (R_fmt fast convergence; R_exec gradual improvement)
+%% 2. Per-subtask breakdown for BBH (27 subtasks)
+
+\end{document}

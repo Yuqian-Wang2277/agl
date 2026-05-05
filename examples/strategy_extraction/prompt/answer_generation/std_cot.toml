@@ -1,0 +1,44 @@
+# Standard CoT (chain-of-thought) answer generation — single call, think mode enabled.
+#
+# Classic chain-of-thought (Wei et al. 2022, task-aware): given K few-shot examples,
+# the model co-presents the new problem with the examples in a single forward pass.
+# The model generates task-specific step-by-step reasoning about the NEW problem,
+# then produces the final answer.  Reasoning is problem-specific (task-aware).
+#
+# Contrast with Blind-CoT (cot_reasoning + cot_answer, 2 calls):
+#   Blind-CoT: the model first reasons about the examples WITHOUT seeing the new
+#              problem, producing a problem-agnostic chain of thought, then answers.
+#   Std CoT:   the model sees the new problem directly and reasons about it
+#              (problem-specific, task-aware) in a single forward pass.
+#
+# Think mode is enabled for this prompt (--answer-no-think is NOT passed),
+# providing an additional internal <think>...</think> scratchpad on top of the
+# explicit 推理 section in the visible output.
+#
+# Placeholders: {examples_text}, {problem}
+
+system = '''
+You are an expert problem solver that excels at in-context learning.
+You will be given several solved example problems, then a new problem to solve.
+
+Study the examples to understand the problem type and solving approach.
+Then reason step by step about the new problem before giving your final answer.
+
+Respond in this exact format:
+推理: <your step-by-step reasoning about the new problem>
+<answer>your final answer</answer>
+
+Output ONLY the 推理 section and the <answer> block — nothing before, nothing after.
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Now solve the following new problem.
+
+{problem}
+
+请先逐步推理，再给出答案。
+'''

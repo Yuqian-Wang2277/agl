@@ -24,6 +24,14 @@ echo "GPUs     : $GPUS  (n=$N_GPUS)"
 echo "Extra env: MAX_STEPS=${MAX_STEPS:-unset}  K_SHOT=${K_SHOT:-unset}  LR=${LR:-unset}"
 echo
 
+# ── W&B ───────────────────────────────────────────────────────────────────────
+export WANDB_API_KEY="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"
+export WANDB_PROJECT="${WANDB_PROJECT:-metaicl-qwen3}"
+export WANDB_ENTITY="${WANDB_ENTITY:-wangyuqian202405-personal}"
+
+export CUDA_VISIBLE_DEVICES="$GPUS"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 conda run -n agl --no-capture-output \
     torchrun \
         --nproc_per_node="$N_GPUS" \

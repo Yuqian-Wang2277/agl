@@ -1,0 +1,49 @@
+# Free chain-of-thought reasoning extraction — CoT / FS+CoT modes, Call 1.
+#
+# Given K few-shot examples, the model freely generates a chain-of-thought
+# reasoning trace that captures the underlying solving pattern.
+# The content is completely free prose — no structured sections required.
+# The output is wrapped in <strategy>...</strategy> tags so the agent can
+# extract and forward it to the answer call as the {strategy} placeholder.
+#
+# WHY the <strategy> wrapper: strategy_generation_agent.py gates the answer
+# call on `extract_strategy(strategy_output) is not None` (line ~1149).
+# Without this wrapper the agent skips Call 2 entirely, producing empty output.
+# The tags are a transport container only — the content inside is free text.
+#
+# Contrast with mist_inline_strategy.toml: that prompt enforces a rigid
+# FIRST_ORDER + SECOND_ORDER schema inside the tags; this prompt leaves the
+# content unconstrained so the model reasons in its own natural style.
+#
+# Placeholder: {examples_text}
+
+system = '''
+You are an expert problem solver. Study the provided example problems and their solutions.
+Freely reason about the underlying problem-solving pattern — there is no required format for your reasoning.
+
+Write a clear chain of thought that captures:
+- What type of problem this is and what the goal is.
+- What reasoning or computational steps the examples demonstrate.
+- What knowledge, rules, or heuristics are being applied.
+- How you would approach a new problem of the same type.
+
+Write naturally, as if thinking out loud. Your analysis will be used to guide answering a new problem.
+Do not write an answer to any specific problem — focus only on extracting the general pattern.
+
+Wrap your entire chain-of-thought analysis in <strategy>...</strategy> tags:
+
+<strategy>
+your free-form reasoning here
+</strategy>
+
+Output ONLY the <strategy> block — nothing before, nothing after.
+'''
+
+user = '''
+Here are example problems and their solutions:
+
+{examples_text}
+
+Analyze the problem-solving pattern demonstrated above and write your chain-of-thought reasoning.
+Wrap your analysis in <strategy>...</strategy> tags:
+'''

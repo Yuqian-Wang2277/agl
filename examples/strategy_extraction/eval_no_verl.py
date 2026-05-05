@@ -312,6 +312,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable Qwen3 think mode for answer /chat/completions (same as train --answer-no-think).",
     )
     parser.add_argument(
+        "--answer-max-tokens",
+        type=int,
+        default=None,
+        help="Override max output tokens for answer /chat/completions. "
+        "Defaults to the rollout LLM's max_tokens (16384). "
+        "For CoT (think-mode) it is recommended to pass 32768 to avoid truncation of <think> blocks.",
+    )
+    parser.add_argument(
         "--answer-request-retries",
         type=int,
         default=3,
@@ -499,6 +507,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
             strategy_no_think=args.strategy_no_think,
             strategy_repetition_penalty=strategy_repetition_penalty_effective,
             answer_no_think=args.answer_no_think,
+            answer_max_tokens=args.answer_max_tokens,
             answer_request_retries=args.answer_request_retries,
             answer_retry_delay_sec=args.answer_retry_delay_sec,
             answer_fallback_rollout_on_failure=not args.no_answer_fallback_rollout,

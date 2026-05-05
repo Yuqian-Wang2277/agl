@@ -136,7 +136,6 @@ if [[ "$MODE" == "few-shot" ]]; then
         --answer-model-name "$ANSWER_MODEL_NAME"
         --answer-model-base-url "$ANSWER_MODEL_BASE_URL"
         --answer-prompt-version "$ANSWER_PROMPT_VERSION"
-        --answer-no-think
     )
     echo "[INFO] 答案模型: $ANSWER_MODEL_NAME @ $ANSWER_MODEL_BASE_URL"
     echo "[INFO] 答案 prompt: $ANSWER_PROMPT_VERSION"
@@ -161,8 +160,6 @@ else
         --answer-model-base-url "$ANSWER_MODEL_BASE_URL"
         --strategy-prompt-version "$STRATEGY_PROMPT_VERSION"
         --answer-prompt-version "$ANSWER_PROMPT_VERSION"
-        --strategy-no-think
-        --answer-no-think
         --strategy-repetition-penalty 1.1
     )
     echo "[INFO] 策略模型: $STRATEGY_MODEL_NAME @ $STRATEGY_MODEL_BASE_URL"

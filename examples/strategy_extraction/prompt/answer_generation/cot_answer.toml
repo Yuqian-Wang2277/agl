@@ -1,0 +1,32 @@
+# CoT answer generation — Call 2 of CoT mode (free chain-of-thought, no examples).
+#
+# Receives the free chain-of-thought reasoning derived from few-shot examples
+# in the preceding call, then applies it to solve a new problem.
+# The original few-shot examples are NOT shown — only the extracted reasoning.
+#
+# Contrast with fs_cot_answer.toml: that prompt additionally includes {examples_text}
+# so the model can cross-reference both the reasoning and the concrete demonstrations;
+# this prompt provides reasoning only, keeping the context window smaller.
+#
+# Placeholders: {strategy}, {problem}
+
+system = '''
+You are an expert problem solver. You are given a chain-of-thought reasoning
+analysis derived from similar example problems. Apply it to solve the new problem.
+
+Output your final answer wrapped in <answer>...</answer> tags.
+Output ONLY the <answer> tags with your answer inside — nothing before, nothing after.
+'''
+
+user = '''
+Here is a chain-of-thought analysis derived from similar examples:
+
+{strategy}
+
+Now apply this reasoning to solve the following new problem:
+
+{problem}
+
+Return only:
+<answer>your final answer</answer>
+'''

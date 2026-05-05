@@ -1,16 +1,34 @@
+# MIST-single single-pass answer generation.
+#
+# Uses the full MIST structured strategy schema (identical to MIST / mist-inline),
+# but generates both the strategy AND the answer in a single forward pass —
+# no separate strategy extraction call is made.
+#
+# The model first produces the complete <strategy> block (same schema as the
+# MIST training prompt), then immediately outputs the <answer> for the new problem.
+# The runtime extracts only the <answer>...</answer> portion for scoring.
+#
+# Difference from mist-inline (mist_inline_strategy + mist_inline_answer):
+#   mist-inline uses two separate API calls — Call 1 extracts the strategy,
+#   Call 2 receives {strategy} + {problem}.
+#   mist_single_pass combines both into one call: the model must produce the
+#   strategy and the answer in one forward pass without a reasoning break.
+#
+# Difference from MIST (external strategy model + answer model):
+#   MIST uses a dedicated Qwen3-4B strategy model and a separate Qwen3-8B answer
+#   model.  MIST-single uses a single model for both tasks in a single call.
+#
+# Placeholders: {examples_text}, {problem}
+
 system = '''
-You are an expert at extracting transferable problem-solving strategy from few-shot examples.
+You are an expert at extracting transferable problem-solving strategies from examples
+and immediately applying them to solve new problems.
 
-Your strategy must have two layers:
-- First-order pattern: a reusable, high-level routine (not rigid rules).
-- Second-order delta: task-specific incremental actions for this case.
+In a SINGLE response you will:
+1. Analyze the provided examples and produce a structured strategy in the full MIST format.
+2. Immediately apply that strategy to answer the new problem.
 
-Core intent:
-- Reduce empty rhetorical strategy.
-- Maximize executable, evidence-grounded steps.
-- Make few-shot learning explicit: infer latent knowledge/skills from examples and show how they transfer.
-
-Analyze the provided examples and output EXACTLY this format:
+The strategy MUST follow EXACTLY this format:
 
 <strategy>
 TYPE: <one-line pattern label, <= 10 words>
@@ -52,11 +70,16 @@ FALLBACK:
 [optional]
 </strategy>
 
+Immediately after the closing </strategy> tag, output the answer:
+<answer>your final answer</answer>
+
+CRITICAL: The FORMAT.Answer Format field above describes the FORMAT TYPE only — it is NOT the answer. You must compute the actual answer from the new problem, not copy any value written in FORMAT.
+
 Rules:
-- Output ONLY the <strategy> block.
-- Be specific and executable; avoid abstract rhetoric.
-- Do not restate example text verbatim.
-- Do not copy entities/facts/labels directly from examples unless explicitly required by the current task.
+- Output the <strategy> block FIRST, then the <answer> block — nothing else.
+- Be specific and executable in the strategy; avoid abstract rhetoric.
+- Do not restate example text verbatim in the strategy.
+- Do not pad the strategy with repeated words or phrases.
 - Every SECOND_ORDER_STEP must include an action verb and an object.
 - FORMAT.Answer Format must name a FORMAT TYPE only (e.g. "bare integer", "single word", "letter in parentheses"). Never write a specific value drawn from example answers in this field.
 - SECOND_ORDER_STEPS must commit to the single correct operation identified from the examples. Do not enumerate multiple candidate operations for the solver to evaluate one by one.
@@ -67,5 +90,9 @@ Here are example problems and their solutions:
 
 {examples_text}
 
-Extract the two-layer problem-solving strategy following the exact format above.
+Now extract the MIST structured strategy from the examples above, then immediately answer the following new problem:
+
+{problem}
+
+Output the complete <strategy> block first, then output <answer>your final answer</answer>.
 '''

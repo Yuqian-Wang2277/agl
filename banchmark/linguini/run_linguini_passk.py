@@ -11,7 +11,7 @@ Supports three prompting modes selectable via --mode:
   MIST       — two-step: (1) extract a problem-solving strategy from few-shot
                examples using strategy_generation/repetition_controls_2026-04-01.toml,
                (2) apply the strategy to answer the new problem using
-               answer_generation/v1.toml
+               answer_generation/linguini_answer.toml
 
 Scoring logic (official Linguini eval_type semantics):
   single / simple : exact string match per sub-answer (after strip+lower)
@@ -250,34 +250,48 @@ def parse_numbered_answers(text: str) -> List[str]:
     """Extract a numbered list from inside <answer>...</answer> tags.
 
     Falls back to scanning the entire text if no tags are found.
+    Answers are collected in the order they appear; the numeric label is
+    ignored as an index so that tasks whose items are numbered from e.g. 17
+    (continuing the context numbering) are handled correctly.
+
+    Fallback chain when no numbered lines are found:
+      1. Multiple non-empty lines  → one answer per line
+      2. Single line with commas   → split on ", " / ","
+      3. Otherwise                 → return the single stripped value
 
     Example model output:
         <answer>
-        1. ɨnnetakʼa
-        2. ɨŋɡɨrʼɨ
+        21. ɨnnetakʼa
+        22. ɨŋɡɨrʼɨ
         </answer>
 
     Returns:
         ['ɨnnetakʼa', 'ɨŋɡɨrʼɨ']
     """
-    # Try to extract the content inside <answer>...</answer>
     match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL | re.IGNORECASE)
     block = match.group(1) if match else text
 
-    # Parse numbered lines: "1. answer", "1) answer", "(1) answer"
+    # Primary: numbered lines — collected in appearance order, label ignored
     answers: List[str] = []
     for line in block.splitlines():
         line = line.strip()
         m = re.match(r"^\(?(\d+)[.)]\s*(.+)$", line)
         if m:
-            idx = int(m.group(1))
-            val = m.group(2).strip()
-            # Extend list to fit the index (1-based)
-            while len(answers) < idx:
-                answers.append("")
-            answers[idx - 1] = val
+            answers.append(m.group(2).strip())
+    if answers:
+        return answers
 
-    return answers
+    # Fallback 1: multiple non-empty lines
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        return lines
+
+    # Fallback 2: single comma-separated line
+    if lines and "," in lines[0]:
+        return [part.strip() for part in lines[0].split(",") if part.strip()]
+
+    # Fallback 3: single value (or empty)
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +568,7 @@ def make_solve_fn(
         strat_sys_p = strat_tmpl["system"].strip()
         strat_usr_tpl = strat_tmpl["user"]
 
-        ans_tmpl = load_toml_prompt(prompt_dir / "answer_generation" / "v1.toml")
+        ans_tmpl = load_toml_prompt(prompt_dir / "answer_generation" / "linguini_answer.toml")
         ans_sys_p = ans_tmpl["system"].strip()
         ans_usr_tpl = ans_tmpl["user"]
 
@@ -599,7 +613,7 @@ def make_solve_fn(
         inline_strat_usr = inline_strat_tmpl["user"]
 
         inline_ans_tmpl = load_toml_prompt(
-            prompt_dir / "answer_generation" / "mist_inline_answer.toml"
+            prompt_dir / "answer_generation" / "linguini_answer.toml"
         )
         inline_ans_sys = inline_ans_tmpl["system"].strip()
         inline_ans_usr = inline_ans_tmpl["user"]
@@ -870,7 +884,7 @@ async def main() -> None:
         meta["strategy_api_base"] = args.strategy_api_base or args.api_base
     elif args.mode == "mist-inline":
         meta["inline_strategy_prompt"] = "mist"
-        meta["inline_answer_prompt"] = "mist_inline_answer"
+        meta["inline_answer_prompt"] = "linguini_answer"
 
     # ── Build solvers ────────────────────────────────────────────────────────
     solver = load_solver(args)
@@ -889,7 +903,7 @@ async def main() -> None:
         sm = args.strategy_model or args.model
         print(f"  Strategy mdl: {sm}  (T={args.strategy_temperature})")
     elif args.mode == "mist-inline":
-        print(f"  Strategy    : inline (mist.toml → mist_inline_answer.toml)")
+        print(f"  Strategy    : inline (mist.toml → linguini_answer.toml)")
     if args.mode != "zero-shot":
         ctx_label = "diverse" if args.context_diversity_mode == "diverse" else "reproducible"
         print(f"  Shot num    : {args.shot_num}  seed={args.shot_seed}  context={ctx_label}")

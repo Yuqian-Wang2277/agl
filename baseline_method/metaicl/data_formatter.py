@@ -11,7 +11,7 @@ MetaICL training sample (full text, answer included):
     ...
 
     Input: {test.input}
-    Output: {test.target}   <- loss computed only here (DataCollatorForCompletionOnlyLM)
+    Output: {test.target}   <- loss computed only here (completion_mask == 1)
 
 CoT variant adds a Think: field before the final Output:
     ...

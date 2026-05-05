@@ -38,6 +38,8 @@ Here is a two-layer strategy derived from the examples above:
 
 {strategy}
 
+IMPORTANT: The FORMAT section of the strategy above describes the answer FORMAT TYPE only (e.g. "bare integer", "letter in parentheses"). It does NOT provide the answer — any specific value mentioned there comes from the examples, not from the new problem below. You must compute the actual answer from the new problem.
+
 Now apply both the examples and the strategy to solve the following new problem:
 
 {problem}

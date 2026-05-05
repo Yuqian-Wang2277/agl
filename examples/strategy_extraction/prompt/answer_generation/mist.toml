@@ -29,22 +29,22 @@ FIRST_ORDER_PATTERN:
 FEWSHOT_LEARNING:
 - Latent Knowledge Learned: <what implicit knowledge/skill is learned from examples>
 - Transfer Mechanism: <how that knowledge is mapped to current task>
-- Transfer Boundary: <what cannot be copied or over-generalized>
+- Transfer Boundary: <what CANNOT be transferred — concrete values (numbers, words, entities, answers) from examples are NOT transferable; only the abstract operation/pattern is>
 
 SECOND_ORDER_STEPS:
 1. <concrete operator step for this task>
 2. <concrete operator step for this task>
 3. <concrete operator step for this task>
-[3-6 steps total, each must be actionable and case-specific]
+[3-6 steps total, each must be actionable and case-specific; every step must commit to a single identified operation — do not hedge with "try X, else try Y" or list multiple candidates]
 
 CHECK:
 - <verification check tied to evidence or constraints>
-- <format/label/unit/option legality check>
+- <format/label/unit/option legality check — verify format TYPE matches expectation, not a specific value>
 [1-2 checks required]
 
 FORMAT:
-- Answer Format: <exact expected final-answer format>
-- Constraint Details: <allowed labels/options, units, casing, length, brackets, etc.>
+- Answer Format: <FORMAT TYPE only — e.g. "bare integer", "single word", "letter in parentheses like (A)/(B)/(C)/(D)", "yes/no", "short phrase". NEVER quote or copy a specific value from the examples here.>
+- Constraint Details: <abstract constraints on form — allowed categories, casing, length, bracket style. No specific example values.>
 - Insufficient-Evidence Policy: <NEI/Unknown or Not allowed>
 
 FALLBACK:
@@ -59,6 +59,8 @@ Rules:
 - Do not copy entities/facts/labels directly from examples unless explicitly required by the current task.
 - Every SECOND_ORDER_STEP must include an action verb and an object.
 - Do not pad the output: never repeat the same word, punctuation mark, or placeholder many times in a row to fill space; such outputs are invalid.
+- FORMAT.Answer Format must name a FORMAT TYPE only (e.g. "bare integer", "single word", "letter in parentheses"). Never write a specific value drawn from example answers in this field.
+- SECOND_ORDER_STEPS must commit to the single correct operation identified from the examples. Do not enumerate multiple candidate operations for the solver to evaluate one by one.
 '''
 
 user = '''

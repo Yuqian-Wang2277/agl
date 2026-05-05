@@ -66,6 +66,51 @@
 #    默认端口：META_TEST_MODEL_BASE_URL=http://localhost:8200/v1
 #              META_TEST_MODEL_NAME=Qwen3-4B（可通过环境变量覆盖）
 #
+#  MODE=CoT（标准链式推理，1×，task-aware）
+#    单次调用，模型在看到新题的同时自由生成推理，然后输出答案。
+#    这是 Wei et al. (2022) 意义上的经典 CoT——推理内容围绕具体新题展开，是问题特异性的。
+#    模型开启 think 模式（不传 --answer-no-think），内部 <think> 块作为额外推理暂存区。
+#    可见输出包含 "推理: ..." 段落和 <answer> 块。
+#    Prompt 结构：[示例1: Q→A]  [示例2: Q→A]  [示例3: Q→A]
+#                 Q: [新题]  →  推理: ...（自由文本，见到新题后展开）  →  <answer>
+#    prompt: answer_generation/std_cot.toml（{examples_text}+{problem}）
+#    fewshot-min/max=3，底层映射为 Python 层的 few-shot 模式（单次调用+示例）。
+#    只需启动答案模型（端口 8200）。
+#
+#  MODE=Blind-CoT（盲式链式推理，2×，free format）
+#    给模型 K 个示例，先自由生成一段推理过程（chain-of-thought），再产出答案。
+#    推理在看到新题之前产生，是问题无关（problem-agnostic）的。两次 API 调用（同一答案模型）。
+#    Call 1: 基于 [示例1~K] 自由推理，生成推理文本 r（尚未见到新题）
+#            prompt: answer_generation/cot_reasoning.toml（{examples_text}）
+#    Call 2: 基于推理 r 回答新问题 Q → A（不保留原始示例）
+#            prompt: answer_generation/cot_answer.toml（{strategy}+{problem}）
+#    与 CoT 的核心区别：推理在看到新题之前产生（blind to new question）。
+#    fewshot-min/max=3，底层映射为 Python 层的 mist-inline 模式。
+#    只需启动答案模型（端口 8200）。
+#
+#  MODE=FS+CoT（示例+自由推理，2×，free format）
+#    在 Blind-CoT 的基础上，Call 2 阶段不丢弃原始示例，而是把自由推理文本叠加在示例上
+#    一起送给答案模型。两次 API 调用（同一答案模型）。
+#    Call 1: 基于 [示例1~K] 生成自由推理 r（与 Blind-CoT Call 1 完全相同）
+#            prompt: answer_generation/cot_reasoning.toml（{examples_text}）
+#    Call 2: [示例1~K] + 推理 r + 新问题 Q → A
+#            prompt: answer_generation/fs_cot_answer.toml（{examples_text}+{strategy}+{problem}）
+#    与 Blind-CoT 的区别：答案模型同时可见原始示例和自由推理，而非仅推理。
+#    与 habit 的区别：habit 使用 FIRST_ORDER+SECOND_ORDER 结构化格式；FS+CoT 使用自由推理。
+#    fewshot-min/max=3，底层映射为 Python 层的 habit 模式。
+#    只需启动答案模型（端口 8200）。
+#
+#  MODE=MIST-single（结构化策略单 pass，1×，struct.）
+#    使用与 MIST 完全相同的结构化策略格式（含 FIRST_ORDER_PATTERN、FEWSHOT_LEARNING、
+#    SECOND_ORDER_STEPS 等章节），但策略生成和答案产出在同一次 forward pass 完成：
+#    先输出完整 <strategy> 块，紧接着输出 <answer>。
+#    仅一次 API 调用（答案模型），底层映射为 Python 层的 few-shot 模式。
+#    与 MIST 的区别：不需要独立策略模型（Qwen3-4B），仅使用答案模型（Qwen3-8B）。
+#    与 mist-inline 的区别：mist-inline 分两次调用；MIST-single 在单次前向传播中
+#                          同时生成策略和答案，无策略-答案之间的推理中断。
+#    使用 prompt: answer_generation/mist_single_pass.toml（{examples_text}+{problem}）
+#    fewshot-min/max=3，只需启动答案模型（端口 8200）。
+#
 # ============================================================
 #  重要 setting 速查（实际生效值，含显式参数 + 隐式 default）
 # ============================================================
@@ -83,15 +128,25 @@
 #    输出指标: pass@1 / pass@2 / pass@3（hard 0/1 和 soft F1 各一份）
 #
 #  [模型 — MIST 模式]
-#    策略模型: Qwen3-4B  端口 8100  no-think  repetition_penalty=1.1
-#              prompt_version=repetition_controls_2026-04-01
-#    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=v1
-#              grounded-proxy-k=1（每道题仅调用 answer model 1 次）
+#    策略模型: Qwen3-4B  端口 8100  think 由 STRATEGY_THINK 控制（默认关闭）
+#              repetition_penalty=1.1  prompt_version=repetition_controls_2026-04-01
+#    答案模型: Qwen3-8B  端口 8200  think 由 ANSWER_THINK 控制（默认关闭）
+#              answer_prompt_version=v1  grounded-proxy-k=1
+#
+#  [think 模式独立开关]
+#    ANSWER_THINK=0（默认）   关闭 answer model think，直接输出 <answer>
+#    ANSWER_THINK=1           开启 answer model think，先生成 <think> 再输出答案
+#                             建议在 MIST/MIST+few-shot 下设为 1，使 answer model 能按策略步骤推理
+#    STRATEGY_THINK=0（默认） 关闭 strategy model think
+#    STRATEGY_THINK=1         开启 strategy model think，有助于提升策略归纳质量（截断风险极低）
+#    注：CoT 模式强制开启 answer think，忽略 ANSWER_THINK 设置
+#    两个开关同时作用于额外测评集（HARDMath2 / Linguini）
 #
 #  [模型 — MIST+few-shot 模式]
-#    策略模型: Qwen3-4B  端口 8100  no-think  repetition_penalty=1.1
-#              prompt_version=repetition_controls_2026-04-01（与 MIST 完全相同）
-#    答案模型: Qwen3-8B  端口 8200  no-think  answer_prompt_version=mist_fewshot_answer
+#    策略模型: Qwen3-4B  端口 8100  think 由 STRATEGY_THINK 控制（默认关闭）
+#              repetition_penalty=1.1  prompt_version=repetition_controls_2026-04-01
+#    答案模型: Qwen3-8B  端口 8200  think 由 ANSWER_THINK 控制（默认关闭；建议设为 1）
+#              answer_prompt_version=mist_fewshot_answer
 #              （答案 prompt 包含 {examples_text}+{strategy}+{problem}）
 #
 #  [模型 — few-shot 模式]
@@ -112,6 +167,33 @@
 #    prompt:   meta_test_neutral（中性指令，不含策略引导）
 #    fewshot-min=0 fewshot-max=0（无示例）
 #    Python 层: --mode 0-shot（复用无策略单次调用逻辑）
+#
+#  [模型 — CoT 模式]
+#    答案模型: Qwen3-8B  端口 8200  think 模式开启（不传 --answer-no-think）
+#    prompt:   std_cot（{examples_text}+{problem}，单次调用，visible 推理+<answer>）
+#    max_tokens: 32768（think block 可消耗 5k–15k tokens，默认 16384 对难题可能截断）
+#    fewshot-min=3 fewshot-max=3
+#    Python 层: --mode few-shot（单次调用+示例，跳过策略模型）
+#
+#  [模型 — Blind-CoT 模式]
+#    答案模型: Qwen3-8B  端口 8200  no-think
+#    Call 1 prompt: cot_reasoning（自由推理提取，{examples_text}）
+#    Call 2 prompt: cot_answer（基于推理回答，{strategy}+{problem}）
+#    fewshot-min=3 fewshot-max=3
+#    Python 层: --mode mist-inline（复用 inline strategy 双调用逻辑）
+#
+#  [模型 — FS+CoT 模式]
+#    答案模型: Qwen3-8B  端口 8200  no-think
+#    Call 1 prompt: cot_reasoning（自由推理提取，与 Blind-CoT 相同）
+#    Call 2 prompt: fs_cot_answer（示例+推理联合作答，{examples_text}+{strategy}+{problem}）
+#    fewshot-min=3 fewshot-max=3
+#    Python 层: --mode habit（复用 habit 双调用+示例逻辑）
+#
+#  [模型 — MIST-single 模式]
+#    答案模型: Qwen3-8B  端口 8200  no-think
+#    prompt:   mist_single_pass（完整 MIST 结构化策略 + 答案，{examples_text}+{problem}）
+#    fewshot-min=3 fewshot-max=3
+#    Python 层: --mode few-shot（复用单次调用+示例逻辑，跳过策略模型）
 #
 #  [数据集]
 #    val-subdirs: test-id-subtask + test-ood-task + test-bbh
@@ -166,6 +248,10 @@
 #   MODE=0-shot         bash examples/strategy_extraction/scripts/eval_no_verl.sh
 #   MODE=habit-0-shot   bash examples/strategy_extraction/scripts/eval_no_verl.sh
 #   MODE=meta-test      bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=CoT            bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=Blind-CoT      bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=FS+CoT         bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   MODE=MIST-single    bash examples/strategy_extraction/scripts/eval_no_verl.sh
 #   MODE=few-shot       bash examples/strategy_extraction/scripts/eval_no_verl.sh --max-samples 64
 #
 # meta-test 自定义模型端口示例（已训练 4B 模型运行在 GPU 6,7，端口 8200）：
@@ -182,6 +268,19 @@
 #   ANSWER_MODEL_NAME=Qwen3-8B \
 #   EVAL_CONCURRENCY=64 \
 #   NUM_SAMPLES_PER_PROBLEM=3 \
+#   bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#
+# think 模式开关示例：
+#   # MIST+few-shot：开启 answer think（推荐），使 answer model 按策略步骤推理
+#   MODE=MIST+few-shot ANSWER_THINK=1 \
+#   bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#
+#   # MIST+few-shot：同时开启 strategy think 和 answer think
+#   MODE=MIST+few-shot ANSWER_THINK=1 STRATEGY_THINK=1 \
+#   bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#
+#   # MIST：仅开启 strategy think（answer 仍关闭）
+#   MODE=MIST STRATEGY_THINK=1 \
 #   bash examples/strategy_extraction/scripts/eval_no_verl.sh
 #
 # 采样模式开关：
@@ -202,8 +301,8 @@ cd "$REPO_ROOT"
 
 # --- 模式选择 ---
 MODE="${MODE:-MIST}"
-if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" && "$MODE" != "MIST+few-shot" && "$MODE" != "mist-inline" && "$MODE" != "habit" && "$MODE" != "0-shot" && "$MODE" != "habit-0-shot" && "$MODE" != "meta-test" ]]; then
-    echo "[ERROR] MODE 必须为 'few-shot'、'MIST'、'MIST+few-shot'、'mist-inline'、'habit'、'0-shot'、'habit-0-shot' 或 'meta-test'（当前值: $MODE）"
+if [[ "$MODE" != "few-shot" && "$MODE" != "MIST" && "$MODE" != "MIST+few-shot" && "$MODE" != "mist-inline" && "$MODE" != "habit" && "$MODE" != "0-shot" && "$MODE" != "habit-0-shot" && "$MODE" != "meta-test" && "$MODE" != "CoT" && "$MODE" != "Blind-CoT" && "$MODE" != "FS+CoT" && "$MODE" != "MIST-single" ]]; then
+    echo "[ERROR] MODE 必须为 'few-shot'、'MIST'、'MIST+few-shot'、'mist-inline'、'habit'、'0-shot'、'habit-0-shot'、'meta-test'、'CoT'、'Blind-CoT'、'FS+CoT' 或 'MIST-single'（当前值: $MODE）"
     exit 1
 fi
 echo "[INFO] 运行模式: $MODE"
@@ -224,6 +323,32 @@ fi
 # --- fewshot 数量（0-shot / habit-0-shot 模式在各自 block 内覆盖为 0） ---
 FEWSHOT_MIN="${FEWSHOT_MIN:-3}"
 FEWSHOT_MAX="${FEWSHOT_MAX:-3}"
+
+# --- think 模式控制 ---
+# ANSWER_THINK=0（默认）  关闭 answer model think，直接输出 <answer>...</answer>
+# ANSWER_THINK=1          开启 answer model think，模型先生成 <think>...</think> 再输出答案
+#                         建议在 MIST/MIST+few-shot 模式下设为 1，使 answer model 能按策略步骤推理
+# STRATEGY_THINK=0（默认）关闭 strategy model think
+# STRATEGY_THINK=1        开启 strategy model think，有助于提升策略归纳质量（截断风险极低）
+# 注：CoT 模式语义上强制开启 answer think，忽略 ANSWER_THINK 设置
+ANSWER_THINK="${ANSWER_THINK:-0}"
+STRATEGY_THINK="${STRATEGY_THINK:-0}"
+
+if [[ "${ANSWER_THINK}" == "1" ]]; then
+    ANSWER_THINK_ARGS=()
+    echo "[INFO] Answer model think 模式：开启（ANSWER_THINK=1）"
+else
+    ANSWER_THINK_ARGS=(--answer-no-think)
+    echo "[INFO] Answer model think 模式：关闭（ANSWER_THINK=0）"
+fi
+
+if [[ "${STRATEGY_THINK}" == "1" ]]; then
+    STRATEGY_THINK_ARGS=()
+    echo "[INFO] Strategy model think 模式：开启（STRATEGY_THINK=1）"
+else
+    STRATEGY_THINK_ARGS=(--strategy-no-think)
+    echo "[INFO] Strategy model think 模式：关闭（STRATEGY_THINK=0）"
+fi
 
 # --- 模式专属参数 ---
 MODE_ARGS=()
@@ -306,6 +431,8 @@ elif [[ "$MODE" == "MIST+few-shot" ]]; then
     # MIST+few-shot：策略生成与 MIST 完全相同（外部 Qwen3-4B 策略模型）；
     # 答案生成时，答案模型同时接收 few-shot 示例 + 策略，综合两者回答新题。
     # 与 habit 模式的区别：策略由外部专用策略模型生成，而非答案模型内联生成。
+    # think 控制：通过 ANSWER_THINK / STRATEGY_THINK 环境变量独立设置。
+    #   建议 ANSWER_THINK=1，使 answer model 能按策略步骤显式推理后再输出答案。
     MODE_ARGS+=(
         --mode MIST
         --model-path /home/test/test16/chenlu/model/Qwen3-4B
@@ -314,13 +441,70 @@ elif [[ "$MODE" == "MIST+few-shot" ]]; then
         --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B
         --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
         --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
-        --strategy-no-think
+        "${STRATEGY_THINK_ARGS[@]}"
         --strategy-prompt-version repetition_controls_2026-04-01
         --strategy-repetition-penalty 1.1
         --answer-prompt-version "${ANSWER_PROMPT_VERSION:-mist_fewshot_answer}"
     )
+elif [[ "$MODE" == "CoT" ]]; then
+    # CoT（标准链式推理，1×，task-aware）：单次调用，think 模式强制开启。
+    # 给定 K 个 few-shot 示例后，模型同时看到新题，自由生成 task-aware 推理再输出答案。
+    # 这是 Wei et al. (2022) 意义上的经典 CoT——推理内容围绕具体新题展开，是问题特异性的。
+    # 可见输出包含 "推理: ..." 段落和 <answer> 块；内部同时开启 <think> 暂存区。
+    # 底层映射为 Python few-shot 模式（单次调用+示例，跳过策略模型）。
+    # CoT 语义上要求 think，忽略 ANSWER_THINK 设置，强制开启。
+    ANSWER_THINK_ARGS=()  # 强制开启 think（CoT 模式专属）
+    MODE_ARGS+=(
+        --mode few-shot
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --answer-prompt-version "${ANSWER_PROMPT_VERSION:-std_cot}"
+        --answer-max-tokens "${ANSWER_MAX_TOKENS:-32768}"
+    )
+elif [[ "$MODE" == "Blind-CoT" ]]; then
+    # Blind-CoT（盲式链式推理，2×，free format）：同一答案模型，两次调用，无结构约束。
+    # 推理在看到新题之前产生（problem-agnostic），是与 CoT 的核心区别。
+    # Call 1（inline strategy）：给定 K 个示例，自由生成推理文本 r（free format，尚未见新题）。
+    # Call 2（answer）：基于推理 r 回答新问题（不保留原始示例）。
+    # 底层映射为 Python mist-inline 模式（共用 inline strategy 双调用路径）。
+    MODE_ARGS+=(
+        --mode mist-inline
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --inline-strategy-prompt-version "${INLINE_STRATEGY_PROMPT_VERSION:-cot_reasoning}"
+        --answer-prompt-version "${ANSWER_PROMPT_VERSION:-cot_answer}"
+    )
+elif [[ "$MODE" == "FS+CoT" ]]; then
+    # FS+CoT（示例+自由推理）：同一答案模型，两次调用，无结构约束。
+    # Call 1（inline strategy）：给定 K 个示例，自由生成推理文本 r（与 Blind-CoT 完全相同）。
+    # Call 2（answer）：原始示例 + 推理 r + 新问题 Q → A（示例不被丢弃）。
+    # 与 Blind-CoT 的区别：Call 2 同时看到原始示例和推理，而非仅推理。
+    # 与 habit 的区别：habit 使用结构化 FIRST_ORDER+SECOND_ORDER 格式；FS+CoT 使用自由文本。
+    # 底层映射为 Python habit 模式（共用 habit 双调用+示例路径）。
+    MODE_ARGS+=(
+        --mode habit
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --inline-strategy-prompt-version "${INLINE_STRATEGY_PROMPT_VERSION:-cot_reasoning}"
+        --answer-prompt-version "${ANSWER_PROMPT_VERSION:-fs_cot_answer}"
+    )
+elif [[ "$MODE" == "MIST-single" ]]; then
+    # MIST-single（结构化策略单 pass）：同一答案模型，单次调用。
+    # 使用与 MIST 完全相同的结构化策略格式（FIRST_ORDER_PATTERN、FEWSHOT_LEARNING、
+    # SECOND_ORDER_STEPS 等章节），但策略生成和答案产出在同一次 forward pass 完成：
+    # 先输出 <strategy> 块（完整 MIST 格式），紧接着输出 <answer>。
+    # 与 mist-inline 的区别：mist-inline 分两次 API 调用；MIST-single 仅一次。
+    # 与 MIST 的区别：无需独立策略模型（Qwen3-4B），仅用答案模型（Qwen3-8B）。
+    # 底层映射为 Python few-shot 模式（单次调用+示例，跳过策略模型）。
+    MODE_ARGS+=(
+        --mode few-shot
+        --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
+        --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
+        --answer-prompt-version "${ANSWER_PROMPT_VERSION:-mist_single_pass}"
+    )
 else
     # MIST：策略模型（Qwen3-4B）+ 答案模型（Qwen3-8B）
+    # think 控制：通过 ANSWER_THINK / STRATEGY_THINK 环境变量独立设置。
     MODE_ARGS+=(
         --mode MIST
         --model-path /home/test/test16/chenlu/model/Qwen3-4B
@@ -329,7 +513,7 @@ else
         --answer-model-path /home/test/test16/chenlu/model/Qwen3-8B
         --answer-model-base-url "${ANSWER_MODEL_BASE_URL:-http://localhost:8200/v1}"
         --answer-model-name "${ANSWER_MODEL_NAME:-Qwen3-8B}"
-        --strategy-no-think
+        "${STRATEGY_THINK_ARGS[@]}"
         --strategy-prompt-version repetition_controls_2026-04-01
         --strategy-repetition-penalty 1.1
         --answer-prompt-version v1
@@ -344,7 +528,7 @@ python -m examples.strategy_extraction.eval_no_verl \
   --concurrency "${EVAL_CONCURRENCY:-64}" \
   --llm-seed 42 \
   --num-samples-per-problem "${NUM_SAMPLES_PER_PROBLEM:-3}" \
-  --answer-no-think \
+  "${ANSWER_THINK_ARGS[@]}" \
   --reward-version v3 \
   --answer-request-retries 3 \
   --answer-retry-delay-sec 1.0 \
@@ -365,6 +549,8 @@ python -m examples.strategy_extraction.eval_no_verl \
 #    mist-inline   → HARDMath2=mist-inline Linguini=mist-inline
 #    habit         → HARDMath2=mist-inline Linguini=mist-inline  (habit 本质同 mist-inline)
 #    0-shot        → HARDMath2=（跳过）    Linguini=zero-shot
+#    CoT           → HARDMath2=few-shot    Linguini=few-shot  (单次调用，额外测评集用标准 ICL prompt)
+#    Blind-CoT     → HARDMath2=mist-inline Linguini=mist-inline  (双调用，额外测评集用标准 mist prompt)
 #    habit-0-shot / meta-test → 两者均跳过（无对应模式）
 #
 #  fewshot 示例数：额外测评集使用 EXTRA_FEWSHOT_K（默认 3），
@@ -374,6 +560,11 @@ python -m examples.strategy_extraction.eval_no_verl \
 #    HARDMATH2_OUTPUT_DIR  默认 banchmark/HARDMath2/results
 #    LINGUINI_OUTPUT_DIR   默认 banchmark/linguini/results/passk
 # ============================================================
+
+# Result-file paths — populated inside each extra-benchmark block, consumed in the
+# final summary at the bottom of this script.
+_hm_result_file=""
+_ling_result_file=""
 
 EXTRA_BENCHMARKS="${EXTRA_BENCHMARKS:-1}"
 
@@ -421,6 +612,26 @@ if [[ "${EXTRA_BENCHMARKS}" == "1" ]]; then
         habit-0-shot|meta-test)
             echo "[INFO] 额外测评集：MODE=${MODE} 无对应模式，跳过 HARDMath2 和 Linguini"
             ;;
+        CoT)
+            _hardmath_mode="few-shot"
+            _linguini_mode="few-shot"
+            echo "[INFO] 额外测评集：CoT 模式映射为 few-shot（单次调用+示例，额外测评集不支持 std_cot prompt，使用标准 ICL prompt）"
+            ;;
+        Blind-CoT)
+            _hardmath_mode="mist-inline"
+            _linguini_mode="mist-inline"
+            echo "[INFO] 额外测评集：Blind-CoT 模式映射为 mist-inline（额外测评集使用标准 mist 推理 prompt，非 cot_reasoning）"
+            ;;
+        FS+CoT)
+            _hardmath_mode="mist-inline"
+            _linguini_mode="mist-inline"
+            echo "[INFO] 额外测评集：FS+CoT 模式映射为 mist-inline（额外测评集使用标准 mist 推理 prompt，非 cot_reasoning）"
+            ;;
+        MIST-single)
+            _hardmath_mode="few-shot"
+            _linguini_mode="few-shot"
+            echo "[INFO] 额外测评集：MIST-single 模式映射为 few-shot（额外测评集使用标准 ICL prompt，非 mist_single_pass）"
+            ;;
     esac
 
     # 提取当前模式下已解析的答案 / 策略模型参数（复用 MODE_ARGS 中的值）
@@ -447,7 +658,7 @@ if [[ "${EXTRA_BENCHMARKS}" == "1" ]]; then
             _hm_extra+=(
                 --strategy-model-name  "${_strategy_name}"
                 --strategy-model-base-url "${_strategy_url}"
-                --strategy-no-think
+                "${STRATEGY_THINK_ARGS[@]}"
                 --strategy-repetition-penalty 1.1
             )
         fi
@@ -457,16 +668,23 @@ if [[ "${EXTRA_BENCHMARKS}" == "1" ]]; then
             _hm_extra+=(--inline-strategy-prompt-version mist)
         fi
 
+        # answer think：跟随全局 ANSWER_THINK 开关
+        _hm_answer_think_args=()
+        [[ "${ANSWER_THINK}" != "1" ]] && _hm_answer_think_args=(--answer-no-think)
+
         python "${HARDMATH2_DIR}/eval_hardmath.py" \
             --mode               "${_hardmath_mode}" \
             --answer-model-name  "${_answer_name}" \
             --answer-model-base-url "${_answer_url}" \
-            --answer-no-think \
+            "${_hm_answer_think_args[@]}" \
             --fewshot-k          "${EXTRA_FEWSHOT_K}" \
             --num-samples        "${EXTRA_NUM_SAMPLES}" \
             --concurrency        "${EXTRA_CONCURRENCY}" \
             --output-dir         "${HARDMATH2_OUTPUT_DIR}" \
             "${_hm_extra[@]}"
+
+        # Capture the most recently written HARDMath2 result file
+        _hm_result_file=$(ls -t "${HARDMATH2_OUTPUT_DIR}"/hardmath_*.json 2>/dev/null | head -1 || true)
     fi
 
     # ── Linguini ──────────────────────────────────────────────────────────────
@@ -482,23 +700,129 @@ if [[ "${EXTRA_BENCHMARKS}" == "1" ]]; then
             _ling_extra+=(
                 --strategy_model    "${_strategy_name}"
                 --strategy_api_base "${_strategy_url}"
-                --strategy_no_think
             )
+            # strategy think：跟随全局 STRATEGY_THINK 开关
+            [[ "${STRATEGY_THINK}" != "1" ]] && _ling_extra+=(--strategy_no_think)
         fi
+
+        # answer think：跟随全局 ANSWER_THINK 开关（Linguini 用 --no_think 禁用）
+        _ling_no_think_arg=()
+        [[ "${ANSWER_THINK}" != "1" ]] && _ling_no_think_arg=(--no_think)
 
         python "${LINGUINI_DIR}/run_linguini_passk.py" \
             --model       "${_answer_name}" \
             --mode        "${_linguini_mode}" \
             --backend     openai_compatible \
             --api_base    "${_answer_url}" \
-            --no_think \
+            "${_ling_no_think_arg[@]}" \
             --shot_num    "${EXTRA_FEWSHOT_K}" \
             --num_samples "${EXTRA_NUM_SAMPLES}" \
             --concurrency "${EXTRA_CONCURRENCY}" \
             --output_dir  "${LINGUINI_OUTPUT_DIR}" \
             --prompt_dir  "/home/test/test16/chenlu/projects/agent-lightning/examples/strategy_extraction/prompt" \
             "${_ling_extra[@]}"
+
+        # Compute the deterministic Linguini result-file path (mirrors run_linguini_passk.py logic)
+        _safe_ling_model=$(python3 -c "import re, sys; print(re.sub(r'[^a-zA-Z0-9._-]+', '_', sys.argv[1])[:80])" "${_answer_name}")
+        _ling_result_file="${LINGUINI_OUTPUT_DIR}/linguini_passk_${_safe_ling_model}_${_linguini_mode}.json"
     fi
 
 fi
 
+# ============================================================
+#  最终汇总：将所有测评结果集中输出一次，便于日志检索
+# ============================================================
+
+export _HM_RESULT_FILE="${_hm_result_file}"
+export _LING_RESULT_FILE="${_ling_result_file}"
+export _EVAL_MODE="${MODE}"
+
+python3 << 'PYEOF'
+import os, json
+
+SEP  = "═" * 66
+DASH = "─" * 66
+
+def _fmt(v):
+    return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+
+print()
+print(SEP)
+print("  ALL BENCHMARKS — FINAL RESULTS SUMMARY")
+print(f"  MODE: {os.environ.get('_EVAL_MODE', '?')}")
+print(SEP)
+
+# ── 主评测 (eval_no_verl) ──────────────────────────────────────────────────
+print()
+print("  ┌─ 主评测 (eval_no_verl) ─────────────────────────────────────┐")
+print("  │  ↑ 详细结果已打印在上方 (StrategyGenerationAgent summary)  │")
+print("  └────────────────────────────────────────────────────────────┘")
+
+# ── HARDMath2 ──────────────────────────────────────────────────────────────
+hm_file = os.environ.get('_HM_RESULT_FILE', '')
+print()
+print(DASH)
+print("  HARDMath2")
+print(DASH)
+if hm_file and os.path.isfile(hm_file):
+    with open(hm_file, encoding='utf-8') as f:
+        d = json.load(f)
+    print(f"  mode      : {d.get('mode', '?')}")
+    print(f"  model     : {d.get('answer_model', '?')}")
+    print(f"  n_problems: {d.get('num_problems', '?')}  samples/prob: {d.get('num_samples', '?')}")
+    print(f"  acc_hard  : {_fmt(d.get('acc_hard', '?'))}   acc_soft: {_fmt(d.get('acc_soft', '?'))}")
+    ph = d.get('pass_at_k_hard', {})
+    ps = d.get('pass_at_k_soft', {})
+    for k in sorted(ph):
+        print(f"  pass@{k}    : hard={_fmt(ph[k])}   soft={_fmt(ps.get(k, '?'))}")
+    by_type = d.get('by_type', {})
+    if by_type:
+        print("  by type:")
+        for pt, tv in sorted(by_type.items()):
+            pth = tv.get('pass_at_k_hard', {})
+            pts = tv.get('pass_at_k_soft', {})
+            parts = " ".join(
+                f"p@{k}(h={_fmt(pth.get(k,'?'))},s={_fmt(pts.get(k,'?'))})"
+                for k in sorted(pth)
+            )
+            print(f"    {pt:28s}  n={tv.get('n_problems','?'):3}  "
+                  f"acc_h={_fmt(tv.get('acc_hard','?'))}  {parts}")
+    print(f"  file: {hm_file}")
+else:
+    print("  (未运行或结果文件未找到)")
+
+# ── Linguini ───────────────────────────────────────────────────────────────
+ling_file = os.environ.get('_LING_RESULT_FILE', '')
+print()
+print(DASH)
+print("  Linguini")
+print(DASH)
+if ling_file and os.path.isfile(ling_file):
+    with open(ling_file, encoding='utf-8') as f:
+        d = json.load(f)
+    meta  = d.get('_meta', {})
+    summ  = d.get('_summary', {}).get('overall', {})
+    print(f"  mode      : {meta.get('mode', '?')}")
+    print(f"  model     : {meta.get('model', '?')}")
+    print(f"  n_problems: {summ.get('n_problems', '?')}  samples/prob: {meta.get('num_samples', '?')}")
+    for k in (1, 2, 3):
+        v = summ.get(f'pass@{k}')
+        if v is not None:
+            print(f"  pass@{k}(hard): {_fmt(v)}")
+    buckets = d.get('_summary', {}).get('buckets', {})
+    if buckets:
+        print("  by task type:")
+        for bt, bv in sorted(buckets.items()):
+            pk = bv.get('pass@k', {})
+            p1 = pk.get('pass@1', '?')
+            p1s = f"{p1:.4f}" if isinstance(p1, float) else str(p1)
+            print(f"    {bt:16s}  n={bv.get('n','?'):3}  pass@1(hard)={p1s}")
+    print(f"  file: {ling_file}")
+else:
+    print("  (未运行或结果文件未找到)")
+
+print()
+print(SEP)
+print("  评测完成。")
+print(SEP)
+PYEOF

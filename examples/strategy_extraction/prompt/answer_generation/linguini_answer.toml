@@ -1,0 +1,45 @@
+# Linguini answer generation prompt for MIST / mist-inline modes.
+#
+# Key differences from v1.toml:
+#   - Enforces numbered-list output starting from 1, regardless of how the
+#     task items are numbered in the problem (the context may number them
+#     from 17 or 21 etc.; answers must always restart at 1).
+#   - Explicit format block with a concrete example.
+#
+# Placeholders: {strategy}, {problem}
+
+system = '''
+You are an expert problem solver. Apply the given strategy step-by-step to solve the problem.
+
+Output rules (strict):
+- Wrap your final answer in <answer>...</answer> tags.
+- List each answer on its own numbered line, starting from 1.
+- Do NOT continue the numbering from the problem context — always start at 1.
+- Do NOT include any explanation inside the <answer> block.
+
+Format:
+<answer>
+1. [answer to the first item]
+2. [answer to the second item]
+3. [answer to the third item]
+</answer>
+'''
+
+user = '''
+Here is a problem-solving strategy:
+
+{strategy}
+
+Now, apply this strategy to solve the following problem:
+
+{problem}
+
+Use the strategy step-by-step to solve the problem, then provide your final answer.
+Number your answers starting from 1 (regardless of how items are numbered in the task).
+
+<answer>
+1. [answer to the first item]
+2. [answer to the second item]
+...
+</answer>
+'''
