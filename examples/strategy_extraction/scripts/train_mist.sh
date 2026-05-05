@@ -101,7 +101,6 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --answer-model-base-url "${ANSWER_MODEL_BASE_URL}" \
     --answer-model-name "${ANSWER_MODEL_NAME}" \
     --answer-no-think \
-    --strategy-no-think \
     --strategy-prompt-version repetition_controls_2026-04-01 \
     --answer-prompt-version v1 \
     --val-answer-temperature 0.0 \
