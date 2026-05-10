@@ -144,6 +144,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # MIST reward: R_EIR × (1 + β·R_ICR)
         beta: float = 0.0,
         eir_k: float = 10.0,
+        alpha_up: float = 0.7,
+        alpha_down: float = 0.3,
     ) -> None:
         super().__init__()
         self.save_full_output = save_full_output
@@ -265,9 +267,12 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         # MIST reward: R_EIR × (1 + β·R_ICR)
         self._beta: float = float(beta)
         self._eir_k: float = float(eir_k)
+        self._alpha_up: float = float(alpha_up)
+        self._alpha_down: float = float(alpha_down)
         if self._baseline_cache:
             logger.info(
                 f"MIST reward enabled: beta={self._beta}, eir_k={self._eir_k}, "
+                f"alpha_up={self._alpha_up}, alpha_down={self._alpha_down}, "
                 f"baseline_entries={len(self._baseline_cache)}"
                 + (" (pure EIR, no ICR scaling)" if self._beta == 0.0 else "")
             )
@@ -410,13 +415,19 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _compute_eir(a_curr: float, a_base: float, k: float) -> float:
+    def _compute_eir(
+        a_curr: float,
+        a_base: float,
+        k: float,
+        alpha_up: float = 0.7,
+        alpha_down: float = 0.3,
+    ) -> float:
         """Execution Incremental Reward: sign(g_raw) · ln(1 + k·|g_raw|).
 
-        Uses asymmetric normalization: α=0.7 when improving (a_curr≥a_base),
-        α=0.3 when regressing, with denominator clamped to 0.05.
+        Uses asymmetric normalization: alpha_up when improving (a_curr≥a_base),
+        alpha_down when regressing, with denominator clamped to 0.05.
         """
-        alpha = 0.7 if a_curr >= a_base else 0.3
+        alpha = alpha_up if a_curr >= a_base else alpha_down
         denom = max(a_base ** alpha * (1.0 - a_base) ** (1.0 - alpha), 0.05)
         g_raw = (a_curr - a_base) / denom
         return math.copysign(math.log(1.0 + k * abs(g_raw)), g_raw)
@@ -982,7 +993,10 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
 
                 # MIST formula: R = R_EIR × (1 + β·R_ICR)
                 _r_icr = self._compute_icr(_token_logprobs)
-                _r_eir = self._compute_eir(_a_curr, _a_base, self._eir_k)
+                _r_eir = self._compute_eir(
+                    _a_curr, _a_base, self._eir_k,
+                    alpha_up=self._alpha_up, alpha_down=self._alpha_down,
+                )
                 _final = _r_eir * (1.0 + self._beta * _r_icr)
 
                 logger.info(

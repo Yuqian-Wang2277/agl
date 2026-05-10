@@ -833,6 +833,8 @@ def train(
     train_new_problems_per_sample: int = 1,
     beta: float = 0.0,
     eir_k: float = 10.0,
+    alpha_up: float = 0.7,
+    alpha_down: float = 0.3,
     train_batch_size: Optional[int] = None,
     total_epochs: Optional[int] = None,
     test_freq: Optional[int] = None,
@@ -1195,6 +1197,8 @@ def train(
         incremental_weight=incremental_weight,
         beta=beta,
         eir_k=eir_k,
+        alpha_up=alpha_up,
+        alpha_down=alpha_down,
     )
 
     # Trainer
@@ -1659,6 +1663,22 @@ def main() -> None:
         default=10.0,
         help="MIST k: log-smoothing scale for EIR = sign(g) · ln(1 + k·|g|). Default: 10.0.",
     )
+    parser.add_argument(
+        "--alpha-up",
+        "--alpha_up",
+        type=float,
+        default=0.7,
+        help="MIST EIR α when a_curr >= a_base (improving). "
+             "Controls asymmetric normalization denominator. Default: 0.7.",
+    )
+    parser.add_argument(
+        "--alpha-down",
+        "--alpha_down",
+        type=float,
+        default=0.3,
+        help="MIST EIR α when a_curr < a_base (regressing). "
+             "Controls asymmetric normalization denominator. Default: 0.3.",
+    )
 
     args = parser.parse_args()
 
@@ -1756,6 +1776,8 @@ def main() -> None:
         train_new_problems_per_sample=args.train_new_problems_per_sample,
         beta=args.beta,
         eir_k=args.eir_k,
+        alpha_up=args.alpha_up,
+        alpha_down=args.alpha_down,
         train_batch_size=args.train_batch_size,
         total_epochs=args.total_epochs,
         test_freq=args.test_freq,

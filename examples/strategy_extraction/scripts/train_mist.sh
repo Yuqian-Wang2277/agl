@@ -47,6 +47,8 @@ ANSWER_MODEL_NAME="${ANSWER_MODEL_NAME:-Qwen3-8B}"
 # --- MIST reward parameters ---
 BETA="${BETA:-0.5}"                                    # β: ICR amplification weight
 EIR_K="${EIR_K:-10.0}"                                # k: log-smoothing scale for EIR
+ALPHA_UP="${ALPHA_UP:-0.7}"                            # α when a_curr >= a_base (improving)
+ALPHA_DOWN="${ALPHA_DOWN:-0.3}"                        # α when a_curr <  a_base (regressing)
 BASELINE_CACHE_PATH="${BASELINE_CACHE_PATH:-}"         # path to baseline_cache.json (required for MIST)
 FILTER_TO_BASELINE_CACHE="${FILTER_TO_BASELINE_CACHE:-1}"  # 1=filter train set to cached problems only (recommended)
 
@@ -58,7 +60,8 @@ SAVE_FREQ="${SAVE_FREQ:-50}"                     # checkpoint every N steps
 
 # --- Fixed: M=1 for ICR, no scorer ---
 GROUNDED_PROXY_K=1
-FORMAT_WEIGHT=0.0
+# 格式阶段可把 FORMAT_WEIGHT 调大（如 1.0），并去掉 BASELINE_CACHE_PATH 以关闭 MIST，仅用 v3 的 format 信号训练。
+FORMAT_WEIGHT="${FORMAT_WEIGHT:-0.0}"
 
 echo "========================================="
 echo " MIST Reward Training (EIR × (1 + β·ICR))"
@@ -67,6 +70,8 @@ echo " Train data : ${CZJ_TRAIN_ROOT}/${TRAIN_SUBDIR}"
 echo " Val root   : ${VAL_DATA_ROOT}"
 echo " β (beta)   : ${BETA}"
 echo " k (eir_k)  : ${EIR_K}"
+echo " α_up       : ${ALPHA_UP}"
+echo " α_down     : ${ALPHA_DOWN}"
 echo " Baseline   : ${BASELINE_CACHE_PATH:-<not set — MIST disabled>}"
 echo " Filter     : ${FILTER_TO_BASELINE_CACHE} (1=filter train set to cached problems)"
 echo " Schedule   : batch=${TRAIN_BATCH_SIZE}, epochs=${TOTAL_EPOCHS}, test=${TEST_FREQ}, save=${SAVE_FREQ}"
@@ -111,10 +116,12 @@ python -m examples.strategy_extraction.train_strategy_generation \
     --answer-retry-delay-sec 1.0 \
     --beta "${BETA}" \
     --eir-k "${EIR_K}" \
+    --alpha-up "${ALPHA_UP}" \
+    --alpha-down "${ALPHA_DOWN}" \
     --train-batch-size "${TRAIN_BATCH_SIZE}" \
     --total-epochs "${TOTAL_EPOCHS}" \
     --test-freq "${TEST_FREQ}" \
     --save-freq "${SAVE_FREQ}" \
     ${BASELINE_CACHE_PATH:+--baseline-cache-path "${BASELINE_CACHE_PATH}"} \
-    ${FILTER_TO_BASELINE_CACHE:+--filter-to-baseline-cache} \
+    $([ "${FILTER_TO_BASELINE_CACHE:-0}" = "1" ] && echo --filter-to-baseline-cache) \
     "$@"
