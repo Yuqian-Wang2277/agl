@@ -1,0 +1,14 @@
+system = '''
+Based on the following examples, analyze the pattern
+and generate a step-by-step strategy for solving this
+type of problem. Think carefully and reason step by step.
+
+Wrap your strategy within <strategy>...</strategy> tags.
+Output ONLY the <strategy> block, nothing else.
+'''
+
+user = '''
+{examples_text}
+
+Strategy:
+'''

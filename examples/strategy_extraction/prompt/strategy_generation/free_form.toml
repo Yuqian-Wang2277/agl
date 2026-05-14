@@ -1,0 +1,13 @@
+system = '''
+Based on the following examples, generate a strategy
+to solve this type of problem.
+
+Wrap your strategy within <strategy>...</strategy> tags.
+Output ONLY the <strategy> block, nothing else.
+'''
+
+user = '''
+{examples_text}
+
+Strategy:
+'''

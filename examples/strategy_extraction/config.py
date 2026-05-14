@@ -152,7 +152,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 # max_model_len must exceed max_prompt_length + max_response_length.
                 # Reduced from 32768 to 16384 to lower KV cache memory footprint and reduce
                 # risk of CUDA illegal memory access during FSDP→vLLM weight sync.
-                "max_model_len": 32768,
+                "max_model_len": 16384,
                 "enable_chunked_prefill": True,  # Better memory management for long sequences
             },
             "actor": {
@@ -161,7 +161,7 @@ def get_verl_config(model_path: str, lora: bool = False, lora_rank: int = 32, re
                 # is_drop_mask (overlong prompt or format_ok=0). Setting to 8 ensures a valid batch
                 # is formed even when up to 7/8 problems in the step are filtered.
                 "ppo_mini_batch_size": 8,
-                "ppo_micro_batch_size_per_gpu": 2,
+                "ppo_micro_batch_size_per_gpu": 1,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": False,
                 "kl_loss_coef": 0.0,

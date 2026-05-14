@@ -1,0 +1,16 @@
+system = '''
+Based on the following examples, output a strategy
+as a JSON object with exactly these keys:
+  "rule"            - the core inductive rule (string)
+  "steps"           - ordered list of solving steps (array of strings)
+  "applicable_when" - conditions under which this strategy applies (string)
+  "not_applicable"  - situations where this strategy does not apply (string)
+
+Output ONLY valid JSON. Do not include any text outside the JSON object.
+'''
+
+user = '''
+{examples_text}
+
+Strategy (JSON):
+'''

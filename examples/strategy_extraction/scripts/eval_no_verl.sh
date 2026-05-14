@@ -826,3 +826,37 @@ print(SEP)
 print("  评测完成。")
 print(SEP)
 PYEOF
+
+# ============================================================
+#  统计显著性检验（可选后处理步骤）
+# ============================================================
+#  运行完评测后，可用 stat_test.py 对两个条件做 bootstrap 置信区间
+#  和配对显著性检验（McNemar / Wilcoxon / 配对 t 检验）。
+#  脚本自动识别 Linguini、HARDMath2 和 eval_no_verl 三种结果格式。
+#
+#  示例——比较两个 Linguini 结果文件：
+#    python examples/strategy_extraction/scripts/stat_test.py \
+#        --a banchmark/linguini/my_linguini_results/few-shot/Qwen3-8B-trained/linguini_passk_Qwen3-8B-trained_few-shot.json \
+#        --b banchmark/linguini/my_linguini_results/MIST+few-shot/Qwen3-8B-trained/linguini_passk_Qwen3-8B-trained_MIST.json \
+#        --label-a "few-shot" --label-b "MIST+few-shot" \
+#        --subgroup --out results/stat_report.json
+#
+#  示例——比较两个 HARDMath2 结果文件：
+#    python examples/strategy_extraction/scripts/stat_test.py \
+#        --a banchmark/HARDMath2/results/hardmath_few-shot.json \
+#        --b banchmark/HARDMath2/results/hardmath_MIST.json \
+#        --label-a "few-shot" --label-b "MIST" --subgroup
+#
+#  示例——比较训练前后的 eval_no_verl rollout 目录：
+#    python examples/strategy_extraction/scripts/stat_test.py \
+#        --a checkpoints_eval_no_verl/pre/ \
+#        --b checkpoints_eval_no_verl/post_step250/ \
+#        --label-a "4B base" --label-b "4B MIST step-250"
+#
+#  参数速查：
+#    --n-bootstrap N   bootstrap 次数（默认 10000）
+#    --ci FLOAT        置信水平，单位 %（默认 95）
+#    --seed INT        随机种子（默认 42）
+#    --subgroup        输出按任务类型分组的子集检验
+#    --out PATH        将完整报告写入 JSON 文件
+# ============================================================
