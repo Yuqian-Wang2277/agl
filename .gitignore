@@ -236,6 +236,4 @@ data/
 checkpoints_mist/
 checkpoints_baseline_train_sft8b/
 my_hardmath_results/
-banchmark/BBH-ID-OOD/results/
-banchmark/HARDMath2/results/
-banchmark/linguini/results/
+banchmark/

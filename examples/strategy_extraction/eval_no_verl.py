@@ -345,6 +345,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "When >1 and temperature==0, auto-switches temperature to 0.7 and uses "
         "incrementing seeds (base_seed, base_seed+1, ...) per attempt.",
     )
+    parser.add_argument(
+        "--compute-icr",
+        action="store_true",
+        default=False,
+        help="Compute ICR (Internal Confidence Reward) during evaluation. "
+        "Requires the answer model server to support logprobs (vLLM). "
+        "Each answer call is made with logprobs=True; ICR = exp(mean(log P(token))). "
+        "Results are reported per split alongside accuracy metrics.",
+    )
 
     return parser
 
@@ -511,6 +520,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
             answer_request_retries=args.answer_request_retries,
             answer_retry_delay_sec=args.answer_retry_delay_sec,
             answer_fallback_rollout_on_failure=not args.no_answer_fallback_rollout,
+            compute_eval_icr=args.compute_icr,
         )
         # Ensure shard filenames don't collide across workers in the same process.
         agent._worker_id = f"{os.getpid()}_{worker_idx}"
@@ -527,8 +537,10 @@ async def _run_eval(args: argparse.Namespace) -> None:
     # Run rollouts sequentially (no VERL / Ray).
     overall_soft: List[float] = []
     overall_hard: List[float] = []
+    overall_icr: List[float] = []
     by_split_soft: Dict[str, List[float]] = {}
     by_split_hard: Dict[str, List[float]] = {}
+    by_split_icr: Dict[str, List[float]] = {}
 
     # Per-problem tracking for pass@k: problem_idx -> list of (soft, hard) per attempt.
     per_problem_soft: Dict[int, List[float]] = {}
@@ -588,6 +600,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
         soft = reward.get("correctness", None)
         hard = reward.get("hard_correct", None)
+        icr_val = reward.get("r_icr", None)
         async with stats_lock:
             if soft is not None:
                 try:
@@ -605,6 +618,14 @@ async def _run_eval(args: argparse.Namespace) -> None:
                     by_split_hard.setdefault(split, []).append(h)
                     per_problem_hard.setdefault(problem_idx, []).append(h)
                     by_split_per_problem_hard.setdefault(split, {}).setdefault(problem_idx, []).append(h)
+                except Exception:  # noqa: BLE001
+                    pass
+            if icr_val is not None and args.compute_icr:
+                try:
+                    ic = float(icr_val)
+                    if ic > 0.0:  # only include samples where ICR was actually computed
+                        overall_icr.append(ic)
+                        by_split_icr.setdefault(split, []).append(ic)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -669,6 +690,11 @@ async def _run_eval(args: argparse.Namespace) -> None:
         print(f"Acc_soft(all): {_mean(overall_soft):.4f}")
     if overall_hard:
         print(f"Acc_hard(all): {_mean(overall_hard):.4f}")
+    if args.compute_icr:
+        if overall_icr:
+            print(f"ICR(all):      {_mean(overall_icr):.4f}  (n={len(overall_icr)})")
+        else:
+            print("ICR(all):      NA  (no ICR values collected; check answer server logprobs support)")
 
     # pass@k overall
     k_values = [k for k in (1, 2, 3) if k <= num_samples]
@@ -683,10 +709,11 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     if by_split_soft or by_split_hard:
         print("\nBy validation split:")
-        all_splits = sorted(set(by_split_soft.keys()) | set(by_split_hard.keys()))
+        all_splits = sorted(set(by_split_soft.keys()) | set(by_split_hard.keys()) | set(by_split_icr.keys()))
         for split in all_splits:
             soft_vals = by_split_soft.get(split, [])
             hard_vals = by_split_hard.get(split, [])
+            icr_vals = by_split_icr.get(split, [])
             soft_part = f"acc_soft={_mean(soft_vals):.4f}" if soft_vals else "acc_soft=NA"
             hard_part = f"acc_hard={_mean(hard_vals):.4f}" if hard_vals else "acc_hard=NA"
             n_part = max(len(soft_vals), len(hard_vals))
@@ -696,7 +723,12 @@ async def _run_eval(args: argparse.Namespace) -> None:
                 ps_str = _pass_at_k_split(by_split_per_problem_soft.get(split, {}), k)
                 pass_parts.append(f"p@{k}(h)={ph_str} p@{k}(s)={ps_str}")
             pass_str = "  " + "  ".join(pass_parts) if pass_parts else ""
-            print(f"  - {split:20s} n={n_part:4d}  {soft_part}  {hard_part}{pass_str}")
+            icr_part = (
+                f"  icr={_mean(icr_vals):.4f}(n={len(icr_vals)})"
+                if (args.compute_icr and icr_vals)
+                else ""
+            )
+            print(f"  - {split:20s} n={n_part:4d}  {soft_part}  {hard_part}{pass_str}{icr_part}")
     print("=" * 90 + "\n")
 
 

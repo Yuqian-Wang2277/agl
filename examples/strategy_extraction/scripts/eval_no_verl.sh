@@ -287,9 +287,17 @@
 #   FULL_DATASET=0（默认）  — 分层采样，每个 subtask JSON 取 VAL_SAMPLES_PER_SUBTASK 条（默认 20）
 #   FULL_DATASET=1          — 全量枚举，每道题恰好跑一次（~123k 题，约为默认的 17 倍）
 #
+# ICR 开关：
+#   COMPUTE_ICR=0（默认）   — 不计算 ICR，速度更快
+#   COMPUTE_ICR=1           — 计算 ICR（需要 answer model vLLM 支持 logprobs）
+#                             所有模式均可使用（few-shot / MIST / mist-inline / habit 等）
+#                             ICR 结果随准确率一并打印在评测汇总中
+#
 # 示例：
 #   VAL_SAMPLES_PER_SUBTASK=50 bash examples/strategy_extraction/scripts/eval_no_verl.sh
 #   FULL_DATASET=1 bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   COMPUTE_ICR=1 MODE=MIST bash examples/strategy_extraction/scripts/eval_no_verl.sh
+#   COMPUTE_ICR=1 MODE=few-shot bash examples/strategy_extraction/scripts/eval_no_verl.sh
 
 set -euo pipefail
 
@@ -348,6 +356,20 @@ if [[ "${STRATEGY_THINK}" == "1" ]]; then
 else
     STRATEGY_THINK_ARGS=(--strategy-no-think)
     echo "[INFO] Strategy model think 模式：关闭（STRATEGY_THINK=0）"
+fi
+
+# --- ICR 评测开关 ---
+# COMPUTE_ICR=0（默认）  不计算 ICR，评测速度更快
+# COMPUTE_ICR=1          计算 ICR（Internal Confidence Reward），
+#                        需要 answer model vLLM 服务支持 logprobs（--enable-log-probs）
+#                        每次 answer 调用附带 logprobs=True，结果与准确率一并输出
+COMPUTE_ICR="${COMPUTE_ICR:-0}"
+COMPUTE_ICR_ARGS=()
+if [[ "${COMPUTE_ICR}" == "1" ]]; then
+    COMPUTE_ICR_ARGS=(--compute-icr)
+    echo "[INFO] ICR 计算：开启（COMPUTE_ICR=1，需要 answer server 支持 logprobs）"
+else
+    echo "[INFO] ICR 计算：关闭（COMPUTE_ICR=0）"
 fi
 
 # --- 模式专属参数 ---
@@ -534,6 +556,7 @@ python -m examples.strategy_extraction.eval_no_verl \
   --answer-retry-delay-sec 1.0 \
   "${MODE_ARGS[@]}" \
   "${SAMPLING_MODE_ARGS[@]}" \
+  "${COMPUTE_ICR_ARGS[@]}" \
   "$@"
 
 # ============================================================

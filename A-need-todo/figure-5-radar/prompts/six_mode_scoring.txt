@@ -1,0 +1,44 @@
+You are an expert in inductive reasoning. Score the following model-generated strategy on six theoretically grounded modes of induction. Each mode is rated on an integer scale 0–5; scores must be justified by direct reference to the strategy text.
+
+Task description: {task}
+
+Strategy to score: {strategy}
+
+Six induction modes:
+
+1. Compositional — Does the strategy combine multiple atomic sub-rules into a composite procedure (e.g. chaining conditions, nesting operations)?
+
+2. Analogical — Does the strategy draw structural correspondences across examples, mapping shared relational patterns rather than surface features?
+
+3. Pattern Extrapolation — Does the strategy extract a pattern that visibly extends beyond the demonstrated instances (e.g. to longer sequences, new value ranges, unseen entities)?
+
+4. Procedural — Does the strategy abstract a step-wise algorithm from input–output pairs (clear ordering, state updates, termination conditions)?
+
+5. Constraint-based — Does the strategy identify and articulate implicit constraints, preconditions, or boundary conditions (e.g. when the rule does NOT apply)?
+
+6. Schema-induction — Does the strategy explicitly classify the task type itself, recognising the meta-level structure (e.g. "this is a coordinate-tracking problem")?
+
+0–5 scoring rubric (applied per dimension):
+• 0 — Absent: no evidence of this mode in the strategy.
+• 1 — Hinted: a fragment alludes to it but is not developed.
+• 2 — Partial: present but incomplete or ambiguous.
+• 3 — Adequate: clearly present, executable, but minimal.
+• 4 — Strong: well-developed, multi-step or multi-condition.
+• 5 — Exemplary: cleanly abstracted, generalisable, with explicit scope statements.
+
+Calibration constraints:
+(i) Scores must reference specific text spans (quote the supporting sentence in evidence).
+(ii) If a mode is structurally inapplicable to the task type, mark as N/A rather than 0.
+(iii) Modes are scored independently; high score on one does not imply high score on others.
+
+Output strictly in JSON:
+
+{
+  "compositional": {"score": 0-5 or "N/A", "evidence": "...", "reason": "..."},
+  "analogical": {"score": 0-5 or "N/A", "evidence": "...", "reason": "..."},
+  "pattern_extrapolation": {"score": 0-5 or "N/A", "evidence": "...", "reason": "..."},
+  "procedural": {"score": 0-5 or "N/A", "evidence": "...", "reason": "..."},
+  "constraint_based": {"score": 0-5 or "N/A", "evidence": "...", "reason": "..."},
+  "schema_induction": {"score": 0-5 or "N/A", "evidence": "...", "reason": "..."},
+  "composite": {"mean_score": float, "applicable_modes": int}
+}

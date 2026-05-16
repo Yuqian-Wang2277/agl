@@ -146,6 +146,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         eir_k: float = 10.0,
         alpha_up: float = 0.7,
         alpha_down: float = 0.3,
+        # Eval-time ICR: compute AS token-level log-probability confidence during validation
+        compute_eval_icr: bool = False,
     ) -> None:
         super().__init__()
         self.save_full_output = save_full_output
@@ -269,6 +271,8 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
         self._eir_k: float = float(eir_k)
         self._alpha_up: float = float(alpha_up)
         self._alpha_down: float = float(alpha_down)
+        # Eval-time ICR metric
+        self._compute_eval_icr: bool = compute_eval_icr
         if self._baseline_cache:
             logger.info(
                 f"MIST reward enabled: beta={self._beta}, eir_k={self._eir_k}, "
@@ -1041,6 +1045,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
             hard_correct_list: List[int] = []
             answer_used_rollout_fallback = False
             effective_proxy = 0.0
+            r_icr: float = 0.0  # eval-time ICR metric (0.0 when not computed)
 
             if strategy and self.reward_mode == "hybrid_grounded":
                 try:
@@ -1257,22 +1262,54 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                                 f"{passes} → correctness={correctness:.3f}"
                             )
                         elif should_use_k_answers:
+                            _icr_values: List[float] = []
                             for _ in range(self.grounded_proxy_k):
-                                answer_raw, _via = await self._generate_answer_untraced(
-                                    base_url=ans_base_url,
-                                    api_key=ans_api_key,
-                                    model=ans_model,
-                                    strategy=answer_strategy,
-                                    problem=task["problem"],
-                                    temperature=answer_temperature,
-                                    max_tokens=self._answer_max_tokens_for_llm(llm),
-                                    seed=llm_request_seed,
-                                    examples_text=examples_text,
-                                    rollout_fallback_base_url=base_url,
-                                    rollout_fallback_model=llm.model,
-                                )
-                                if _via == "rollout_fallback":
-                                    answer_used_rollout_fallback = True
+                                if self._compute_eval_icr:
+                                    answer_raw, _icr_lp = await self._post_answer_chat_completions_mist(
+                                        base_url=ans_base_url,
+                                        api_key=ans_api_key,
+                                        model=ans_model,
+                                        strategy=answer_strategy,
+                                        problem=task["problem"],
+                                        temperature=answer_temperature,
+                                        max_tokens=self._answer_max_tokens_for_llm(llm),
+                                        seed=llm_request_seed,
+                                        examples_text=examples_text,
+                                    )
+                                    if _icr_lp:
+                                        _icr_values.append(self._compute_icr(_icr_lp))
+                                    if not answer_raw:
+                                        answer_raw, _via = await self._generate_answer_untraced(
+                                            base_url=ans_base_url,
+                                            api_key=ans_api_key,
+                                            model=ans_model,
+                                            strategy=answer_strategy,
+                                            problem=task["problem"],
+                                            temperature=answer_temperature,
+                                            max_tokens=self._answer_max_tokens_for_llm(llm),
+                                            seed=llm_request_seed,
+                                            examples_text=examples_text,
+                                            rollout_fallback_base_url=base_url,
+                                            rollout_fallback_model=llm.model,
+                                        )
+                                        if _via == "rollout_fallback":
+                                            answer_used_rollout_fallback = True
+                                else:
+                                    answer_raw, _via = await self._generate_answer_untraced(
+                                        base_url=ans_base_url,
+                                        api_key=ans_api_key,
+                                        model=ans_model,
+                                        strategy=answer_strategy,
+                                        problem=task["problem"],
+                                        temperature=answer_temperature,
+                                        max_tokens=self._answer_max_tokens_for_llm(llm),
+                                        seed=llm_request_seed,
+                                        examples_text=examples_text,
+                                        rollout_fallback_base_url=base_url,
+                                        rollout_fallback_model=llm.model,
+                                    )
+                                    if _via == "rollout_fallback":
+                                        answer_used_rollout_fallback = True
                                 answer_raw_list.append(answer_raw)
                                 answer_extracted = self.reward_config.extract_answer(answer_raw) or ""
                                 answer_extracted_list.append(answer_extracted)
@@ -1310,21 +1347,55 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                             extracted_answer = answer_extracted_list[rep_idx] if rep_idx < len(answer_extracted_list) else ""
                             hard_correct = hard_correct_list[rep_idx] if rep_idx < len(hard_correct_list) else 0
                             answer_call_succeeded = len(answer_raw_list) > 0
+                            if self._compute_eval_icr and _icr_values:
+                                r_icr = sum(_icr_values) / len(_icr_values)
                         else:
-                            answer_output, _via = await self._generate_answer_untraced(
-                                base_url=ans_base_url,
-                                api_key=ans_api_key,
-                                model=ans_model,
-                                strategy=answer_strategy,
-                                problem=task["problem"],
-                                temperature=answer_temperature,
-                                max_tokens=self._answer_max_tokens_for_llm(llm),
-                                seed=llm_request_seed,
-                                examples_text=examples_text,
-                                rollout_fallback_base_url=base_url,
-                                rollout_fallback_model=llm.model,
-                            )
-                            answer_used_rollout_fallback = _via == "rollout_fallback"
+                            if self._compute_eval_icr:
+                                _icr_content, _icr_lp = await self._post_answer_chat_completions_mist(
+                                    base_url=ans_base_url,
+                                    api_key=ans_api_key,
+                                    model=ans_model,
+                                    strategy=answer_strategy,
+                                    problem=task["problem"],
+                                    temperature=answer_temperature,
+                                    max_tokens=self._answer_max_tokens_for_llm(llm),
+                                    seed=llm_request_seed,
+                                    examples_text=examples_text,
+                                )
+                                if _icr_content:
+                                    answer_output = _icr_content
+                                    r_icr = self._compute_icr(_icr_lp)
+                                    answer_used_rollout_fallback = False
+                                else:
+                                    answer_output, _via = await self._generate_answer_untraced(
+                                        base_url=ans_base_url,
+                                        api_key=ans_api_key,
+                                        model=ans_model,
+                                        strategy=answer_strategy,
+                                        problem=task["problem"],
+                                        temperature=answer_temperature,
+                                        max_tokens=self._answer_max_tokens_for_llm(llm),
+                                        seed=llm_request_seed,
+                                        examples_text=examples_text,
+                                        rollout_fallback_base_url=base_url,
+                                        rollout_fallback_model=llm.model,
+                                    )
+                                    answer_used_rollout_fallback = _via == "rollout_fallback"
+                            else:
+                                answer_output, _via = await self._generate_answer_untraced(
+                                    base_url=ans_base_url,
+                                    api_key=ans_api_key,
+                                    model=ans_model,
+                                    strategy=answer_strategy,
+                                    problem=task["problem"],
+                                    temperature=answer_temperature,
+                                    max_tokens=self._answer_max_tokens_for_llm(llm),
+                                    seed=llm_request_seed,
+                                    examples_text=examples_text,
+                                    rollout_fallback_base_url=base_url,
+                                    rollout_fallback_model=llm.model,
+                                )
+                                answer_used_rollout_fallback = _via == "rollout_fallback"
                             extracted_answer = self.reward_config.extract_answer(answer_output)
                             if extracted_answer:
                                 correctness = self.reward_config.compute_answer_correctness(
@@ -1443,6 +1514,7 @@ class StrategyGenerationAgent(agl.LitAgent["StrategyGenerationTask"]):
                 "answer_model_version": self.answer_model_name or llm.model,
                 "used_soft_fallback": used_soft_fallback,
                 "answer_used_rollout_fallback": answer_used_rollout_fallback,
+                "r_icr": r_icr,
                 "final": final_reward,
             }
 
