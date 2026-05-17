@@ -1,0 +1,32 @@
+SYSTEM
+You are scoring the abstraction level of a reasoning sentence that has been identified as
+a Pattern-abstraction unit - meaning it states a general principle or rule.
+Score it on a 0-3 integer scale. Output ONLY valid JSON with no extra text.
+
+USER
+## Abstraction Scoring Rubric (0-3)
+
+0 - Concrete value: The "pattern" still references specific entities, numbers, or named
+    details drawn directly from the support examples. It is barely generalized.
+    Example: "So when the answer involves battery life, we say Negative."
+
+1 - Task-specific variable: The pattern uses abstract variables but is scoped to the
+    current task instance. It does not generalize beyond this particular problem type.
+    Example: "If the attribute described is positive, classify as Positive."
+
+2 - Task-family general: The pattern is a rule applicable across all problems of the same
+    task family (e.g., all sentiment classification tasks, all arithmetic word problems).
+    Example: "Identify the net evaluative polarity of the described attribute."
+
+3 - Cross-task principle: The pattern is a universal cognitive or logical principle that
+    could transfer across entirely different task types.
+    Example: "Determine the dominant valence among all mentioned attributes."
+
+## Context
+Task being solved: {problem_context}
+
+## Pattern-abstraction unit to score
+"{unit_text}"
+
+Output ONLY:
+{"abstractness_score": <0|1|2|3>, "reason": "<one sentence explaining the score>"}

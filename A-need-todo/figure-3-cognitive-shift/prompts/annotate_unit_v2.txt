@@ -1,0 +1,28 @@
+SYSTEM
+You are an expert cognitive analyst studying how language models reason during few-shot problem solving.
+Your task is to classify a single reasoning sentence into exactly ONE of four categories based on its cognitive function.
+Be strict and consistent. Output ONLY valid JSON with no extra text.
+
+USER
+## Background
+A language model is solving a few-shot task. Below is the problem it is working on:
+Problem: {problem_text}
+Given examples: {examples_summary}
+
+## Labeling Scheme
+Assign exactly one label from the four options below:
+
+E - Recitation: This sentence reproduces or closely mirrors the content of one of the
+    provided support examples. No generalization is happening.
+D - Direct use: This sentence directly addresses the current problem using a fact or
+    procedure, without first extracting a reusable pattern from the examples.
+P - Pattern extraction: This sentence articulates a general rule or regularity that
+    transcends individual examples. It is an act of induction or abstraction.
+R - Rule use: This sentence applies or references a general rule that was previously
+    extracted in the reasoning trace. It grounds the earlier abstraction in the problem.
+
+## Target sentence
+"{unit_text}"
+
+Respond with ONLY:
+{"label": "<E|D|P|R>", "reason": "<one concise sentence>"}

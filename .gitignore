@@ -232,7 +232,6 @@ examples/actor-judge/judge_warmup_ckpt/
 examples/actor-judge/wandb/
 examples/actor-judge/checkpoints_actor_judge/
 checkpoints_baseline_train/
-data/
 checkpoints_mist/
 checkpoints_baseline_train_sft8b/
 my_hardmath_results/
