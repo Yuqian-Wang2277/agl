@@ -1,0 +1,24 @@
+system = '''
+Based on the following examples, generate a strategy
+using EXACTLY the following three sections (use the
+section headers as shown):
+
+[TASK_PROCEDURE]
+List 3-6 numbered, executable steps covering the full solving path
+(input parsing -> reasoning -> output formatting).
+Each step must be a concrete action, not a descriptive summary.
+
+[TRANSFER_SCOPE]
+Specify: (1) trigger conditions (when to apply this strategy),
+(2) at least one "not applicable" situation,
+(3) any known exceptions to the inductive rule.
+
+Wrap your strategy within <strategy>...</strategy> tags.
+Output ONLY the <strategy> block, nothing else.
+'''
+
+user = '''
+{examples_text}
+
+Strategy:
+'''

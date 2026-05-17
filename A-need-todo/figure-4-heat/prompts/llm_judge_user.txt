@@ -1,0 +1,113 @@
+## Calibration Examples (for reference only — do not score these)
+
+[CALIBRATION EXAMPLE A — High abstraction, Low copying]
+Task: Sentiment classification of product reviews
+Support Ex1: "The battery dies quickly." → Negative
+Support Ex2: "Screen brightness is excellent." → Positive
+Support Ex3: "Delivery was faster than expected." → Positive
+Rule: "Identify whether the review expresses a net positive or negative
+      evaluation of a product attribute; classify accordingly."
+Expected scores:
+  abstraction_score: 5  (no specific details from examples)
+  coverage_score: 5     (all three examples follow this principle)
+  copying_score: 1      (no copying detectable)
+  transferability_score: 5
+
+[CALIBRATION EXAMPLE B — Low abstraction, High copying]
+Task: Sentiment classification of product reviews
+Support Ex1: "The battery dies quickly." → Negative
+Support Ex2: "Screen brightness is excellent." → Positive
+Support Ex3: "Delivery was faster than expected." → Positive
+Rule: "If the review mentions battery life dying quickly, classify it as Negative."
+Expected scores:
+  abstraction_score: 1  (specific to Ex1 only)
+  coverage_score: 1     (only Ex1 is covered)
+  copying_score: 5      (reproduces Ex1's content directly)
+  transferability_score: 1
+
+---
+
+## Task Description
+{task_description}
+
+## Support Examples
+Example 1:
+  Input:  {ex1_input}
+  Output: {ex1_output}
+
+Example 2:
+  Input:  {ex2_input}
+  Output: {ex2_output}
+
+Example 3:
+  Input:  {ex3_input}
+  Output: {ex3_output}
+
+## Generated Inductive Rule
+{inductive_rule}
+
+---
+
+## Evaluation Instructions
+
+Please evaluate the rule on the following four dimensions.
+For each dimension, assign an integer score from 1 to 5, and provide
+a one-sentence justification.
+
+### Dimension 1 — abstraction_score (1-5)
+Does the rule express a **task-level abstract principle** rather than
+restating or paraphrasing the support examples?
+- 5: The rule is fully abstract; it describes a general principle
+     applicable to any instance of this task, with no surface-level
+     copying from the examples.
+- 3: The rule is partially abstract but still borrows specific details
+     (e.g., entities, phrasing) from one or more examples.
+- 1: The rule is essentially a restatement or light paraphrase of a
+     single support example; no genuine abstraction is present.
+
+### Dimension 2 — coverage_score (1-5)
+Is the rule **collectively supported** by multiple support examples,
+rather than derived from only one?
+- 5: All three examples are consistent with and supportive of the rule;
+     the rule captures what is common across all of them.
+- 3: The rule fits two examples well but is inconsistent with or
+     irrelevant to one example.
+- 1: The rule only fits one example; the other examples are irrelevant
+     or even contradicted by the rule.
+
+### Dimension 3 — copying_score (1-5)
+To what extent does the rule appear to be **copied or minimally
+transformed** from a single support example?
+- 5: Strong evidence of copying — the rule reproduces specific content
+     (entities, structure, wording) from one example with minor changes.
+- 3: Moderate borrowing — the rule draws heavily from one example
+     but shows some generalization.
+- 1: No copying — the rule does not closely resemble any single example;
+     it reads as a genuinely inferred abstraction.
+NOTE: A higher copying_score is WORSE. This dimension is reverse-scored.
+
+### Dimension 4 — transferability_score (1-5)
+Would the rule be **useful and applicable** to new, unseen instances
+of this task that are different from the support examples?
+- 5: The rule is clearly transferable; a new example following this
+     task type would benefit directly from applying the rule.
+- 3: The rule is somewhat transferable but may not apply to instances
+     that differ significantly from the support examples.
+- 1: The rule is not transferable; it is too specific to the given
+     examples to generalize.
+
+---
+
+## Output Format
+Return ONLY the following JSON object (no markdown, no extra text):
+
+{
+  "abstraction_score": <int 1-5>,
+  "abstraction_reason": "<one sentence>",
+  "coverage_score": <int 1-5>,
+  "coverage_reason": "<one sentence>",
+  "copying_score": <int 1-5>,
+  "copying_reason": "<one sentence>",
+  "transferability_score": <int 1-5>,
+  "transferability_reason": "<one sentence>"
+}
