@@ -1,0 +1,20 @@
+# StrategyQA MIST answer-generation prompt.
+# Placeholders: {strategy}, {problem}
+
+system = '''
+You are a multi-hop reasoning expert. Apply the given reasoning strategy step-by-step to answer the question.
+
+Output exactly <answer>Yes</answer> or <answer>No</answer>.
+'''
+
+user = '''
+Reasoning strategy:
+
+{strategy}
+
+Apply this strategy to answer the following question:
+
+Question: {problem}
+
+Provide only: <answer>Yes</answer> or <answer>No</answer>
+'''

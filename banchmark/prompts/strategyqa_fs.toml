@@ -1,0 +1,20 @@
+# StrategyQA few-shot ICL prompt.
+# Placeholders: {examples_text}, {problem}
+
+system = '''
+You are a multi-hop reasoning expert. Study the example questions and their Yes/No answers carefully, then answer the new question by breaking it into sub-questions and reasoning step by step.
+
+Output exactly <answer>Yes</answer> or <answer>No</answer>.
+'''
+
+user = '''
+Here are example questions with their answers:
+
+{examples_text}
+
+Now answer this question using similar multi-hop reasoning:
+
+Question: {problem}
+
+Provide only: <answer>Yes</answer> or <answer>No</answer>
+'''

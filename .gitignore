@@ -235,4 +235,8 @@ checkpoints_baseline_train/
 checkpoints_mist/
 checkpoints_baseline_train_sft8b/
 my_hardmath_results/
-banchmark/
+banchmark/BBH-ID-OOD/
+banchmark/HARDMath2/
+banchmark/linguini/
+banchmark/ReClor/
+banchmark/MATH-500/

@@ -1,0 +1,20 @@
+# ReClor few-shot ICL prompt.
+# Placeholders: {examples_text}, {problem}
+
+system = '''
+You are an expert at logical reasoning and critical thinking. Study the example problems and their correct answers carefully, then solve the new problem using the same reasoning approach.
+
+Select the single best answer choice and output it inside <answer>...</answer> tags, e.g. <answer>A</answer>.
+'''
+
+user = '''
+Here are example problems with their correct answers:
+
+{examples_text}
+
+Now solve this problem using similar logical reasoning:
+
+{problem}
+
+Select the best answer. Provide only: <answer>A</answer>, <answer>B</answer>, <answer>C</answer>, or <answer>D</answer>
+'''

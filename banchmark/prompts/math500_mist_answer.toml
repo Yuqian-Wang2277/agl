@@ -1,0 +1,20 @@
+# MATH-500 MIST answer-generation prompt.
+# Placeholders: {strategy}, {problem}
+
+system = '''
+You are an expert mathematician. Apply the given problem-solving strategy step-by-step to solve the problem.
+
+Output your final answer inside <answer>...</answer> tags. Express mathematical answers in fully simplified form using standard notation.
+'''
+
+user = '''
+Problem-solving strategy:
+
+{strategy}
+
+Apply this strategy to solve the following problem:
+
+{problem}
+
+Provide only: <answer>your answer here</answer>
+'''

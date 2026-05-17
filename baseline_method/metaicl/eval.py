@@ -1,20 +1,25 @@
 """
 MetaICL unified evaluation script.
 
-Evaluates a trained MetaICL (or MetaICL-CoT) checkpoint against all five
+Evaluates a trained MetaICL (or MetaICL-CoT) checkpoint against all seven
 benchmark sets.  Connects to a vLLM-served model via OpenAI-compatible API.
 
 Benchmarks selectable via --benchmark:
-  id-ood    test-id-subtask + test-ood-task  (from LLMReflection/data/)
-  bbh       test-bbh                          (from LLMReflection/data/)
-  hardmath  HARDMath2                         (banchmark/HARDMath2/data/)
-  linguini  Linguini                          (banchmark/linguini/dataset.jsonl)
-  all       all four above
+  id-ood      test-id-subtask + test-ood-task  (from LLMReflection/data/)
+  bbh         test-bbh                          (from LLMReflection/data/)
+  hardmath    HARDMath2                         (banchmark/HARDMath2/data/)
+  linguini    Linguini                          (banchmark/linguini/dataset.jsonl)
+  math500     MATH-500                          (banchmark/MATH-500/data/test.json)
+  strategyqa  StrategyQA                        (banchmark/StrategyQA/data/test.json)
+  reclor      ReClor                            (banchmark/ReClor/data/test.json)
+  all         all seven above
 
 Scoring:
   - Greedy decode: temperature=0, do_sample=False
   - Pass@1 only (consistent across all methods including closed-source models)
   - Reuses judging functions from existing benchmark scripts
+  - math500/strategyqa/reclor scoring reuses compare_math/_extract_yes_no/_extract_abcd
+    from eval_unified.py for cross-system comparability
 
 Setup (start vLLM before running):
   CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \\
@@ -25,6 +30,7 @@ Setup (start vLLM before running):
 Usage:
   python eval.py --benchmark all --model-name metaicl --model-url http://localhost:8300/v1
   BENCHMARK=id-ood bash scripts/run_eval.sh
+  BENCHMARK="math500 strategyqa reclor" bash scripts/run_eval.sh
 
 Environment: conda activate agl  (has openai)
 """
@@ -61,6 +67,7 @@ _BANCHMARK = _REPO_ROOT / "banchmark"
 sys.path.insert(0, str(_BANCHMARK / "BBH-ID-OOD"))
 sys.path.insert(0, str(_BANCHMARK / "HARDMath2"))
 sys.path.insert(0, str(_BANCHMARK / "linguini"))
+sys.path.insert(0, str(_BANCHMARK))
 
 from eval_mist_inline import compute_answer_judgement, load_dataset  # noqa: E402
 from eval_hardmath import compare_math_answers, load_hardmath_data, select_fewshot  # noqa: E402
@@ -71,6 +78,7 @@ from run_linguini_passk import (  # noqa: E402
     score_answers,
     parse_numbered_answers,
 )
+from eval_unified import compare_math, _extract_yes_no, _extract_abcd  # noqa: E402
 
 sys.path.insert(0, str(_THIS_DIR))
 from data_formatter import make_metaicl_prompt  # noqa: E402
@@ -79,8 +87,13 @@ from data_formatter import make_metaicl_prompt  # noqa: E402
 _DATA_BASE = _REPO_ROOT / "data"          # contains test-id-subtask / test-ood-task / test-bbh
 _HARDMATH_DATA = _BANCHMARK / "HARDMath2" / "data"
 _LINGUINI_DATA = _BANCHMARK / "linguini" / "dataset.jsonl"
+_MATH500_DATA = _BANCHMARK / "MATH-500" / "data" / "test.json"
+_STRATEGYQA_DATA = _BANCHMARK / "StrategyQA" / "data" / "test.json"
+_RECLOR_DATA = _BANCHMARK / "ReClor" / "data" / "test.json"
 
-BENCHMARKS = ["id-ood", "bbh", "hardmath", "linguini"]
+BENCHMARKS = ["id-ood", "bbh", "hardmath", "linguini", "math500", "strategyqa", "reclor"]
+
+_RECLOR_LABELS = ["A", "B", "C", "D"]
 
 # ── Generation config (greedy, pass@1) ───────────────────────────────────────
 GENERATION_KWARGS = dict(
@@ -305,6 +318,245 @@ async def eval_linguini(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# MATH-500 evaluation
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def eval_math500(
+    client: AsyncOpenAI,
+    model: str,
+    data_file: Path,
+    k: int,
+    max_samples: Optional[int],
+    seed: int,
+    concurrency: int,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """Evaluate on MATH-500 using MetaICL format.
+
+    Few-shot pool: same subject (leave-one-out), k=4 shots.
+    Scoring: compare_math() from eval_unified (LaTeX norm → SymPy → char-F1).
+    Format:  Input: {problem}\\nOutput: {answer}
+    """
+    with open(data_file, encoding="utf-8") as f:
+        items = json.load(f)
+
+    # Group by subject for in-subject few-shot selection
+    by_subject: Dict[str, List[dict]] = defaultdict(list)
+    for item in items:
+        by_subject[item["subject"]].append(item)
+
+    # Build flat eval list (deterministic order: sorted subjects → original order)
+    eval_items: List[Tuple[str, dict]] = []
+    for subj in sorted(by_subject):
+        for item in by_subject[subj]:
+            eval_items.append((subj, item))
+
+    if max_samples is not None:
+        eval_items = eval_items[:max_samples]
+
+    logger.info("[MATH-500] %d problems across %d subjects", len(eval_items), len(by_subject))
+    rng = random.Random(seed)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _eval_one(subj: str, item: dict) -> dict:
+        # Leave-one-out: exclude exact same object from candidate pool
+        candidates = [p for p in by_subject[subj] if p is not item]
+        shots = rng.sample(candidates, min(k, len(candidates))) if candidates else []
+        shot_dicts = [{"input": s["problem"], "target": s["answer"]} for s in shots]
+        prompt = make_metaicl_prompt(shot_dicts, item["problem"], k=k)
+        raw_output = await _generate(client, model, prompt, sem)
+        hard_correct, soft_score = compare_math(raw_output, item["answer"])
+        return {
+            "subject": subj,
+            "hard_correct": int(hard_correct),
+            "soft_score": float(soft_score),
+            "prediction": raw_output.strip(),
+            "ground_truth": item["answer"],
+        }
+
+    results = await asyncio.gather(*[_eval_one(subj, item) for subj, item in eval_items])
+
+    # Aggregate by subject
+    by_subj_scores: Dict[str, List[int]] = defaultdict(list)
+    for r in results:
+        by_subj_scores[r["subject"]].append(r["hard_correct"])
+
+    summary: Dict[str, Any] = {}
+    for subj, scores in sorted(by_subj_scores.items()):
+        acc = sum(scores) / len(scores) if scores else 0.0
+        summary[subj] = {"pass@1": round(acc, 4), "n": len(scores)}
+        logger.info("[MATH-500] %s  pass@1=%.4f  n=%d", subj, acc, len(scores))
+
+    all_scores = [r["hard_correct"] for r in results]
+    overall = sum(all_scores) / len(all_scores) if all_scores else 0.0
+    summary["overall"] = {"pass@1": round(overall, 4), "n": len(all_scores)}
+    logger.info("[MATH-500] overall pass@1=%.4f  n=%d", overall, len(all_scores))
+
+    _save_results(output_dir, "math500", {"summary": summary, "details": results})
+    return summary
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# StrategyQA evaluation
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def eval_strategyqa(
+    client: AsyncOpenAI,
+    model: str,
+    data_file: Path,
+    k: int,
+    max_samples: Optional[int],
+    seed: int,
+    concurrency: int,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """Evaluate on StrategyQA using MetaICL format.
+
+    Few-shot pool: single pool with balanced yes/no sampling (leave-one-out).
+    Scoring: exact yes/no match via _extract_yes_no() from eval_unified.
+    Format:  Input: {question}\\nOutput: Yes / No
+    """
+    with open(data_file, encoding="utf-8") as f:
+        items = json.load(f)
+
+    if max_samples is not None:
+        items = items[:max_samples]
+
+    yes_pool = [p for p in items if p["answer"] is True]
+    no_pool = [p for p in items if p["answer"] is False]
+
+    logger.info(
+        "[StrategyQA] %d problems (yes=%d, no=%d)",
+        len(items), len(yes_pool), len(no_pool),
+    )
+    rng = random.Random(seed)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _eval_one(item: dict) -> dict:
+        qid = item["qid"]
+        # Balanced yes/no leave-one-out shot selection
+        yes_cands = [p for p in yes_pool if p["qid"] != qid]
+        no_cands = [p for p in no_pool if p["qid"] != qid]
+        n_yes = k // 2
+        n_no = k - n_yes
+        shots: List[dict] = (
+            rng.sample(yes_cands, min(n_yes, len(yes_cands)))
+            + rng.sample(no_cands, min(n_no, len(no_cands)))
+        )
+        # Pad from full pool if one class was too small
+        if len(shots) < k:
+            remaining = [p for p in items if p["qid"] != qid and p not in shots]
+            shots += rng.sample(remaining, min(k - len(shots), len(remaining)))
+        rng.shuffle(shots)
+
+        shot_dicts = [
+            {"input": s["question"], "target": "Yes" if s["answer"] else "No"}
+            for s in shots
+        ]
+        prompt = make_metaicl_prompt(shot_dicts, item["question"], k=k)
+        raw_output = await _generate(client, model, prompt, sem)
+
+        predicted = _extract_yes_no(raw_output)
+        expected = "yes" if item["answer"] else "no"
+        hard_correct = int(predicted == expected)
+
+        return {
+            "qid": qid,
+            "hard_correct": hard_correct,
+            "prediction": predicted,
+            "ground_truth": expected,
+            "raw_output": raw_output.strip(),
+        }
+
+    results = await asyncio.gather(*[_eval_one(item) for item in items])
+
+    scores = [r["hard_correct"] for r in results]
+    acc = sum(scores) / len(scores) if scores else 0.0
+    summary: Dict[str, Any] = {"pass@1": round(acc, 4), "n": len(scores)}
+    logger.info("[StrategyQA] pass@1=%.4f  n=%d", acc, len(scores))
+
+    _save_results(output_dir, "strategyqa", {"summary": summary, "details": results})
+    return summary
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ReClor evaluation
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _format_reclor_input(item: dict) -> str:
+    """Format a ReClor item into the MetaICL Input field."""
+    choices = "\n".join(
+        f"({_RECLOR_LABELS[i]}) {ans}" for i, ans in enumerate(item["answers"])
+    )
+    return (
+        f"Context: {item['context']}\n\n"
+        f"Question: {item['question']}\n\n"
+        f"{choices}"
+    )
+
+
+async def eval_reclor(
+    client: AsyncOpenAI,
+    model: str,
+    data_file: Path,
+    k: int,
+    max_samples: Optional[int],
+    seed: int,
+    concurrency: int,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """Evaluate on ReClor using MetaICL format.
+
+    Few-shot pool: single pool with leave-one-out selection.
+    Scoring: exact A/B/C/D match via _extract_abcd() from eval_unified.
+    Format:  Input: Context: ...\\n\\nQuestion: ...\\n\\n(A)...\\nOutput: A
+    """
+    with open(data_file, encoding="utf-8") as f:
+        items = json.load(f)
+
+    if max_samples is not None:
+        items = items[:max_samples]
+
+    logger.info("[ReClor] %d problems", len(items))
+    rng = random.Random(seed)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _eval_one(item: dict) -> dict:
+        item_id = item["id_string"]
+        candidates = [p for p in items if p["id_string"] != item_id]
+        shots = rng.sample(candidates, min(k, len(candidates))) if candidates else []
+
+        shot_dicts = [
+            {"input": _format_reclor_input(s), "target": _RECLOR_LABELS[s["label"]]}
+            for s in shots
+        ]
+        prompt = make_metaicl_prompt(shot_dicts, _format_reclor_input(item), k=k)
+        raw_output = await _generate(client, model, prompt, sem)
+
+        predicted = _extract_abcd(raw_output)
+        expected = _RECLOR_LABELS[item["label"]]
+        hard_correct = int(predicted == expected)
+
+        return {
+            "id": item_id,
+            "hard_correct": hard_correct,
+            "prediction": predicted,
+            "ground_truth": expected,
+            "raw_output": raw_output.strip(),
+        }
+
+    results = await asyncio.gather(*[_eval_one(item) for item in items])
+
+    scores = [r["hard_correct"] for r in results]
+    acc = sum(scores) / len(scores) if scores else 0.0
+    summary: Dict[str, Any] = {"pass@1": round(acc, 4), "n": len(scores)}
+    logger.info("[ReClor] pass@1=%.4f  n=%d", acc, len(scores))
+
+    _save_results(output_dir, "reclor", {"summary": summary, "details": results})
+    return summary
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Output helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -340,7 +592,7 @@ def _parse_args() -> argparse.Namespace:
         "--benchmark", "-b", nargs="+",
         choices=BENCHMARKS + ["all"],
         default=["all"],
-        help="Benchmark(s) to evaluate. 'all' runs all four.",
+        help="Benchmark(s) to evaluate. 'all' runs all seven.",
     )
     p.add_argument("--model-url", default=os.environ.get("MODEL_URL", "http://localhost:8300/v1"),
                    help="vLLM OpenAI-compatible base URL")
@@ -362,6 +614,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Root data directory (contains test-* subdirs)")
     p.add_argument("--hardmath-data", default=str(_HARDMATH_DATA))
     p.add_argument("--linguini-data", default=str(_LINGUINI_DATA))
+    p.add_argument("--math500-data", default=str(_MATH500_DATA),
+                   help="Path to MATH-500 test.json")
+    p.add_argument("--strategyqa-data", default=str(_STRATEGYQA_DATA),
+                   help="Path to StrategyQA test.json")
+    p.add_argument("--reclor-data", default=str(_RECLOR_DATA),
+                   help="Path to ReClor test.json")
     return p.parse_args()
 
 
@@ -426,6 +684,42 @@ async def _main() -> None:
             output_dir=output_dir,
         )
         all_results["linguini"] = res
+
+    if "math500" in targets:
+        res = await eval_math500(
+            client, args.model_name,
+            data_file=Path(args.math500_data),
+            k=args.k_shot,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            concurrency=args.concurrency,
+            output_dir=output_dir,
+        )
+        all_results["math500"] = res
+
+    if "strategyqa" in targets:
+        res = await eval_strategyqa(
+            client, args.model_name,
+            data_file=Path(args.strategyqa_data),
+            k=args.k_shot,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            concurrency=args.concurrency,
+            output_dir=output_dir,
+        )
+        all_results["strategyqa"] = res
+
+    if "reclor" in targets:
+        res = await eval_reclor(
+            client, args.model_name,
+            data_file=Path(args.reclor_data),
+            k=args.k_shot,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            concurrency=args.concurrency,
+            output_dir=output_dir,
+        )
+        all_results["reclor"] = res
 
     _print_summary(all_results)
 

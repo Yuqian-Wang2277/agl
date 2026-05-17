@@ -6,8 +6,8 @@
 # Key environment variables:
 #   CHECKPOINT   — path to the checkpoint directory (default: ./checkpoints/metaicl-qwen3-4b/best)
 #   MODEL_NAME   — model name to serve (default: metaicl)
-#   BENCHMARK    — space-separated benchmarks: id-ood bbh hardmath linguini all
-#                  (default: all)
+#   BENCHMARK    — space-separated benchmarks: id-ood bbh hardmath linguini math500 strategyqa reclor all
+#                  (default: all — runs all seven benchmarks)
 #   VLLM_GPUS    — CUDA devices for vLLM server (default: 0,1)
 #   VLLM_PORT    — API port (default: 8300)
 #   K_SHOT       — few-shot k (default: 4, must match training)
@@ -23,8 +23,9 @@
 #   bash scripts/run_eval.sh
 #   BENCHMARK=id-ood bash scripts/run_eval.sh
 #   BENCHMARK="bbh hardmath" bash scripts/run_eval.sh
+#   BENCHMARK="math500 strategyqa reclor" bash scripts/run_eval.sh
 #   BENCHMARK=all CHECKPOINT=./checkpoints/metaicl-cot-qwen3-4b/best MODEL_NAME=metaicl-cot bash scripts/run_eval.sh
-#   MAX_SAMPLES=10 bash scripts/run_eval.sh    # smoke test
+#   MAX_SAMPLES=10 BENCHMARK="math500 strategyqa reclor" bash scripts/run_eval.sh   # smoke test new benchmarks
 #   SKIP_VLLM=1 bash scripts/run_eval.sh       # vLLM already on VLLM_PORT (default 8300)
 #
 # Environment: conda env 'agl' (has openai, vllm, torch, transformers).
@@ -40,7 +41,7 @@ MODEL_NAME="${MODEL_NAME:-metaicl}"
 BENCHMARK="${BENCHMARK:-all}"
 VLLM_GPUS="${VLLM_GPUS:-0,1}"
 VLLM_PORT="${VLLM_PORT:-8300}"
-K_SHOT="${K_SHOT:-4}"
+K_SHOT="${K_SHOT:-3}"
 OUTPUT_DIR="${OUTPUT_DIR:-./results}"
 CONCURRENCY="${CONCURRENCY:-32}"
 

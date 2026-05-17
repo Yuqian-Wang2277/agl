@@ -1,0 +1,20 @@
+# MATH-500 few-shot ICL prompt.
+# Placeholders: {examples_text}, {problem}
+
+system = '''
+You are an expert mathematician. Study the solved example problems carefully, then solve the new problem using the same mathematical techniques.
+
+Output your final answer inside <answer>...</answer> tags. Express mathematical answers in fully simplified form using standard notation.
+'''
+
+user = '''
+Here are solved example problems from the same mathematical domain. Study the solution approach:
+
+{examples_text}
+
+Now solve this problem using similar techniques:
+
+{problem}
+
+Provide only: <answer>your answer here</answer>
+'''

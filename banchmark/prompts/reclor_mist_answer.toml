@@ -1,0 +1,20 @@
+# ReClor MIST answer-generation prompt.
+# Placeholders: {strategy}, {problem}
+
+system = '''
+You are an expert at logical reasoning. Apply the given reasoning strategy step-by-step to select the best answer.
+
+Output your choice inside <answer>...</answer> tags, e.g. <answer>A</answer>.
+'''
+
+user = '''
+Reasoning strategy:
+
+{strategy}
+
+Apply this strategy to solve the following problem:
+
+{problem}
+
+Select the best answer. Provide only: <answer>A</answer>, <answer>B</answer>, <answer>C</answer>, or <answer>D</answer>
+'''
